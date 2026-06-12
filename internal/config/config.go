@@ -77,7 +77,14 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := Parse(data, filepath.Dir(path))
+	// Absolute base dir, so every resolved path is absolute no matter how -f
+	// was given: subprocesses with their own working directory (docker build)
+	// and watcher path matching must not depend on ksync's cwd.
+	baseDir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := Parse(data, baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}

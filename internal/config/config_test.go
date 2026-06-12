@@ -483,6 +483,21 @@ func TestLoad_AcceptsAnyRecognizedKustomizationFileName(t *testing.T) {
 	}
 }
 
+func TestLoad_RelativeConfigPathYieldsAbsolutePaths(t *testing.T) {
+	dir := t.TempDir()
+	writeApp(t, dir, "apps/api-b")
+	mustWriteFile(t, filepath.Join(dir, "ksync.yaml"), "context: docker-desktop\napps:\n  - path: apps/api-b\n")
+	t.Chdir(dir)
+
+	cfg, err := Load("ksync.yaml")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !filepath.IsAbs(cfg.Apps[0].Path) {
+		t.Errorf("Path = %q, want absolute — subprocess working dirs and watcher matching must not depend on ksync's cwd", cfg.Apps[0].Path)
+	}
+}
+
 func TestLoad_RejectsMissingBuildContextDir(t *testing.T) {
 	dir := t.TempDir()
 	writeApp(t, dir, "apps/api-b")
