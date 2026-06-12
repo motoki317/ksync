@@ -298,6 +298,56 @@ func TestSelect_RejectsUnknownName(t *testing.T) {
 	}
 }
 
+func TestSortByNeeds_KeepsDeclarationOrderWhenUnconstrained(t *testing.T) {
+	apps := []App{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	got := SortByNeeds(apps)
+	if !sameOrder(got, "a", "b", "c") {
+		t.Errorf("SortByNeeds = %v, want declaration order", names(got))
+	}
+}
+
+func TestSortByNeeds_PlacesDependenciesFirst(t *testing.T) {
+	apps := []App{{Name: "api-b", Needs: []string{"db"}}, {Name: "db"}}
+	got := SortByNeeds(apps)
+	if !sameOrder(got, "db", "api-b") {
+		t.Errorf("SortByNeeds = %v, want [db api-b]", names(got))
+	}
+}
+
+func TestSortByNeeds_BreaksTiesByDeclarationOrder(t *testing.T) {
+	// Diamond: top is needed by both mid apps; bottom needs both mids.
+	apps := []App{
+		{Name: "bottom", Needs: []string{"mid-b", "mid-a"}},
+		{Name: "mid-b", Needs: []string{"top"}},
+		{Name: "mid-a", Needs: []string{"top"}},
+		{Name: "top"},
+	}
+	got := SortByNeeds(apps)
+	if !sameOrder(got, "top", "mid-b", "mid-a", "bottom") {
+		t.Errorf("SortByNeeds = %v, want [top mid-b mid-a bottom]", names(got))
+	}
+}
+
+func sameOrder(apps []App, want ...string) bool {
+	if len(apps) != len(want) {
+		return false
+	}
+	for i, a := range apps {
+		if a.Name != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func names(apps []App) []string {
+	out := make([]string, len(apps))
+	for i, a := range apps {
+		out[i] = a.Name
+	}
+	return out
+}
+
 func mustMkdirAll(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

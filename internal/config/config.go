@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/api/validate/content"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/kustomize/api/konfig"
 	"sigs.k8s.io/yaml"
 )
@@ -94,7 +94,7 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 		if app.Name == "" {
 			app.Name = filepath.Base(app.Path)
 		}
-		if msgs := content.IsLabelValue(app.Name); len(msgs) > 0 {
+		if msgs := validation.IsValidLabelValue(app.Name); len(msgs) > 0 {
 			errs = append(errs, fmt.Errorf("apps[%d]: name %q must be a valid Kubernetes label value (it becomes the ksync tracking label): %s",
 				i, app.Name, strings.Join(msgs, "; ")))
 		}
@@ -150,6 +150,46 @@ func (c *Config) Select(names []string) ([]App, error) {
 		apps = append(apps, app)
 	}
 	return apps, nil
+}
+
+// SortByNeeds returns the apps ordered so that every app comes after the
+// apps it needs, breaking ties by declaration order (the earliest-declared
+// runnable app goes next). The input must already be a validated DAG.
+func SortByNeeds(apps []App) []App {
+	indegree := make(map[string]int, len(apps))
+	dependents := make(map[string][]string, len(apps))
+	for _, a := range apps {
+		indegree[a.Name] = 0
+	}
+	for _, a := range apps {
+		for _, dep := range a.Needs {
+			if _, ok := indegree[dep]; ok {
+				indegree[a.Name]++
+				dependents[dep] = append(dependents[dep], a.Name)
+			}
+		}
+	}
+	sorted := make([]App, 0, len(apps))
+	placed := make(map[string]bool, len(apps))
+	for len(sorted) < len(apps) {
+		progressed := false
+		for _, a := range apps {
+			if placed[a.Name] || indegree[a.Name] != 0 {
+				continue
+			}
+			placed[a.Name] = true
+			for _, d := range dependents[a.Name] {
+				indegree[d]--
+			}
+			sorted = append(sorted, a)
+			progressed = true
+			break // rescan from the start so declaration order wins ties
+		}
+		if !progressed {
+			return apps // cycle; unreachable after validation
+		}
+	}
+	return sorted
 }
 
 // findCycle returns a cycle in the needs graph rendered as "a -> b -> a", or

@@ -7,12 +7,20 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
+	"text/tabwriter"
+
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
+	"k8s.io/klog/v2/textlogger"
 
 	"github.com/motoki317/ksync/internal/config"
+	"github.com/motoki317/ksync/internal/engine"
 	"github.com/motoki317/ksync/internal/render"
 )
 
@@ -23,7 +31,7 @@ var subcommands = []struct {
 	run           func(args []string) error
 }{
 	{"watch", "watch app directories and render/diff/apply on change (the main loop)", nil},
-	{"sync", "render and sync the given apps once", nil},
+	{"sync", "render and sync the given apps once", runSync},
 	{"diff", "render and show the diff against live cluster state", nil},
 	{"render", "render the given apps to stdout", runRender},
 	{"destroy", "delete all tracked resources of the given apps", nil},
@@ -63,10 +71,11 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w)
 }
 
-// loadConfig parses the shared -f flag and loads the config; the remaining
-// positional args are returned for the subcommand (usually app names).
-func loadConfig(name string, args []string) (*config.Config, []string, error) {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+// loadConfig adds the shared -f flag to fs, parses args, and loads the
+// config; the remaining positional args are returned for the subcommand
+// (usually app names). Subcommand-specific flags must be registered on fs
+// before calling.
+func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, []string, error) {
 	path := fs.String("f", "ksync.yaml", "path to the ksync config file")
 	if err := fs.Parse(args); err != nil {
 		return nil, nil, err
@@ -79,7 +88,7 @@ func loadConfig(name string, args []string) (*config.Config, []string, error) {
 }
 
 func runRender(args []string) error {
-	cfg, names, err := loadConfig("render", args)
+	cfg, names, err := loadConfig(flag.NewFlagSet("render", flag.ContinueOnError), args)
 	if err != nil {
 		return err
 	}
@@ -101,4 +110,50 @@ func runRender(args []string) error {
 		}
 	}
 	return nil
+}
+
+func runSync(args []string) error {
+	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
+	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
+	cfg, names, err := loadConfig(fs, args)
+	if err != nil {
+		return err
+	}
+	apps, err := cfg.Select(names)
+	if err != nil {
+		return err
+	}
+	apps = config.SortByNeeds(apps)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	log := textlogger.NewLogger(textlogger.NewConfig())
+	eng, err := engine.New(cfg.Context, log)
+	if err != nil {
+		return err
+	}
+	defer eng.Close()
+
+	r := render.New(render.Options{})
+	for _, app := range apps {
+		res, err := r.Render(app.Path)
+		if err != nil {
+			return fmt.Errorf("app %s: %w", app.Name, err)
+		}
+		results, err := eng.Sync(ctx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune})
+		if err != nil {
+			return fmt.Errorf("app %s: sync: %w", app.Name, err)
+		}
+		printSyncResults(os.Stdout, app.Name, results)
+	}
+	return nil
+}
+
+func printSyncResults(w io.Writer, app string, results []common.ResourceSyncResult) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, res := range results {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", app, res.ResourceKey.String(), res.Status, res.Message)
+	}
+	tw.Flush()
 }
