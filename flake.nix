@@ -79,7 +79,7 @@
             pname = "ksync";
             inherit version;
             src = ./.;
-            vendorHash = "sha256-GpCdxg2NiCaeDp+S90G6aPLYl44cm1jUw+CxHaodqko=";
+            vendorHash = "sha256-b7/fD6ECBIsjzZ2QcY6KmaTjsH3vdIy/EQh5CWOaxRQ=";
             subPackages = [ "cmd/ksync" ];
             ldflags = [ "-s" "-w" ];
             env.CGO_ENABLED = 0;

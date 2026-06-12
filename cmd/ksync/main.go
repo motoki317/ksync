@@ -13,14 +13,19 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2/textlogger"
 
 	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/engine"
+	"github.com/motoki317/ksync/internal/loop"
 	"github.com/motoki317/ksync/internal/render"
 )
 
@@ -30,11 +35,11 @@ var subcommands = []struct {
 	name, summary string
 	run           func(args []string) error
 }{
-	{"watch", "watch app directories and render/diff/apply on change (the main loop)", nil},
+	{"watch", "watch app directories and render/diff/apply on change (the main loop)", runWatch},
 	{"sync", "render and sync the given apps once", runSync},
 	{"diff", "render and show the diff against live cluster state", nil},
 	{"render", "render the given apps to stdout", runRender},
-	{"destroy", "delete all tracked resources of the given apps", nil},
+	{"destroy", "delete all tracked resources of the given apps", runDestroy},
 }
 
 func main() {
@@ -144,6 +149,89 @@ func runSync(args []string) error {
 		results, err := eng.Sync(ctx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune})
 		if err != nil {
 			return fmt.Errorf("app %s: sync: %w", app.Name, err)
+		}
+		printSyncResults(os.Stdout, app.Name, results)
+	}
+	return nil
+}
+
+func runWatch(args []string) error {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
+	debounce := fs.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
+	maxParallel := fs.Int("max-parallel", 4, "how many apps may sync concurrently")
+	cfg, names, err := loadConfig(fs, args)
+	if err != nil {
+		return err
+	}
+	apps, err := cfg.Select(names)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	log := textlogger.NewLogger(textlogger.NewConfig())
+	eng, err := engine.New(cfg.Context, log)
+	if err != nil {
+		return err
+	}
+	defer eng.Close()
+
+	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) error {
+		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune})
+		if err != nil {
+			return err
+		}
+		printSyncResults(os.Stdout, app, results)
+		return nil
+	}
+	return loop.Run(ctx, apps, syncFn, loop.Options{
+		Debounce:    *debounce,
+		MaxParallel: *maxParallel,
+		Log:         log,
+	})
+}
+
+func runDestroy(args []string) error {
+	fs := flag.NewFlagSet("destroy", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "confirm deleting every tracked resource of the selected apps")
+	cfg, names, err := loadConfig(fs, args)
+	if err != nil {
+		return err
+	}
+	apps, err := cfg.Select(names)
+	if err != nil {
+		return err
+	}
+	if !*yes {
+		all := make([]string, len(apps))
+		for i, a := range apps {
+			all[i] = a.Name
+		}
+		return fmt.Errorf("destroy deletes every tracked resource of: %s — re-run with -yes to confirm", strings.Join(all, ", "))
+	}
+	// Dependents go down before their dependencies.
+	apps = config.SortByNeeds(apps)
+	slices.Reverse(apps)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	log := textlogger.NewLogger(textlogger.NewConfig())
+	eng, err := engine.New(cfg.Context, log)
+	if err != nil {
+		return err
+	}
+	defer eng.Close()
+
+	for _, app := range apps {
+		// Destroy is a sync to an empty target set: prune removes everything
+		// the tracking label scopes to this app, and nothing else.
+		results, err := eng.Sync(ctx, app.Name, nil, engine.SyncOptions{Prune: true})
+		if err != nil {
+			return fmt.Errorf("app %s: destroy: %w", app.Name, err)
 		}
 		printSyncResults(os.Stdout, app.Name, results)
 	}
