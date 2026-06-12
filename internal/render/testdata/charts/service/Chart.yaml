@@ -1,0 +1,4 @@
+apiVersion: v2
+name: service
+description: Minimal chart fixture shaped like a shared per-service chart
+version: 0.1.0

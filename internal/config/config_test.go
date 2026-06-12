@@ -268,6 +268,36 @@ func TestLoad_AcceptsAnyRecognizedKustomizationFileName(t *testing.T) {
 	}
 }
 
+func TestSelect_EmptyNamesMeansAllApps(t *testing.T) {
+	cfg := &Config{Apps: []App{{Name: "db"}, {Name: "api-b"}}}
+	apps, err := cfg.Select(nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if len(apps) != 2 || apps[0].Name != "db" || apps[1].Name != "api-b" {
+		t.Errorf("Select(nil) = %v, want all apps in declaration order", apps)
+	}
+}
+
+func TestSelect_ReturnsNamedAppsInRequestOrder(t *testing.T) {
+	cfg := &Config{Apps: []App{{Name: "db"}, {Name: "api-b"}, {Name: "shop"}}}
+	apps, err := cfg.Select([]string{"shop", "db"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if len(apps) != 2 || apps[0].Name != "shop" || apps[1].Name != "db" {
+		t.Errorf("Select = %v, want [shop db]", apps)
+	}
+}
+
+func TestSelect_RejectsUnknownName(t *testing.T) {
+	cfg := &Config{Apps: []App{{Name: "db"}}}
+	_, err := cfg.Select([]string{"ghost"})
+	if err == nil || !strings.Contains(err.Error(), `unknown app "ghost"`) {
+		t.Errorf("Select error = %v, want unknown app error", err)
+	}
+}
+
 func mustMkdirAll(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

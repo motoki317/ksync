@@ -1,0 +1,20 @@
+# Mirrors the production manifest shape: a shared chartHome outside the
+# kustomization root, multiple releases of the same chart in one app, and the
+# namespace fed per release into `helm template --namespace` (the chart stamps
+# it via .Release.Namespace — the kustomization-level namespace transformer
+# does NOT touch helm-inflated output).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+helmGlobals:
+  chartHome: ../charts
+helmCharts:
+  - name: service
+    releaseName: api-b
+    namespace: team-a
+    valuesInline:
+      app: api-b
+  - name: service
+    releaseName: shop
+    namespace: team-a
+    valuesInline:
+      app: shop

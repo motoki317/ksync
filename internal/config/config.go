@@ -130,6 +130,27 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	return &cfg, nil
 }
 
+// Select returns the apps with the given names in request order, or all apps
+// in declaration order when names is empty.
+func (c *Config) Select(names []string) ([]App, error) {
+	if len(names) == 0 {
+		return c.Apps, nil
+	}
+	byName := make(map[string]App, len(c.Apps))
+	for _, app := range c.Apps {
+		byName[app.Name] = app
+	}
+	apps := make([]App, 0, len(names))
+	for _, name := range names {
+		app, ok := byName[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown app %q (not declared in the config)", name)
+		}
+		apps = append(apps, app)
+	}
+	return apps, nil
+}
+
 // findCycle returns a cycle in the needs graph rendered as "a -> b -> a", or
 // "" if the graph is a DAG. Apps and their needs are visited in declaration
 // order so the reported cycle is deterministic.
