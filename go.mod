@@ -6,6 +6,7 @@ require (
 	github.com/argoproj/argo-cd/gitops-engine v0.0.0-20260528113041-1801122b4391
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-logr/logr v1.4.3
+	github.com/moby/patternmatcher v0.6.1
 	k8s.io/apimachinery v0.34.0
 	k8s.io/client-go v0.34.0
 	k8s.io/klog/v2 v2.140.0
