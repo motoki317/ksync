@@ -4,10 +4,11 @@ ksync is a long-running CLI that watches a set of local directories containing
 `kustomization.yaml`, and on file change rebuilds (renders), diffs, and applies the affected app
 to a local cluster — with **ArgoCD-parity sync semantics** (helm hooks, sync waves, prune,
 server-side apply, health assessment) and a **fast change→applied loop** as the primary design
-goal.
+goal. With per-app `build` entries it also closes the source loop: save a source file, and
+ksync docker-builds the image, injects the new tag, and rolls the pods.
 
-Think: "ArgoCD pointed at local files instead of git, as a single fast CLI" or "`kubectl apply`
-with inventory tracking, hooks, ordering, retry, and a file watcher."
+Think: "ArgoCD pointed at local files instead of git, as a single fast CLI" or "docker-compose,
+but the runtime is your local Kubernetes cluster."
 
 What ksync is **not**:
 
@@ -16,11 +17,12 @@ What ksync is **not**:
 - Not a hot-reload/file-sync-into-container tool (mirrord/Telepresence cover that inner loop).
 - Not a GitOps controller (no in-cluster component; push-based, local-first).
 
-> **Status: core loop working.** `watch`, `sync`, `render`, and `destroy` are implemented
-> (long-running watch loop with debounced incremental re-render, server-side apply, tracked
-> prune, namespace auto-creation, backoff retries). Not yet done: `diff`, exec-plugin
-> (e.g. ksops) rendering, hook-semantics conformance fixtures, and the perf validation
-> against the target numbers.
+> **Status: core loop + native builds working.** `watch`, `sync`, `render`, and `destroy` are
+> implemented (long-running watch loop with debounced incremental re-render, server-side
+> apply, tracked prune, namespace auto-creation, backoff retries, source-triggered image
+> builds with content-addressed dev tags). Not yet done: `diff`, exec-plugin (e.g. ksops)
+> rendering, hook-semantics conformance fixtures, and image loaders for clusters that cannot
+> see the docker daemon (kind, k3d).
 
 ## Quickstart
 
@@ -34,6 +36,9 @@ apps:
     path: apps/api-b
     namespace: team-a          # default ns for rendered resources without one
     needs: [db]                # sync db before api-b
+    build:                     # rebuild + redeploy when the source changes
+      - image: example.com/team-a/api-b
+        context: ../src/api-b
   - name: db
     path: apps/postgres
     namespace: team-a
@@ -61,6 +66,9 @@ is in **[docs/usage.md](docs/usage.md)**.
   sync as PostSync, `helm.sh/hook-weight` acts as the sync wave.
 - **Incremental rendering** — only the app(s) whose watched files changed are re-rendered
   (kustomize, including `helmCharts` inflation via `--enable-helm`).
+- **Native builds without ceremony** — two fields (`image`, `context`) per built image;
+  content-addressed dev tags mean unchanged source never rolls a pod, and no build state is
+  persisted anywhere. `.dockerignore` decides what triggers rebuilds.
 - **Safety** — explicit kubectl-context allowlist; prune scoped by a ksync tracking label.
 
 ## Development

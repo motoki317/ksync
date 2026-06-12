@@ -38,6 +38,7 @@ you push.
   (context `docker-desktop`), kind, k3d, or minikube.
 - The **helm** binary on your `PATH`, but only if your kustomizations use `helmCharts`.
   kustomize itself is built into ksync — you do not need the kustomize binary.
+- The **docker** CLI, but only if your apps use `build` (see "Building images from source").
 - **Go 1.26+** or **Nix** to build ksync (see below).
 
 ## Install
@@ -79,6 +80,9 @@ apps:
     path: apps/api-b             # directory that contains kustomization.yaml
     namespace: team-a            # default namespace for this app (see below)
     needs: [db]                  # sync "db" first
+    build:                       # build this image from local source (see below)
+      - image: example.com/team-a/api-b
+        context: ../src/api-b
 
   - name: db
     path: apps/postgres
@@ -94,6 +98,7 @@ The fields, one by one:
 | `apps[].name` | no | Name of the app. Default: the directory name. Used in commands (`ksync sync api-b`), in logs, and as the tracking label value. |
 | `apps[].namespace` | no | Default namespace for resources that do not set one (like ArgoCD's `destination.namespace`). ksync creates this namespace if it does not exist. |
 | `apps[].needs` | no | Apps that must sync before this one. ksync checks that there is no cycle. |
+| `apps[].build` | no | Images to build from local source code. See "Building images from source" below. |
 
 Unknown fields are an error. This protects you from typos: `need:` instead of `needs:` fails
 loudly instead of being ignored.
@@ -112,6 +117,87 @@ tracking works" below).
 Resources that set their own `metadata.namespace` keep it — the default is only for resources
 that have none.
 
+## Building images from source
+
+With `build`, ksync closes the whole loop: you save a **source file** (not just a manifest),
+and ksync builds the image, updates the manifests, and restarts the pods — like
+docker-compose, but on your Kubernetes cluster.
+
+```yaml
+apps:
+  - path: apps/api-b
+    namespace: team-a
+    build:
+      - image: example.com/team-a/api-b   # the image name your manifests use
+        context: ../src/api-b             # the docker build context directory
+```
+
+That is all you need for the common case: a directory with a `Dockerfile` in it. The fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `image` | yes | The image name **exactly as your manifests reference it**, without a tag. ksync replaces the tag of every matching image in the rendered output (same rules as kustomize's `images:` field). |
+| `context` | yes | The docker build context directory. Relative paths are resolved from the config file's directory. ksync watches it for changes. |
+| `dockerfile` | no | Path to the Dockerfile, relative to `context`. Default: `Dockerfile` in the context. |
+| `watch` | no | Only these paths (relative to `context`) trigger a rebuild. Useful in monorepos where one big context feeds many images. Default: the whole context. |
+| `command` | no | Replaces `docker build` with your own build command (see below). |
+
+### How it works
+
+1. When a watched source file changes, ksync runs `docker build` on the context.
+2. The built image gets a tag made from its **content**: `ksync-` plus 12 hex digits of the
+   image ID. Same source in, same tag out.
+3. ksync renders the app and replaces the tag of every matching image — in memory only,
+   your manifest files are never modified.
+4. The app syncs as usual. Because the tag changed, Kubernetes restarts the pods with the
+   new image.
+
+The content-based tag has a nice effect: if you rebuild without changing anything, the tag
+is the same, nothing differs, and **no pod restarts**. This is also why ksync needs no state
+file — on startup it simply builds everything once (fast, thanks to docker's layer cache)
+and lands on the tags that are already deployed.
+
+Manifest-only edits never run docker: the last built tag is remembered and re-used, so the
+fast manifest loop stays fast.
+
+### `.dockerignore` decides what triggers a rebuild
+
+A file that `.dockerignore` excludes never enters the image, so ksync also ignores it when
+watching. Keep your `.dockerignore` honest (exclude `target/`, `node_modules/`, build
+output) and you get correct rebuild triggers for free — including for build commands that
+write artifacts back into the context, which would otherwise rebuild forever.
+`<dockerfile>.dockerignore` takes precedence over `<context>/.dockerignore`, like BuildKit.
+
+### Custom build commands
+
+If `docker build` is not enough (multi-target bake files, compile-on-host flows, build
+args), set `command`. ksync runs it with `sh -c` inside the context directory. Your command
+must leave the finished image in the local docker daemon under the name ksync passes in the
+`KSYNC_IMAGE` environment variable:
+
+```yaml
+build:
+  - image: example.com/team-a/api-b
+    context: ../..
+    watch: [apps/api-b, lib]
+    command: docker buildx bake --load --set 'api-b.tags=$KSYNC_IMAGE' api-b
+```
+
+Tip: pass `--provenance=false` to docker in your command. Without it, docker adds a
+build-time attestation that gives the same content a different image ID on every build, so
+every rebuild would restart pods even when nothing changed. (ksync's own `docker build`
+already does this.)
+
+### Limits, in plain words
+
+- The cluster must be able to see your docker daemon's images. **Docker Desktop Kubernetes
+  works out of the box.** Clusters with their own image store (kind, remote clusters) need
+  an image-load step that ksync does not do yet.
+- Containers that set `imagePullPolicy: Always` cannot use locally built images — the
+  kubelet would try to pull the ksync tag from a registry. Most charts let you change the
+  policy; the Kubernetes default (`IfNotPresent` for non-`latest` tags) is fine.
+- One image name can have only one build definition across all apps.
+
 ## Commands
 
 Every command accepts `-f <file>` to choose the config file, and an optional list of app names.
@@ -126,10 +212,11 @@ ksync watch api-b shop      # watch only these apps
 
 What it does:
 
-1. On start, it syncs every watched app once, so the cluster matches your files.
+1. On start, it builds every `build` image and syncs every watched app once, so the cluster
+   matches your files.
 2. Then it watches the app directories for file changes. It also watches files *outside* the
    app directory that the kustomization points to: a shared `chartHome`, values files,
-   `resources:` entries, and so on.
+   `resources:` entries, and so on — and the source directories of `build` entries.
 3. When you save a file, ksync waits a short quiet period (debounce, default 200ms), so one
    "save all" in your editor becomes one sync, not ten.
 4. Only the affected app is re-rendered and applied. If two apps share a chart directory and
@@ -156,7 +243,8 @@ ksync sync api-b
 ```
 
 Renders and applies once, then exits. Useful for scripts, or to converge the cluster before
-starting `watch`. Apps are synced in dependency order (`needs` first).
+starting `watch`. Apps are synced in dependency order (`needs` first). Apps with `build`
+entries build their images first, so what gets applied always points at images that exist.
 
 Example output:
 
@@ -174,7 +262,9 @@ ksync render > all.yaml     # render every app
 ```
 
 Renders the kustomization (including helm chart inflation) and prints the result. It does not
-talk to the cluster. Use it to check what ksync *would* apply, or to debug a kustomization.
+talk to the cluster — and it does not run docker: the output shows the manifests as written,
+without locally built dev tags. Use it to check what ksync *would* apply, or to debug a
+kustomization.
 
 The output is the same bytes that `kustomize build --enable-helm --load-restrictor
 LoadRestrictionsNone <dir>` produces — this is verified by tests.
@@ -276,3 +366,20 @@ stable certificate (for example cert-manager) makes it go away.
 On start, ksync lists the cluster's resources once to build its cache (a few seconds on a
 local cluster with many CRDs). Every sync after that uses the warm cache and is fast. Keep
 `watch` running instead of restarting it.
+
+**Pods of a built image show `ErrImagePull` or `ImagePullBackOff`**
+The kubelet tried to pull the `ksync-…` tag from a registry, which does not have it. Two
+common causes: the container sets `imagePullPolicy: Always` (change it — locally built
+images cannot be pulled), or the cluster cannot see your docker daemon's images (use Docker
+Desktop Kubernetes, or another cluster that shares the daemon).
+
+**Pods restart on every rebuild, even when nothing changed**
+The image ID changes on every build. The usual cause is docker's provenance attestation,
+which embeds build timestamps. ksync's own `docker build` disables it; if you use
+`command`, add `--provenance=false` to your docker invocation.
+
+**A source edit does not trigger a rebuild**
+ksync watches the build `context` minus what `.dockerignore` excludes (an excluded file
+cannot change the image), and only the listed paths when `watch:` is set. Check whether the
+file falls under an excluded pattern or outside the watched paths. A manual `ksync sync`
+always builds.

@@ -9,7 +9,9 @@ lives in ADRs ([docs/ADR/](docs/ADR/)). Keep this file scannable — push detail
 A local-development sync loop for Kubernetes: a long-running CLI that watches local
 `kustomization.yaml` directories and, on change, renders, diffs, and applies the affected app to
 a local cluster — with ArgoCD-parity sync semantics and a fast change→applied loop
-(**target: p50 ≤ 2s, p95 ≤ 5s for a single-app edit**, excluding hook Job runtime).
+(**target: p50 ≤ 2s, p95 ≤ 5s for a single-app edit**, excluding hook Job runtime). Per-app
+`build` entries extend the loop to source changes: docker build → content-addressed dev tag →
+in-process `images:` injection → sync (M2, ADR 20260612-build-integration).
 
 Non-negotiable design constraints (each was verified at source level before scaffolding —
 re-litigate only with new evidence):
@@ -37,20 +39,26 @@ re-litigate only with new evidence):
 - `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / destroy`
   implemented; `diff` still a stub).
 - `internal/config` — ksync.yaml model: app list, single explicit kubectl context (the safety
-  model), per-app default namespace (ArgoCD destination.namespace parity), `needs` DAG;
-  `SortByNeeds`.
+  model), per-app default namespace (ArgoCD destination.namespace parity), `needs` DAG,
+  per-app `build` entries (image/context + optional dockerfile/watch/command); `SortByNeeds`.
+- `internal/build` — source→image: docker build (or the `command` escape hatch producing
+  `$KSYNC_IMAGE`), content-addressed dev tags `ksync-<12 hex of image ID>` (no persisted
+  build state; `--provenance=false` keeps IDs deterministic), `.dockerignore`-scoped watch
+  derivation (WatchScope). See ADR 20260612-build-integration.
 - `internal/render` — in-process kustomize (krusty) replicating
   `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
   binary is enforced by test.
-- `internal/watch` — dirty-set mapping (changed path → affected apps), dependency-root
-  derivation (escaping chartHome/resources/values), recursive fsnotify watcher.
+- `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
+  per-entry ignore predicates), dependency-root derivation (escaping
+  chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.
 - `internal/schedule` — pure scheduling state machine: debounce/coalesce, per-app
   serialization, bounded parallelism, needs gating, exponential retry backoff.
 - `internal/engine` — gitops-engine wrapper (pin: argo-cd release-tag commits; k8s.io/* follow
   the engine's version): warm cluster cache, SSA, tracking-label-scoped prune, app-namespace
   auto-creation (create-if-missing only).
-- `internal/loop` — the watch-mode event loop tying the above together; cluster side injected
-  as a SyncFunc so it tests without a cluster.
+- `internal/loop` — the watch-mode event loop tying the above together; cluster and docker
+  sides injected as SyncFunc/BuildFunc so it tests without either. Builds run per dirty
+  (app, entry) before render; manifest-only edits never invoke docker.
 - `internal/leakcheck` — the no-leak guard (see Conventions).
 - `docs/ADR/` — dated decision records (`YYYYMMDD-title.md`, template at `_template.md`).
 - `docs/plans/` — gitignored single-session scratch.
