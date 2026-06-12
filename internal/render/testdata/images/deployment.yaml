@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-b
+  namespace: team-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-b
+  template:
+    metadata:
+      labels:
+        app: api-b
+    spec:
+      initContainers:
+        - name: migrate
+          image: example.com/team-a/api-b:main
+      containers:
+        - name: api
+          image: example.com/team-a/api-b:main
+        - name: proxy
+          image: example.com/shop/proxy:v1

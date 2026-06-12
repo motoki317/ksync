@@ -9,11 +9,29 @@ import (
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/kustomize/api/filters/imagetag"
 	"sigs.k8s.io/kustomize/api/krusty"
 	"sigs.k8s.io/kustomize/api/resmap"
 	"sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 )
+
+// Image is one image override, with kustomize `images:` field semantics.
+type Image = types.Image
+
+// imageFieldSpecs mirrors the default field specs of kustomize's builtin
+// images transformer (api/internal/konfig/builtinpluginconsts). Together with
+// the recursive containers/initContainers filter below they make SetImages
+// behave exactly like an `images:` entry in the kustomization. Replicated
+// because kustomize keeps the canonical list in an internal package.
+var imageFieldSpecs = types.FsSlice{
+	{Path: "spec/containers[]/image", CreateIfNotPresent: true},
+	{Path: "spec/initContainers[]/image", CreateIfNotPresent: true},
+	{Path: "spec/volumes[]/image/reference", CreateIfNotPresent: true},
+	{Path: "spec/template/spec/containers[]/image", CreateIfNotPresent: true},
+	{Path: "spec/template/spec/initContainers[]/image", CreateIfNotPresent: true},
+	{Path: "spec/template/spec/volumes[]/image/reference", CreateIfNotPresent: true},
+}
 
 // Options configures a Renderer.
 type Options struct {
@@ -37,6 +55,30 @@ type Result struct {
 // sync loop works on Objects.
 func (res *Result) YAML() ([]byte, error) {
 	return res.resMap.AsYaml()
+}
+
+// SetImages rewrites matching image references in the rendered output —
+// identical to the user writing `images: [{name, newTag}]` in the
+// kustomization, but in-process so the working tree is never mutated. This is
+// how locally built dev tags are injected before sync.
+func (res *Result) SetImages(images []Image) error {
+	for _, img := range images {
+		// The two filters of kustomize's builtin images transformer: the
+		// recursive containers/initContainers walk, then the fixed field
+		// specs (which also cover pod-level OCI volume images).
+		if err := res.resMap.ApplyFilter(imagetag.LegacyFilter{ImageTag: img}); err != nil {
+			return fmt.Errorf("setting image %s: %w", img.Name, err)
+		}
+		if err := res.resMap.ApplyFilter(imagetag.Filter{ImageTag: img, FsSlice: imageFieldSpecs}); err != nil {
+			return fmt.Errorf("setting image %s: %w", img.Name, err)
+		}
+	}
+	objs, err := objectsFromResMap(res.resMap)
+	if err != nil {
+		return err
+	}
+	res.Objects = objs
+	return nil
 }
 
 // Renderer renders kustomization directories. It is safe for concurrent use;
@@ -73,6 +115,14 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 		return nil, fmt.Errorf("rendering %s: %w", dir, err)
 	}
 
+	objs, err := objectsFromResMap(resMap)
+	if err != nil {
+		return nil, fmt.Errorf("rendering %s: %w", dir, err)
+	}
+	return &Result{Objects: objs, resMap: resMap}, nil
+}
+
+func objectsFromResMap(resMap resmap.ResMap) ([]*unstructured.Unstructured, error) {
 	objs := make([]*unstructured.Unstructured, 0, resMap.Size())
 	for _, res := range resMap.Resources() {
 		// Not res.Map(): kyaml yields YAML-typed values (plain int), which
@@ -81,13 +131,13 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 		// int64/float64 as apimachinery requires.
 		data, err := res.MarshalJSON()
 		if err != nil {
-			return nil, fmt.Errorf("rendering %s: encoding %s: %w", dir, res.CurId(), err)
+			return nil, fmt.Errorf("encoding %s: %w", res.CurId(), err)
 		}
 		obj := &unstructured.Unstructured{}
 		if err := obj.UnmarshalJSON(data); err != nil {
-			return nil, fmt.Errorf("rendering %s: decoding %s: %w", dir, res.CurId(), err)
+			return nil, fmt.Errorf("decoding %s: %w", res.CurId(), err)
 		}
 		objs = append(objs, obj)
 	}
-	return &Result{Objects: objs, resMap: resMap}, nil
+	return objs, nil
 }

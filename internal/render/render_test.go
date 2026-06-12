@@ -125,6 +125,70 @@ func TestRender_MatchesKustomizeBuildOutput(t *testing.T) {
 	}
 }
 
+func TestSetImages_RewritesMatchingImagesEverywhere(t *testing.T) {
+	res, err := New(Options{}).Render("testdata/images")
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if err := res.SetImages([]Image{{Name: "example.com/team-a/api-b", NewTag: "ksync-012301230123"}}); err != nil {
+		t.Fatalf("SetImages: %v", err)
+	}
+
+	want := "example.com/team-a/api-b:ksync-012301230123"
+	containerImage := func(obj *unstructured.Unstructured, listField string, fields ...string) string {
+		t.Helper()
+		list, found, err := unstructured.NestedSlice(obj.Object, append(fields, listField)...)
+		if err != nil || !found || len(list) == 0 {
+			t.Fatalf("no %s at %v: found=%v err=%v", listField, fields, found, err)
+		}
+		img, _ := list[0].(map[string]any)["image"].(string)
+		return img
+	}
+
+	deploy := findObject(t, res.Objects, "Deployment", "api-b")
+	podSpec := []string{"spec", "template", "spec"}
+	if got := containerImage(deploy, "containers", podSpec...); got != want {
+		t.Errorf("Deployment container image = %q, want %q", got, want)
+	}
+	if got := containerImage(deploy, "initContainers", podSpec...); got != want {
+		t.Errorf("Deployment initContainer image = %q, want %q", got, want)
+	}
+	containers, _, _ := unstructured.NestedSlice(deploy.Object, "spec", "template", "spec", "containers")
+	if got, _ := containers[1].(map[string]any)["image"].(string); got != "example.com/shop/proxy:v1" {
+		t.Errorf("unrelated image = %q, must stay untouched", got)
+	}
+
+	// A tag-less reference and a nesting the default field specs do not list
+	// (CronJob pod template) must both be rewritten — kustomize `images:`
+	// parity comes from the same recursive containers/initContainers filter.
+	cron := findObject(t, res.Objects, "CronJob", "api-b-report")
+	if got := containerImage(cron, "containers", "spec", "jobTemplate", "spec", "template", "spec"); got != want {
+		t.Errorf("CronJob container image = %q, want %q", got, want)
+	}
+
+	yml, err := res.YAML()
+	if err != nil {
+		t.Fatalf("YAML: %v", err)
+	}
+	if !strings.Contains(string(yml), want) {
+		t.Error("YAML() does not reflect the injected tag; Objects and YAML must stay consistent")
+	}
+	if strings.Contains(string(yml), "example.com/team-a/api-b:main") {
+		t.Error("YAML() still contains the original tag")
+	}
+}
+
+func findObject(t *testing.T, objs []*unstructured.Unstructured, kind, name string) *unstructured.Unstructured {
+	t.Helper()
+	for _, obj := range objs {
+		if obj.GetKind() == kind && obj.GetName() == name {
+			return obj
+		}
+	}
+	t.Fatalf("no %s %q in rendered objects", kind, name)
+	return nil
+}
+
 func TestRender_ErrorMentionsDirectory(t *testing.T) {
 	_, err := New(Options{}).Render("testdata/does-not-exist")
 	if err == nil {
