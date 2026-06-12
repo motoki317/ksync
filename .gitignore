@@ -1,0 +1,40 @@
+# Go
+/ksync
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Local handoff/context doc: references private environment details (clusters, internal
+# product names) — never tracked. The sanitized agent guide is AGENTS.md.
+/HANDOFF.md
+
+# Local planning docs (work-in-progress; not committed)
+docs/plans/
+
+# Leak-guard denylist: machine-local product/service names for internal/leakcheck.
+# Never commit real names (see AGENTS.md). The .example is the tracked template.
+.leakcheck
+
+# Local config / secrets
+*.local.yaml
+.env
+.envrc.local
+.claude/settings.local.json
+
+# Nix
+result
+result-*
+.direnv/
+.envrc
+
+# git-hooks.nix: generated symlink into the nix store (machine-local; created by the
+# flake devShell's shellHook on `nix develop`).
+.pre-commit-config.yaml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
