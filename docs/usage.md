@@ -258,7 +258,21 @@ values files, resources). It ignores `.git` directories and editor temporary fil
 reference a file in some other way (for example through a symlink target outside all watched
 directories), a manual `ksync sync` always works.
 
+**First install of a chart that ships CRDs fails for the custom resources**
+When one app contains both CRDs and resources *of* those CRDs (many operator charts do),
+the very first sync can fail for the custom resources with `the server could not find the
+requested resource`: the cluster needs a moment to activate a new CRD, and the resources
+are applied in the same pass. This heals by itself: `ksync watch` retries and converges on
+the next attempt, and a second `ksync sync` completes the install.
+
+**The same one or two resources are re-applied on every sync**
+ksync only applies resources whose rendered content differs from the cluster. Some charts
+generate fresh content on every render — the common case is a self-signed certificate for
+an admission webhook, made new on every `helm template`. ksync sees a real difference and
+applies it, the same way ArgoCD would. It is harmless noise; configuring the chart to use a
+stable certificate (for example cert-manager) makes it go away.
+
 **First sync after start is slow**
-On start, ksync lists the cluster's resources once to build its cache (10–20 seconds on a
+On start, ksync lists the cluster's resources once to build its cache (a few seconds on a
 local cluster with many CRDs). Every sync after that uses the warm cache and is fast. Keep
 `watch` running instead of restarting it.
