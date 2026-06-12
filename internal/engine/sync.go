@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/cache"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/diff"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // SyncOptions tune one Sync call.
@@ -29,13 +32,18 @@ type SyncOptions struct {
 // prune.
 func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured.Unstructured, opts SyncOptions) ([]common.ResourceSyncResult, error) {
 	target := StampTracking(app, resources)
-	return e.engine.Sync(ctx, target,
-		func(r *cache.Resource) bool {
-			info, ok := r.Info.(*resourceInfo)
-			return ok && info.app == app
-		},
-		revision(target),
-		opts.Namespace,
+	isManaged := func(r *cache.Resource) bool {
+		info, ok := r.Info.(*resourceInfo)
+		return ok && info.app == app
+	}
+	// Fill the default namespace before any key-based matching: the live-state
+	// lookup and the diff below key resources by the target's namespace, so a
+	// late fill (gitops-engine also stamps at task creation) would mismatch.
+	if opts.Namespace != "" {
+		fillDefaultNamespace(target, opts.Namespace, e.clusterCache.IsNamespaced)
+	}
+
+	syncOpts := []sync.SyncOpt{
 		sync.WithLogr(e.log),
 		sync.WithPrune(opts.Prune),
 		// Production parity: the reference ArgoCD setup applies everything
@@ -45,7 +53,47 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		// Registering a namespace modifier turns on gitops-engine's namespace
 		// auto-creation for opts.Namespace (a no-op when it is empty).
 		sync.WithNamespaceModifier(createNamespaceIfMissing),
-	)
+	}
+
+	// Apply only resources whose desired state differs from the warm cache's
+	// live state (ArgoCD's ApplyOutOfSyncOnly). On a large app this is the
+	// difference between O(changed) and O(all) API round-trips per sync; a
+	// no-change sync applies nothing. Skipped on error: applying everything
+	// is the safe fallback.
+	if lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged); err == nil {
+		if diffRes, err := diff.DiffArray(target, alignedLiveObjs(target, lives)); err == nil {
+			syncOpts = append(syncOpts, sync.WithResourceModificationChecker(true, diffRes))
+		}
+	}
+
+	return e.engine.Sync(ctx, target, isManaged, revision(target), opts.Namespace, syncOpts...)
+}
+
+// fillDefaultNamespace sets namespace on namespaced objects that carry none —
+// what ArgoCD does with destination.namespace before diffing and syncing.
+// Cluster-scoped and unknown-scope objects are left untouched (the engine
+// resolves unknown scopes again at task creation, with the same default).
+func fillDefaultNamespace(objs []*unstructured.Unstructured, namespace string, isNamespaced func(gk schema.GroupKind) (bool, error)) {
+	for _, obj := range objs {
+		if obj.GetNamespace() != "" {
+			continue
+		}
+		if namespaced, err := isNamespaced(obj.GroupVersionKind().GroupKind()); err == nil && namespaced {
+			obj.SetNamespace(namespace)
+		}
+	}
+}
+
+// alignedLiveObjs returns the live counterpart of every target object (nil
+// where none exists), in target order — the pairing diff.DiffArray expects.
+// Extra entries in lives (live-only resources, i.e. prune candidates) have no
+// target to diff against and are dropped; prune handles them.
+func alignedLiveObjs(target []*unstructured.Unstructured, lives map[kube.ResourceKey]*unstructured.Unstructured) []*unstructured.Unstructured {
+	aligned := make([]*unstructured.Unstructured, len(target))
+	for i, t := range target {
+		aligned[i] = lives[kube.GetResourceKey(t)]
+	}
+	return aligned
 }
 
 // createNamespaceIfMissing is ksync's namespace auto-creation contract — the

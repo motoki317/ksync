@@ -1,12 +1,15 @@
 package engine
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func TestStampTracking_LabelsCopiesWithoutMutatingInput(t *testing.T) {
@@ -53,6 +56,80 @@ func TestCreateNamespaceIfMissing_CreatesOnlyWhenAbsent(t *testing.T) {
 	}
 	if create, err := createNamespaceIfMissing(nil, live); err != nil || create {
 		t.Errorf("existing namespace: (create, err) = (%v, %v), want (false, nil) — ksync must never modify an existing namespace", create, err)
+	}
+}
+
+func TestFillDefaultNamespace(t *testing.T) {
+	obj := func(kind, ns string) *unstructured.Unstructured {
+		o := map[string]any{
+			"apiVersion": "v1",
+			"kind":       kind,
+			"metadata":   map[string]any{"name": "x"},
+		}
+		if ns != "" {
+			o["metadata"].(map[string]any)["namespace"] = ns
+		}
+		return &unstructured.Unstructured{Object: o}
+	}
+	isNamespaced := func(gk schema.GroupKind) (bool, error) {
+		switch gk.Kind {
+		case "ConfigMap":
+			return true, nil
+		case "Namespace":
+			return false, nil
+		default:
+			return false, errors.New("unknown scope")
+		}
+	}
+
+	objs := []*unstructured.Unstructured{
+		obj("ConfigMap", ""),       // namespaced, empty -> filled
+		obj("ConfigMap", "team-b"), // explicit namespace -> kept
+		obj("Namespace", ""),       // cluster-scoped -> untouched
+		obj("Unknown", ""),         // unknown scope -> untouched (engine decides later)
+	}
+	fillDefaultNamespace(objs, "team-a", isNamespaced)
+
+	if got := objs[0].GetNamespace(); got != "team-a" {
+		t.Errorf("namespaced object without namespace = %q, want team-a", got)
+	}
+	if got := objs[1].GetNamespace(); got != "team-b" {
+		t.Errorf("explicit namespace = %q, want team-b (must not be overwritten)", got)
+	}
+	if got := objs[2].GetNamespace(); got != "" {
+		t.Errorf("cluster-scoped namespace = %q, want empty", got)
+	}
+	if got := objs[3].GetNamespace(); got != "" {
+		t.Errorf("unknown-scope namespace = %q, want empty", got)
+	}
+}
+
+func TestAlignedLiveObjs(t *testing.T) {
+	cm := func(ns, name string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": name, "namespace": ns},
+		}}
+	}
+	target := []*unstructured.Unstructured{cm("team-a", "one"), cm("team-a", "two")}
+	liveOne := cm("team-a", "one")
+	lives := map[kube.ResourceKey]*unstructured.Unstructured{
+		kube.GetResourceKey(liveOne): liveOne,
+		// an extra managed live object not in target (prune candidate) must
+		// not disturb alignment
+		kube.GetResourceKey(cm("team-a", "gone")): cm("team-a", "gone"),
+	}
+
+	aligned := alignedLiveObjs(target, lives)
+	if len(aligned) != 2 {
+		t.Fatalf("len = %d, want 2 (one slot per target)", len(aligned))
+	}
+	if aligned[0] != liveOne {
+		t.Errorf("aligned[0] = %v, want the matching live object", aligned[0])
+	}
+	if aligned[1] != nil {
+		t.Errorf("aligned[1] = %v, want nil (no live state yet)", aligned[1])
 	}
 }
 
