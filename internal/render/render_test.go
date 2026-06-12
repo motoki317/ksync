@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestRender_PlainKustomization(t *testing.T) {
@@ -24,6 +26,36 @@ func TestRender_PlainKustomization(t *testing.T) {
 	}
 	if !strings.Contains(string(res.YAML), "team-a-settings") {
 		t.Errorf("YAML output does not contain the rendered resource name:\n%s", res.YAML)
+	}
+}
+
+// Rendered objects feed gitops-engine, which deep-copies them; unstructured's
+// DeepCopy panics on any value outside the JSON type set (a plain int where
+// int64 is required). A Deployment with numeric fields is the minimal
+// reproduction.
+func TestRender_ObjectsCarryJSONTypesOnly(t *testing.T) {
+	res, err := New(Options{}).Render("testdata/typed")
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(res.Objects) != 1 {
+		t.Fatalf("len(Objects) = %d, want 1", len(res.Objects))
+	}
+	obj := res.Objects[0]
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("DeepCopy panicked: %v (objects must contain JSON types only)", r)
+		}
+	}()
+	_ = obj.DeepCopy()
+
+	replicas, found, err := unstructured.NestedInt64(obj.Object, "spec", "replicas")
+	if err != nil || !found {
+		t.Fatalf("NestedInt64(spec.replicas): found=%v err=%v, want an int64", found, err)
+	}
+	if replicas != 3 {
+		t.Errorf("spec.replicas = %d, want 3", replicas)
 	}
 }
 

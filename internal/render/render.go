@@ -71,11 +71,19 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 	}
 	objs := make([]*unstructured.Unstructured, 0, resMap.Size())
 	for _, res := range resMap.Resources() {
-		m, err := res.Map()
+		// Not res.Map(): kyaml yields YAML-typed values (plain int), which
+		// break unstructured's JSON-types-only contract — DeepCopy panics on
+		// them during sync. The JSON round-trip converts numbers to
+		// int64/float64 as apimachinery requires.
+		data, err := res.MarshalJSON()
 		if err != nil {
+			return nil, fmt.Errorf("rendering %s: encoding %s: %w", dir, res.CurId(), err)
+		}
+		obj := &unstructured.Unstructured{}
+		if err := obj.UnmarshalJSON(data); err != nil {
 			return nil, fmt.Errorf("rendering %s: decoding %s: %w", dir, res.CurId(), err)
 		}
-		objs = append(objs, &unstructured.Unstructured{Object: m})
+		objs = append(objs, obj)
 	}
 	return &Result{YAML: yml, Objects: objs}, nil
 }
