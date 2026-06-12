@@ -54,6 +54,26 @@ apps:
 	}
 }
 
+func TestParse_NamespaceField(t *testing.T) {
+	yml := `
+context: docker-desktop
+apps:
+  - path: apps/api-b
+    namespace: team-a
+  - path: apps/shop
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Apps[0].Namespace != "team-a" {
+		t.Errorf("Apps[0].Namespace = %q, want team-a", cfg.Apps[0].Namespace)
+	}
+	if cfg.Apps[1].Namespace != "" {
+		t.Errorf("Apps[1].Namespace = %q, want empty (no default)", cfg.Apps[1].Namespace)
+	}
+}
+
 func TestParse_AbsolutePathKeptAsIs(t *testing.T) {
 	yml := `
 context: docker-desktop
@@ -102,6 +122,15 @@ func TestParse_ValidationErrors(t *testing.T) {
 			name:    "app without path",
 			yml:     "context: docker-desktop\napps:\n  - name: api-b\n",
 			wantErr: []string{"apps[0]", "path is required"},
+		},
+		{
+			name: "invalid namespace",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    namespace: Not_A_Namespace
+`,
+			wantErr: []string{"apps[0]", `namespace "Not_A_Namespace"`},
 		},
 		{
 			name: "duplicate explicit names",

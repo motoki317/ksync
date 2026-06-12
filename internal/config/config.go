@@ -34,6 +34,11 @@ type App struct {
 	// Path is the directory containing the kustomization file. Relative paths
 	// are resolved against the directory of the config file.
 	Path string `json:"path"`
+	// Namespace is the default namespace for rendered resources that set
+	// none — the equivalent of an ArgoCD Application's destination.namespace.
+	// When set, ksync also creates the namespace on sync if it is missing
+	// (it never modifies an existing one).
+	Namespace string `json:"namespace,omitempty"`
 	// Needs lists apps that must be synced before this one.
 	Needs []string `json:"needs,omitempty"`
 }
@@ -97,6 +102,12 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 		if msgs := validation.IsValidLabelValue(app.Name); len(msgs) > 0 {
 			errs = append(errs, fmt.Errorf("apps[%d]: name %q must be a valid Kubernetes label value (it becomes the ksync tracking label): %s",
 				i, app.Name, strings.Join(msgs, "; ")))
+		}
+		if app.Namespace != "" {
+			if msgs := validation.IsDNS1123Label(app.Namespace); len(msgs) > 0 {
+				errs = append(errs, fmt.Errorf("apps[%d] (%s): namespace %q is not a valid namespace name: %s",
+					i, app.Name, app.Namespace, strings.Join(msgs, "; ")))
+			}
 		}
 		if names[app.Name] {
 			errs = append(errs, fmt.Errorf("apps[%d]: duplicate name %q", i, app.Name))

@@ -42,6 +42,20 @@ func TestStampTracking_HandlesObjectsWithoutLabels(t *testing.T) {
 	}
 }
 
+func TestCreateNamespaceIfMissing_CreatesOnlyWhenAbsent(t *testing.T) {
+	live := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata":   map[string]any{"name": "team-a"},
+	}}
+	if create, err := createNamespaceIfMissing(nil, nil); err != nil || !create {
+		t.Errorf("missing namespace: (create, err) = (%v, %v), want (true, nil)", create, err)
+	}
+	if create, err := createNamespaceIfMissing(nil, live); err != nil || create {
+		t.Errorf("existing namespace: (create, err) = (%v, %v), want (false, nil) — ksync must never modify an existing namespace", create, err)
+	}
+}
+
 func TestRevision_ChangesWithContentOnly(t *testing.T) {
 	objs := func(data string) []*unstructured.Unstructured {
 		return []*unstructured.Unstructured{{Object: map[string]any{

@@ -146,7 +146,7 @@ func runSync(args []string) error {
 		if err != nil {
 			return fmt.Errorf("app %s: %w", app.Name, err)
 		}
-		results, err := eng.Sync(ctx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune})
+		results, err := eng.Sync(ctx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune, Namespace: app.Namespace})
 		if err != nil {
 			return fmt.Errorf("app %s: sync: %w", app.Name, err)
 		}
@@ -179,8 +179,12 @@ func runWatch(args []string) error {
 	}
 	defer eng.Close()
 
+	nsByApp := make(map[string]string, len(apps))
+	for _, a := range apps {
+		nsByApp[a.Name] = a.Namespace
+	}
 	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) error {
-		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune})
+		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app]})
 		if err != nil {
 			return err
 		}

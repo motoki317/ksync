@@ -17,7 +17,9 @@ type SyncOptions struct {
 	// Prune deletes tracked resources of the app that are absent from the
 	// target set.
 	Prune bool
-	// Namespace is applied to namespaced resources that carry none.
+	// Namespace is the app's default namespace (ArgoCD destination.namespace
+	// parity): gitops-engine stamps it on target objects that set none, and
+	// when non-empty the namespace itself is created on sync if missing.
 	Namespace string
 }
 
@@ -40,7 +42,19 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		// server-side.
 		sync.WithServerSideApply(true),
 		sync.WithServerSideApplyManager(fieldManager),
+		// Registering a namespace modifier turns on gitops-engine's namespace
+		// auto-creation for opts.Namespace (a no-op when it is empty).
+		sync.WithNamespaceModifier(createNamespaceIfMissing),
 	)
+}
+
+// createNamespaceIfMissing is ksync's namespace auto-creation contract — the
+// behavior of ArgoCD's CreateNamespace=true without managed namespace
+// metadata: create the app's default namespace when absent, never touch an
+// existing one (returning true for an existing namespace would overwrite its
+// metadata).
+func createNamespaceIfMissing(_, live *unstructured.Unstructured) (bool, error) {
+	return live == nil, nil
 }
 
 // StampTracking returns copies of objs labeled as belonging to app. Copies,
