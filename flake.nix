@@ -79,7 +79,15 @@
             pname = "ksync";
             inherit version;
             src = ./.;
-            vendorHash = "sha256-nXpmr8Ibnyq3gZFY/iF4FeKJ3f8vBXHdSQBRi/5eMNc=";
+            # proxyVendor makes the vendor derivation a `go mod download` module
+            # cache — a pure function of go.mod/go.sum. The default (`go mod
+            # vendor`) also depends on which packages the *source* imports, so a
+            # new import of an already-required module silently stales
+            # vendorHash without touching go.mod — invisible to the
+            # ksync-nix-build hook below, which fires only on dependency/flake
+            # files. proxyVendor is what makes that file gate sound.
+            proxyVendor = true;
+            vendorHash = "sha256-BjCcLbrZnoPtS+hGmLKSgZ5RT0t1S/AYeWoX4MbVk4Q=";
             subPackages = [ "cmd/ksync" ];
             ldflags = [ "-s" "-w" ];
             env.CGO_ENABLED = 0;

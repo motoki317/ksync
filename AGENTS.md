@@ -79,7 +79,8 @@ just leakcheck   # the no-leak guard alone
 The flake devShell (`nix develop` / direnv) installs commit-time git hooks: every commit runs
 `just pre-commit` (build, gofmt, vet, go test — each commit must compile and pass), and a second
 hook runs `just nix-build` ONLY when the commit touches `go.mod`/`go.sum`/`flake.nix`/`flake.lock`
-— the only changes that can break the Nix path (e.g. a stale `vendorHash`). There is no pre-push
+— the only changes that can break the Nix path (e.g. a stale `vendorHash`; sound because the
+flake sets `proxyVendor`, pinning `vendorHash` to go.mod/go.sum alone). There is no pre-push
 hook; the guarantee lives at commit time so non-building commits never land in history.
 
 ## Conventions
