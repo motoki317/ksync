@@ -18,9 +18,38 @@ What ksync is **not**:
 
 > **Status: core loop working.** `watch`, `sync`, `render`, and `destroy` are implemented
 > (long-running watch loop with debounced incremental re-render, server-side apply, tracked
-> prune, backoff retries). Not yet done: `diff`, namespace auto-creation, exec-plugin
+> prune, namespace auto-creation, backoff retries). Not yet done: `diff`, exec-plugin
 > (e.g. ksops) rendering, hook-semantics conformance fixtures, and the perf validation
 > against the target numbers.
+
+## Quickstart
+
+Declare your apps in a `ksync.yaml`:
+
+```yaml
+context: docker-desktop        # the ONLY kubectl context ksync will touch
+apps:
+  - path: apps/shop
+  - name: api-b
+    path: apps/api-b
+    namespace: team-a          # default ns for rendered resources without one
+    needs: [db]                # sync db before api-b
+  - name: db
+    path: apps/postgres
+    namespace: team-a
+```
+
+Then run the loop and edit your manifests:
+
+```bash
+ksync sync            # one-shot: converge the cluster to the local files
+ksync watch           # keep watching; re-render + apply affected apps on save
+ksync render api-b    # print the rendered YAML of one app (no cluster access)
+ksync destroy -yes    # delete everything ksync tracks (and nothing else)
+```
+
+The full guide — every field, every flag, how tracking/prune/hooks behave, troubleshooting —
+is in **[docs/usage.md](docs/usage.md)**.
 
 ## Design pillars
 

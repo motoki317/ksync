@@ -1,8 +1,8 @@
 # Agent guide
 
 Compact navigation aid for AI agents working on this repo — the "where do I look" sheet. Humans
-see [README.md](README.md); design rationale lives in ADRs ([docs/ADR/](docs/ADR/)). Keep this
-file scannable — push detail to those.
+see [README.md](README.md) and the user guide ([docs/usage.md](docs/usage.md)); design rationale
+lives in ADRs ([docs/ADR/](docs/ADR/)). Keep this file scannable — push detail to those.
 
 ## What ksync is
 
@@ -37,7 +37,8 @@ re-litigate only with new evidence):
 - `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / destroy`
   implemented; `diff` still a stub).
 - `internal/config` — ksync.yaml model: app list, single explicit kubectl context (the safety
-  model), `needs` DAG; `SortByNeeds`.
+  model), per-app default namespace (ArgoCD destination.namespace parity), `needs` DAG;
+  `SortByNeeds`.
 - `internal/render` — in-process kustomize (krusty) replicating
   `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
   binary is enforced by test.
@@ -46,7 +47,8 @@ re-litigate only with new evidence):
 - `internal/schedule` — pure scheduling state machine: debounce/coalesce, per-app
   serialization, bounded parallelism, needs gating, exponential retry backoff.
 - `internal/engine` — gitops-engine wrapper (pin: argo-cd release-tag commits; k8s.io/* follow
-  the engine's version): warm cluster cache, SSA, tracking-label-scoped prune.
+  the engine's version): warm cluster cache, SSA, tracking-label-scoped prune, app-namespace
+  auto-creation (create-if-missing only).
 - `internal/loop` — the watch-mode event loop tying the above together; cluster side injected
   as a SyncFunc so it tests without a cluster.
 - `internal/leakcheck` — the no-leak guard (see Conventions).
