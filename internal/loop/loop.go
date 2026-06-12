@@ -1,17 +1,22 @@
 // Package loop is the watch-mode heart of ksync: it wires the file watcher,
-// the dirty-set mapping, the scheduler, and the renderer into one event loop
-// that renders and syncs apps as their inputs change. The cluster side is
-// injected as a SyncFunc so the loop is testable without a cluster.
+// the dirty-set mapping, the scheduler, the builder, and the renderer into
+// one event loop that builds, renders, and syncs apps as their inputs change.
+// The cluster and docker sides are injected as SyncFunc/BuildFunc so the loop
+// is testable without either.
 package loop
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/motoki317/ksync/internal/build"
 	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/render"
 	"github.com/motoki317/ksync/internal/schedule"
@@ -21,6 +26,10 @@ import (
 // SyncFunc applies one app's rendered objects to the cluster.
 type SyncFunc func(ctx context.Context, app string, objects []*unstructured.Unstructured) error
 
+// BuildFunc produces the image of one build entry and returns the full
+// content-addressed ref.
+type BuildFunc func(ctx context.Context, b config.Build) (string, error)
+
 // Options tune the loop; zero values get sensible watch-mode defaults.
 type Options struct {
 	Debounce    time.Duration // default 200ms
@@ -28,6 +37,7 @@ type Options struct {
 	RetryBase   time.Duration // default 1s
 	RetryMax    time.Duration // default 2m
 	Render      render.Options
+	Build       BuildFunc // required when any app declares builds
 	Log         logr.Logger
 }
 
@@ -49,9 +59,21 @@ func (o *Options) applyDefaults() {
 	}
 }
 
-// Run watches the apps' inputs and renders+syncs them on change until ctx is
-// done. Every app is synced once at startup so the cluster converges to the
-// current working tree before incremental behavior takes over.
+// buildState is the loop's per-build-entry memory: whether sources changed
+// since the last successful build, and the last built tag (re-injected on
+// every render until a newer build replaces it).
+type buildState struct {
+	scope *build.Scope
+	dirty bool
+	tag   string
+}
+
+// Run watches the apps' inputs and builds+renders+syncs them on change until
+// ctx is done. Every app is synced — and every build entry built — once at
+// startup, so the cluster converges to the current working tree before
+// incremental behavior takes over. Startup builds are how ksync avoids
+// persisting build state: unchanged sources hit the docker layer cache and
+// produce the tag already deployed.
 func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) error {
 	opts.applyDefaults()
 	log := opts.Log
@@ -60,12 +82,36 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	byName := make(map[string]config.App, len(apps))
 	scheduleApps := make([]schedule.App, len(apps))
 	for i, a := range apps {
+		if len(a.Build) > 0 && opts.Build == nil {
+			return fmt.Errorf("app %s declares builds but no build function is configured", a.Name)
+		}
 		byName[a.Name] = a
 		scheduleApps[i] = schedule.App{Name: a.Name, Needs: a.Needs}
 	}
 
+	builds := make(map[string][]buildState, len(apps))
+	deriveScopes := func(app config.App) {
+		states := builds[app.Name]
+		for j := range states {
+			scope, err := build.WatchScope(app.Build[j])
+			if err != nil {
+				log.Error(err, "deriving build watch scope; watching without ignore rules", "app", app.Name, "image", app.Build[j].Image)
+			}
+			states[j].scope = scope
+		}
+	}
+	for _, a := range apps {
+		states := make([]buildState, len(a.Build))
+		for j := range states {
+			states[j].dirty = true
+		}
+		builds[a.Name] = states
+		deriveScopes(a)
+	}
+
 	// Roots are re-derived after every run because a kustomization edit can
-	// change what it references (e.g. a new chartHome).
+	// change what it references (e.g. a new chartHome), and a build's
+	// .dockerignore can change what affects the image.
 	appRoots := make([]watch.AppRoots, len(apps))
 	rebuildRoots := func(i int) {
 		app := apps[i]
@@ -79,9 +125,38 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	for i := range apps {
 		rebuildRoots(i)
 	}
-	mapping := watch.NewMapping(appRoots)
+	mappingEntries := func() []watch.AppRoots {
+		entries := append([]watch.AppRoots{}, appRoots...)
+		for _, a := range apps {
+			for j, st := range builds[a.Name] {
+				entries = append(entries, watch.AppRoots{
+					App:    buildKey(a.Name, j),
+					Roots:  st.scope.Roots,
+					Ignore: st.scope.Ignored,
+				})
+			}
+		}
+		return entries
+	}
+	watchRoots := func() []watch.Root {
+		var roots []watch.Root
+		for _, ar := range appRoots {
+			for _, r := range ar.Roots {
+				roots = append(roots, watch.Root{Path: r})
+			}
+		}
+		for _, a := range apps {
+			for _, st := range builds[a.Name] {
+				for _, r := range st.scope.Roots {
+					roots = append(roots, watch.Root{Path: r, Skip: st.scope.SkipDir})
+				}
+			}
+		}
+		return roots
+	}
+	mapping := watch.NewMapping(mappingEntries())
 
-	watcher, err := watch.NewWatcher(mapping.AllRoots())
+	watcher, err := watch.NewWatcher(watchRoots())
 	if err != nil {
 		return err
 	}
@@ -98,10 +173,6 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		sched.MarkDirty(a.Name, now)
 	}
 
-	type result struct {
-		app string
-		ok  bool
-	}
 	results := make(chan result)
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -109,12 +180,26 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	for {
 		for _, name := range sched.StartDue(time.Now()) {
 			app := byName[name]
+			states := builds[name]
+			// Snapshot the work under the loop goroutine: the run goroutine
+			// must not touch shared state.
+			var todo []int
+			tags := make(map[int]string, len(states))
+			for j := range states {
+				if states[j].dirty {
+					todo = append(todo, j)
+					states[j].dirty = false
+				}
+				if states[j].tag != "" {
+					tags[j] = states[j].tag
+				}
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ok := renderAndSync(ctx, renderer, app, syncFn, log)
+				r := runApp(ctx, renderer, app, todo, tags, opts.Build, syncFn, log)
 				select {
-				case results <- result{app: app.Name, ok: ok}:
+				case results <- r:
 				case <-ctx.Done():
 				}
 			}()
@@ -133,23 +218,40 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				return nil
 			}
 			now := time.Now()
-			for _, app := range mapping.AffectedBy(path) {
-				log.V(1).Info("change detected", "path", path, "app", app)
-				sched.MarkDirty(app, now)
+			for _, key := range mapping.AffectedBy(path) {
+				name, entry, isBuild := parseKey(key)
+				if isBuild {
+					log.V(1).Info("source change detected", "path", path, "app", name, "image", byName[name].Build[entry].Image)
+					builds[name][entry].dirty = true
+				} else {
+					log.V(1).Info("change detected", "path", path, "app", name)
+				}
+				sched.MarkDirty(name, now)
 			}
 		case err := <-watcher.Errors:
 			log.Error(err, "watch error")
 		case r := <-results:
+			states := builds[r.app]
+			// Tags from successful builds stick even when the run failed
+			// later (a failed sync must not force a rebuild); failed builds
+			// re-dirty so the retry runs them again.
+			for j, tag := range r.built {
+				states[j].tag = tag
+			}
+			for _, j := range r.failed {
+				states[j].dirty = true
+			}
 			sched.Finish(r.app, r.ok, time.Now())
 			// The run may have changed what the app references.
 			for i, a := range apps {
 				if a.Name == r.app {
 					rebuildRoots(i)
+					deriveScopes(a)
 				}
 			}
-			mapping = watch.NewMapping(appRoots)
-			for _, root := range mapping.AllRoots() {
-				_ = watcher.Add(root) // idempotent; new roots start being watched
+			mapping = watch.NewMapping(mappingEntries())
+			if err := watcher.SetRoots(watchRoots()); err != nil {
+				log.Error(err, "re-deriving watch roots")
 			}
 		case <-timerC:
 			// A debounce or retry deadline passed; StartDue above picks it up.
@@ -157,17 +259,75 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	}
 }
 
-func renderAndSync(ctx context.Context, renderer *render.Renderer, app config.App, syncFn SyncFunc, log logr.Logger) bool {
+type result struct {
+	app    string
+	ok     bool
+	built  map[int]string // entry -> dev tag, recorded even when the run fails later
+	failed []int          // entries whose build must run again
+}
+
+// runApp is one scheduled run of one app: build the dirty entries, render,
+// inject the known dev tags, sync. A build failure aborts before render —
+// syncing manifests whose images were never built would deploy whatever tag
+// the manifests pin, which is exactly not the local source.
+func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo []int, tags map[int]string, buildFn BuildFunc, syncFn SyncFunc, log logr.Logger) result {
 	started := time.Now()
+	r := result{app: app.Name, built: map[int]string{}}
+	for i, j := range todo {
+		b := app.Build[j]
+		log.Info("building image", "app", app.Name, "image", b.Image)
+		buildStarted := time.Now()
+		ref, err := buildFn(ctx, b)
+		if err != nil {
+			log.Error(err, "build failed", "app", app.Name, "image", b.Image)
+			r.failed = todo[i:]
+			return r
+		}
+		log.Info("image built", "app", app.Name, "ref", ref, "took", time.Since(buildStarted).String())
+		tag := build.Tag(ref)
+		r.built[j] = tag
+		tags[j] = tag
+	}
+
 	res, err := renderer.Render(app.Path)
 	if err != nil {
 		log.Error(err, "render failed", "app", app.Name)
-		return false
+		return r
+	}
+	if len(tags) > 0 {
+		images := make([]render.Image, 0, len(tags))
+		for j := range app.Build {
+			if tag, ok := tags[j]; ok {
+				images = append(images, render.Image{Name: app.Build[j].Image, NewTag: tag})
+			}
+		}
+		if err := res.SetImages(images); err != nil {
+			log.Error(err, "injecting built image tags failed", "app", app.Name)
+			return r
+		}
 	}
 	if err := syncFn(ctx, app.Name, res.Objects); err != nil {
 		log.Error(err, "sync failed", "app", app.Name)
-		return false
+		return r
 	}
 	log.Info("synced", "app", app.Name, "objects", len(res.Objects), "took", time.Since(started).String())
-	return true
+	r.ok = true
+	return r
+}
+
+// keySep joins app name and build-entry index into one mapping key; NUL can
+// never appear in an app name (names are Kubernetes label values).
+const keySep = "\x00"
+
+func buildKey(app string, entry int) string {
+	return app + keySep + strconv.Itoa(entry)
+}
+
+func parseKey(key string) (app string, entry int, isBuild bool) {
+	app, num, found := strings.Cut(key, keySep)
+	if !found {
+		return key, 0, false
+	}
+	entry, _ = strconv.Atoi(num)
+	return app, entry, true
 }

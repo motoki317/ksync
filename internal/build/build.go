@@ -90,6 +90,12 @@ func (bd *Builder) Build(ctx context.Context, b config.Build) (string, error) {
 	return ref, nil
 }
 
+// Tag extracts the tag part of a ref Build returned — what callers feed to
+// the render-time image override (which pairs it with the bare image name).
+func Tag(ref string) string {
+	return ref[strings.LastIndex(ref, ":")+1:]
+}
+
 // devTag derives the dev tag from a docker image ID ("sha256:<64 hex>"). 12
 // hex digits match docker's own short-ID display and keep collisions
 // irrelevant at local-daemon scale.

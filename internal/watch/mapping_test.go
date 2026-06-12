@@ -2,6 +2,7 @@ package watch
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +64,28 @@ func TestMapping_AppWithOverlappingRootsIsReportedOnce(t *testing.T) {
 	})
 	if got := m.AffectedBy("/repo/apps/api-b/extra/file.yaml"); len(got) != 1 {
 		t.Errorf("AffectedBy = %v, want exactly one entry", got)
+	}
+}
+
+func TestMapping_IgnorePredicateFiltersPaths(t *testing.T) {
+	m := NewMapping([]AppRoots{
+		{
+			App:    "api-b-build",
+			Roots:  []string{"/src/api-b"},
+			Ignore: func(path string) bool { return strings.HasSuffix(path, ".md") },
+		},
+		{App: "api-b", Roots: []string{"/src/api-b/manifests"}},
+	})
+	if got := m.AffectedBy("/src/api-b/README.md"); len(got) != 0 {
+		t.Errorf("AffectedBy = %v, want none (ignored by the entry's predicate)", got)
+	}
+	// The predicate binds to its own entry only: another entry watching an
+	// overlapping root still fires.
+	if got := m.AffectedBy("/src/api-b/manifests/notes.md"); !reflect.DeepEqual(got, []string{"api-b"}) {
+		t.Errorf("AffectedBy = %v, want [api-b]", got)
+	}
+	if got := m.AffectedBy("/src/api-b/main.go"); !reflect.DeepEqual(got, []string{"api-b-build"}) {
+		t.Errorf("AffectedBy = %v, want [api-b-build]", got)
 	}
 }
 

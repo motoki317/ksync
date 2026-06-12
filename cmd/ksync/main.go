@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2/textlogger"
 
+	"github.com/motoki317/ksync/internal/build"
 	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/engine"
 	"github.com/motoki317/ksync/internal/loop"
@@ -145,10 +146,26 @@ func runSync(args []string) error {
 	defer eng.Close()
 
 	r := render.New(render.Options{})
+	builder := &build.Builder{}
 	for _, app := range apps {
+		// Build before render so the applied manifests always reference
+		// images that exist in the local daemon.
+		images := make([]render.Image, 0, len(app.Build))
+		for _, b := range app.Build {
+			ref, err := builder.Build(ctx, b)
+			if err != nil {
+				return fmt.Errorf("app %s: building %s: %w", app.Name, b.Image, err)
+			}
+			images = append(images, render.Image{Name: b.Image, NewTag: build.Tag(ref)})
+		}
 		res, err := r.Render(app.Path)
 		if err != nil {
 			return fmt.Errorf("app %s: %w", app.Name, err)
+		}
+		if len(images) > 0 {
+			if err := res.SetImages(images); err != nil {
+				return fmt.Errorf("app %s: %w", app.Name, err)
+			}
 		}
 		results, err := eng.Sync(ctx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune, Namespace: app.Namespace})
 		if err != nil {
@@ -195,9 +212,11 @@ func runWatch(args []string) error {
 		printSyncResults(os.Stdout, app, results)
 		return nil
 	}
+	builder := &build.Builder{}
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
+		Build:       builder.Build,
 		Log:         log,
 	})
 }

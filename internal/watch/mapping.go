@@ -14,6 +14,10 @@ import (
 type AppRoots struct {
 	App   string
 	Roots []string
+	// Ignore filters changed paths that cannot affect the app even though
+	// they lie under a root (build entries pass dockerignore semantics here).
+	// nil ignores nothing.
+	Ignore func(path string) bool
 }
 
 // Mapping resolves changed file paths to the apps that must re-render.
@@ -30,7 +34,7 @@ func NewMapping(apps []AppRoots) *Mapping {
 		for j, r := range a.Roots {
 			roots[j] = filepath.Clean(r)
 		}
-		cleaned[i] = AppRoots{App: a.App, Roots: roots}
+		cleaned[i] = AppRoots{App: a.App, Roots: roots, Ignore: a.Ignore}
 	}
 	return &Mapping{apps: cleaned}
 }
@@ -41,6 +45,9 @@ func (m *Mapping) AffectedBy(path string) []string {
 	path = filepath.Clean(path)
 	var affected []string
 	for _, a := range m.apps {
+		if a.Ignore != nil && a.Ignore(path) {
+			continue
+		}
 		for _, root := range a.Roots {
 			if path == root || isBelow(root, path) {
 				affected = append(affected, a.App)

@@ -3,6 +3,7 @@ package watch
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,9 +61,74 @@ func TestWatcher_SeesFilesInDirectoriesCreatedAfterStart(t *testing.T) {
 	expectEvent(t, w, target)
 }
 
+func TestWatcher_SkipPredicatePrunesDirectories(t *testing.T) {
+	tmp := t.TempDir()
+	skipped := filepath.Join(tmp, "target")
+	kept := filepath.Join(tmp, "src")
+	for _, d := range []string{skipped, kept} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w, err := NewWatcher([]Root{{
+		Path: tmp,
+		Skip: func(dir string) bool { return dir == skipped },
+	}})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	// A change in the pruned directory must produce no event; one in the
+	// kept directory proves the watcher is alive and ordering the check.
+	if err := os.WriteFile(filepath.Join(skipped, "artifact"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(kept, "main.rs")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	expectEvent(t, w, target)
+	select {
+	case got := <-w.Events:
+		if strings.HasPrefix(got, skipped+string(filepath.Separator)) {
+			t.Errorf("got event %q from a pruned directory", got)
+		}
+	default:
+	}
+}
+
+func TestWatcher_OverlappingRootKeepsSkippedDirWatched(t *testing.T) {
+	tmp := t.TempDir()
+	inner := filepath.Join(tmp, "manifests")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The outer root prunes everything below it, but the inner root (a
+	// manifest dir living inside a build context) must stay watched.
+	w, err := NewWatcher([]Root{
+		{Path: tmp, Skip: func(dir string) bool { return dir != tmp }},
+		{Path: inner},
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	target := filepath.Join(inner, "kustomization.yaml")
+	if err := os.WriteFile(target, []byte("resources: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	expectEvent(t, w, target)
+}
+
 func newTestWatcher(t *testing.T, roots ...string) *Watcher {
 	t.Helper()
-	w, err := NewWatcher(roots)
+	rs := make([]Root, len(roots))
+	for i, r := range roots {
+		rs[i] = Root{Path: r}
+	}
+	w, err := NewWatcher(rs)
 	if err != nil {
 		t.Fatalf("NewWatcher: %v", err)
 	}

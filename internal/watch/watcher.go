@@ -5,15 +5,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/fsnotify/fsnotify"
 )
 
+// Root is one watched root. Skip prunes directories beneath it whose content
+// cannot matter (dockerignored build-context subtrees) — pruning matters
+// beyond noise: fsnotify on macOS holds one kqueue descriptor per watched
+// directory, so walking a large excluded tree exhausts the fd limit. nil
+// watches everything under Path.
+type Root struct {
+	Path string
+	Skip func(dir string) bool
+}
+
 // Watcher reports file changes under a set of roots, recursively. fsnotify
-// only watches single directories, so the Watcher walks each root at Add time
-// and registers directories created later as they appear.
+// only watches single directories, so the Watcher walks each root at
+// SetRoots time and registers directories created later as they appear.
 type Watcher struct {
 	fsw *fsnotify.Watcher
+
+	mu    sync.Mutex
+	roots []Root
+
 	// Events carries changed file paths, already filtered of VCS/editor
 	// noise. Closed when the watcher closes.
 	Events chan string
@@ -22,27 +37,41 @@ type Watcher struct {
 	Errors chan error
 }
 
-func NewWatcher(roots []string) (*Watcher, error) {
+func NewWatcher(roots []Root) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 	w := &Watcher{fsw: fsw, Events: make(chan string, 256), Errors: make(chan error, 1)}
-	for _, root := range roots {
-		if err := w.Add(root); err != nil {
-			_ = fsw.Close()
-			return nil, err
-		}
+	if err := w.SetRoots(roots); err != nil {
+		_ = fsw.Close()
+		return nil, err
 	}
 	go w.run()
 	return w, nil
 }
 
-// Add starts watching a root. Directories are walked recursively; for a file
+// SetRoots replaces the root set and starts watching roots not yet observed.
+// Roots that disappeared from the set stay registered with fsnotify — the
+// mapping decides relevance of events, not the watcher — and roots that do
+// not exist yet are skipped; a later SetRoots picks them up once created.
+func (w *Watcher) SetRoots(roots []Root) error {
+	w.mu.Lock()
+	w.roots = roots
+	w.mu.Unlock()
+	var firstErr error
+	for _, r := range roots {
+		if err := w.add(r.Path); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// add starts watching a root. Directories are walked recursively; for a file
 // root its parent directory is watched (events for siblings are filtered out
-// downstream by the Mapping). A root that does not exist yet is skipped —
-// re-Adding after dependency roots are re-derived picks it up once created.
-func (w *Watcher) Add(root string) error {
+// downstream by the Mapping).
+func (w *Watcher) add(root string) error {
 	st, err := os.Stat(root)
 	if err != nil {
 		return nil
@@ -57,8 +86,31 @@ func (w *Watcher) Add(root string) error {
 		if d.Name() == ".git" {
 			return fs.SkipDir
 		}
+		if p != root && w.skippable(p) {
+			return fs.SkipDir
+		}
 		return w.fsw.Add(p)
 	})
+}
+
+// skippable reports whether every root covering dir prunes it. One covering
+// root that wants the directory watched keeps it watched — roots overlap
+// (a manifest dir inside a build context, two builds sharing a context), and
+// pruning is only safe when no observer cares.
+func (w *Watcher) skippable(dir string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	covered := false
+	for _, r := range w.roots {
+		if dir != r.Path && !isBelow(r.Path, dir) {
+			continue
+		}
+		if r.Skip == nil || !r.Skip(dir) {
+			return false
+		}
+		covered = true
+	}
+	return covered
 }
 
 func (w *Watcher) Close() error {
@@ -79,8 +131,8 @@ func (w *Watcher) run() {
 				continue
 			}
 			if ev.Op&fsnotify.Create != 0 {
-				if st, err := os.Stat(ev.Name); err == nil && st.IsDir() {
-					_ = w.Add(ev.Name) // best-effort; a failed add surfaces as missed events, not a crash
+				if st, err := os.Stat(ev.Name); err == nil && st.IsDir() && !w.skippable(ev.Name) {
+					_ = w.add(ev.Name) // best-effort; a failed add surfaces as missed events, not a crash
 				}
 			}
 			w.Events <- ev.Name

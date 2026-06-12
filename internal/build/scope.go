@@ -50,21 +50,24 @@ func WatchScope(b config.Build) (*Scope, error) {
 			ignoreFile = specific
 		}
 	}
+	// On ignore-file errors the scope is still returned usable, just without
+	// ignore rules — over-watching is the safe direction (extra rebuilds,
+	// never missed ones); the caller logs the error.
 	f, err := os.Open(ignoreFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return s, nil
 		}
-		return nil, err
+		return s, err
 	}
 	defer func() { _ = f.Close() }()
 	patterns, err := ignorefile.ReadAll(f)
 	if err != nil {
-		return nil, err
+		return s, err
 	}
 	matcher, err := patternmatcher.New(patterns)
 	if err != nil {
-		return nil, err
+		return s, err
 	}
 	s.matcher = matcher
 	s.Roots = append(s.Roots, ignoreFile)
