@@ -41,6 +41,33 @@ type App struct {
 	Namespace string `json:"namespace,omitempty"`
 	// Needs lists apps that must be synced before this one.
 	Needs []string `json:"needs,omitempty"`
+	// Build lists images built from local sources for this app. When a
+	// build's watched sources change, ksync rebuilds the image and injects
+	// the new tag into the rendered manifests before syncing.
+	Build []Build `json:"build,omitempty"`
+}
+
+// Build declares one locally built image. Design rationale:
+// docs/ADR/20260612-build-integration.md.
+type Build struct {
+	// Image is the image name exactly as the rendered manifests reference it
+	// (no tag or digest) — it selects which image fields the built tag is
+	// injected into, with kustomize `images:` matching semantics.
+	Image string `json:"image"`
+	// Context is the docker build context directory. Relative paths are
+	// resolved against the config file's directory.
+	Context string `json:"context"`
+	// Dockerfile is resolved against Context (docker-compose convention).
+	// Defaults to "Dockerfile" in the context; unused with Command.
+	Dockerfile string `json:"dockerfile,omitempty"`
+	// Watch narrows which paths (resolved against Context) dirty this build.
+	// Default: the whole context, minus .dockerignore exclusions — needed for
+	// monorepos where one shared context feeds many images.
+	Watch []string `json:"watch,omitempty"`
+	// Command replaces `docker build` for flows it cannot express (bake,
+	// host-side compilation, …). It runs via `sh -c` in the context directory
+	// and must leave the image tagged $KSYNC_IMAGE in the local docker daemon.
+	Command string `json:"command,omitempty"`
 }
 
 // Load reads, parses, and validates the config file at path, additionally
@@ -58,6 +85,18 @@ func Load(path string) (*Config, error) {
 	for i, app := range cfg.Apps {
 		if !hasKustomizationFile(app.Path) {
 			errs = append(errs, fmt.Errorf("apps[%d] (%s): no kustomization file in %s", i, app.Name, app.Path))
+		}
+		for j, b := range app.Build {
+			where := fmt.Sprintf("apps[%d] (%s) build[%d]", i, app.Name, j)
+			if st, err := os.Stat(b.Context); err != nil || !st.IsDir() {
+				errs = append(errs, fmt.Errorf("%s: build context %s is not a directory", where, b.Context))
+				continue
+			}
+			if b.Command == "" {
+				if st, err := os.Stat(b.Dockerfile); err != nil || st.IsDir() {
+					errs = append(errs, fmt.Errorf("%s: no Dockerfile at %s (set dockerfile: or command:)", where, b.Dockerfile))
+				}
+			}
 		}
 	}
 	if len(errs) > 0 {
@@ -117,6 +156,47 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 			errs = append(errs, fmt.Errorf("apps[%d] (%s): duplicate path %q", i, app.Name, app.Path))
 		}
 		paths[app.Path] = true
+	}
+
+	// One build definition per image, across all apps: two recipes for the
+	// same name would race over which tag the manifests get.
+	imageOwner := make(map[string]string)
+	for i := range cfg.Apps {
+		app := &cfg.Apps[i]
+		for j := range app.Build {
+			b := &app.Build[j]
+			where := fmt.Sprintf("apps[%d] (%s) build[%d]", i, app.Name, j)
+			switch {
+			case b.Image == "":
+				errs = append(errs, fmt.Errorf("%s: image is required", where))
+			case !validImageName(b.Image):
+				errs = append(errs, fmt.Errorf("%s: image %q must be the bare image name as the manifests reference it, without a tag or digest (ksync manages the tag)", where, b.Image))
+			case imageOwner[b.Image] != "":
+				errs = append(errs, fmt.Errorf("%s: image %q already has a build definition under app %q", where, b.Image, imageOwner[b.Image]))
+			default:
+				imageOwner[b.Image] = app.Name
+			}
+			if b.Context == "" {
+				errs = append(errs, fmt.Errorf("%s: context is required", where))
+				continue
+			}
+			if !filepath.IsAbs(b.Context) {
+				b.Context = filepath.Join(baseDir, b.Context)
+			}
+			b.Context = filepath.Clean(b.Context)
+			if b.Command != "" && b.Dockerfile != "" {
+				errs = append(errs, fmt.Errorf("%s: command and dockerfile are mutually exclusive (a command build must produce $KSYNC_IMAGE itself)", where))
+			}
+			if b.Command == "" && b.Dockerfile == "" {
+				b.Dockerfile = "Dockerfile"
+			}
+			if b.Dockerfile != "" {
+				b.Dockerfile = resolveAgainst(b.Context, b.Dockerfile)
+			}
+			for k, w := range b.Watch {
+				b.Watch[k] = resolveAgainst(b.Context, w)
+			}
+		}
 	}
 
 	for i := range cfg.Apps {
@@ -256,6 +336,24 @@ func findCycle(apps []App) string {
 		}
 	}
 	return ""
+}
+
+// validImageName accepts image references that carry no tag and no digest: a
+// colon in the last path segment is a tag separator (earlier colons belong to
+// a registry port), and "@" anywhere introduces a digest.
+func validImageName(ref string) bool {
+	if strings.ContainsAny(ref, "@ \t") {
+		return false
+	}
+	last := ref[strings.LastIndex(ref, "/")+1:]
+	return last != "" && !strings.Contains(last, ":")
+}
+
+func resolveAgainst(base, p string) string {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return filepath.Join(base, p)
 }
 
 func hasKustomizationFile(dir string) bool {

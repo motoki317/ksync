@@ -74,6 +74,192 @@ apps:
 	}
 }
 
+func TestParse_BuildEntryWithEveryField(t *testing.T) {
+	yml := `
+context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: example.com/team-a/api-b
+        context: ../src/api-b
+        dockerfile: build/Dockerfile.dev
+        watch: [src, Cargo.toml]
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	b := cfg.Apps[0].Build[0]
+	if b.Image != "example.com/team-a/api-b" {
+		t.Errorf("Image = %q", b.Image)
+	}
+	if want := filepath.Clean("/src/api-b"); b.Context != want {
+		t.Errorf("Context = %q, want %q (resolved against config dir)", b.Context, want)
+	}
+	if want := filepath.Join("/src/api-b", "build", "Dockerfile.dev"); b.Dockerfile != want {
+		t.Errorf("Dockerfile = %q, want %q (resolved against context)", b.Dockerfile, want)
+	}
+	if len(b.Watch) != 2 || b.Watch[0] != filepath.Join("/src/api-b", "src") || b.Watch[1] != filepath.Join("/src/api-b", "Cargo.toml") {
+		t.Errorf("Watch = %v, want paths resolved against context", b.Watch)
+	}
+}
+
+func TestParse_BuildDefaultsDockerfile(t *testing.T) {
+	yml := `
+context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src/api-b
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if want := filepath.Join("/src/api-b", "Dockerfile"); cfg.Apps[0].Build[0].Dockerfile != want {
+		t.Errorf("Dockerfile = %q, want %q (defaulted inside the context)", cfg.Apps[0].Build[0].Dockerfile, want)
+	}
+}
+
+func TestParse_BuildCommandLeavesDockerfileEmpty(t *testing.T) {
+	yml := `
+context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src
+        command: just build-api-b
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Apps[0].Build[0].Dockerfile; got != "" {
+		t.Errorf("Dockerfile = %q, want empty (a command build has no Dockerfile to default)", got)
+	}
+}
+
+func TestParse_BuildImageWithRegistryPortIsValid(t *testing.T) {
+	yml := `
+context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: localhost:5000/team-a/api-b
+        context: ../src/api-b
+`
+	if _, err := Parse([]byte(yml), "/cfg"); err != nil {
+		t.Fatalf("Parse rejected a registry-port image name: %v", err)
+	}
+}
+
+func TestParse_BuildValidationErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		yml     string
+		wantErr []string
+	}{
+		{
+			name: "build without image",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - context: ../src/api-b
+`,
+			wantErr: []string{"apps[0] (api-b) build[0]", "image is required"},
+		},
+		{
+			name: "image with tag",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b:dev
+        context: ../src/api-b
+`,
+			wantErr: []string{"build[0]", `image "api-b:dev"`, "tag"},
+		},
+		{
+			name: "image with digest",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b@sha256:abc
+        context: ../src/api-b
+`,
+			wantErr: []string{"build[0]", `image "api-b@sha256:abc"`},
+		},
+		{
+			name: "build without context",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+`,
+			wantErr: []string{"apps[0] (api-b) build[0]", "context is required"},
+		},
+		{
+			name: "command and dockerfile together",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src
+        dockerfile: Dockerfile.dev
+        command: just build
+`,
+			wantErr: []string{"build[0]", "command", "dockerfile"},
+		},
+		{
+			name: "duplicate image within an app",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src/one
+      - image: api-b
+        context: ../src/two
+`,
+			wantErr: []string{"build[1]", `image "api-b"`, "already"},
+		},
+		{
+			name: "duplicate image across apps",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: shared
+        context: ../src/one
+  - path: apps/shop
+    build:
+      - image: shared
+        context: ../src/two
+`,
+			wantErr: []string{"apps[1] (shop) build[0]", `image "shared"`, `"api-b"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.yml), "/cfg")
+			if err == nil {
+				t.Fatal("Parse succeeded, want validation error")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestParse_AbsolutePathKeptAsIs(t *testing.T) {
 	yml := `
 context: docker-desktop
@@ -295,6 +481,66 @@ func TestLoad_AcceptsAnyRecognizedKustomizationFileName(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoad_RejectsMissingBuildContextDir(t *testing.T) {
+	dir := t.TempDir()
+	writeApp(t, dir, "apps/api-b")
+	cfgPath := filepath.Join(dir, "ksync.yaml")
+	mustWriteFile(t, cfgPath, `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: src/api-b
+`)
+	_, err := Load(cfgPath)
+	if err == nil || !strings.Contains(err.Error(), "build context") {
+		t.Fatalf("Load = %v, want missing build context error", err)
+	}
+}
+
+func TestLoad_RejectsMissingDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	writeApp(t, dir, "apps/api-b")
+	mustMkdirAll(t, filepath.Join(dir, "src", "api-b"))
+	cfgPath := filepath.Join(dir, "ksync.yaml")
+	mustWriteFile(t, cfgPath, `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: src/api-b
+`)
+	_, err := Load(cfgPath)
+	if err == nil || !strings.Contains(err.Error(), "Dockerfile") {
+		t.Fatalf("Load = %v, want missing Dockerfile error", err)
+	}
+}
+
+func TestLoad_CommandBuildNeedsNoDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	writeApp(t, dir, "apps/api-b")
+	mustMkdirAll(t, filepath.Join(dir, "src", "api-b"))
+	cfgPath := filepath.Join(dir, "ksync.yaml")
+	mustWriteFile(t, cfgPath, `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: src/api-b
+        command: just build
+`)
+	if _, err := Load(cfgPath); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+}
+
+func writeApp(t *testing.T, dir, rel string) {
+	t.Helper()
+	appDir := filepath.Join(dir, rel)
+	mustMkdirAll(t, appDir)
+	mustWriteFile(t, filepath.Join(appDir, "kustomization.yaml"), "resources: []\n")
 }
 
 func TestSelect_EmptyNamesMeansAllApps(t *testing.T) {
