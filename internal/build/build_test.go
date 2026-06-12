@@ -80,13 +80,22 @@ func TestBuilder_DockerfileBuild(t *testing.T) {
 	if bld.dir != ctxDir {
 		t.Errorf("build dir = %q, want the context", bld.dir)
 	}
-	for _, want := range []string{"docker", "build", "-f", b.Dockerfile, ctxDir} {
+	// --provenance=false is load-bearing: the attestation embeds timestamps,
+	// so identical content would otherwise get a new ID (and roll pods) on
+	// every rebuild.
+	for _, want := range []string{"docker", "build", "--provenance=false", "-f", b.Dockerfile, ctxDir} {
 		if !slices.Contains(bld.argv, want) {
 			t.Errorf("build argv %v missing %q", bld.argv, want)
 		}
 	}
-	if got := calls[1].argv; !slices.Equal(got, []string{"docker", "tag", imageID, ref}) {
-		t.Errorf("tag argv = %v, want docker tag %s %s", got, imageID, ref)
+	// Retagging must go through the temp name: the containerd image store
+	// does not resolve config digests in `docker tag`.
+	tmpRef := "example.com/team-a/api-b:ksync-build"
+	if !slices.Contains(bld.argv, tmpRef) {
+		t.Errorf("build argv %v missing temp tag %q", bld.argv, tmpRef)
+	}
+	if got := calls[1].argv; !slices.Equal(got, []string{"docker", "tag", tmpRef, ref}) {
+		t.Errorf("tag argv = %v, want docker tag %s %s", got, tmpRef, ref)
 	}
 }
 
@@ -123,6 +132,9 @@ func TestBuilder_CommandBuild(t *testing.T) {
 	}
 	if got := calls[1].argv; got[0] != "docker" || got[1] != "image" || got[2] != "inspect" || !slices.Contains(got, "api-b:ksync-build") {
 		t.Errorf("inspect argv = %v, want docker image inspect of the temp tag", got)
+	}
+	if got := calls[2].argv; !slices.Equal(got, []string{"docker", "tag", "api-b:ksync-build", ref}) {
+		t.Errorf("tag argv = %v, want retag from the temp name", got)
 	}
 }
 

@@ -47,6 +47,7 @@ func (bd *Builder) Build(ctx context.Context, b config.Build) (string, error) {
 		out = os.Stderr
 	}
 
+	tmpRef := b.Image + ":" + tempTag
 	var id string
 	if b.Command == "" {
 		iidFile, err := os.CreateTemp("", "ksync-iid-*")
@@ -56,7 +57,12 @@ func (bd *Builder) Build(ctx context.Context, b config.Build) (string, error) {
 		iidPath := iidFile.Name()
 		_ = iidFile.Close()
 		defer func() { _ = os.Remove(iidPath) }()
-		argv := []string{"docker", "build", "-f", b.Dockerfile, "--iidfile", iidPath, b.Context}
+		// --provenance=false: the default provenance attestation embeds build
+		// timestamps, giving identical content a new image ID on every build —
+		// which would defeat content-addressed tags and roll deployments on
+		// no-change rebuilds (verified against docker desktop's containerd
+		// image store).
+		argv := []string{"docker", "build", "--provenance=false", "-t", tmpRef, "-f", b.Dockerfile, "--iidfile", iidPath, b.Context}
 		if err := execFn(ctx, b.Context, nil, argv, out, out); err != nil {
 			return "", fmt.Errorf("building %s: %w", b.Image, err)
 		}
@@ -66,7 +72,6 @@ func (bd *Builder) Build(ctx context.Context, b config.Build) (string, error) {
 		}
 		id = strings.TrimSpace(string(raw))
 	} else {
-		tmpRef := b.Image + ":" + tempTag
 		env := []string{"KSYNC_IMAGE=" + tmpRef}
 		if err := execFn(ctx, b.Context, env, []string{"sh", "-c", b.Command}, out, out); err != nil {
 			return "", fmt.Errorf("build command for %s: %w", b.Image, err)
@@ -84,7 +89,10 @@ func (bd *Builder) Build(ctx context.Context, b config.Build) (string, error) {
 		return "", fmt.Errorf("building %s: %w", b.Image, err)
 	}
 	ref := b.Image + ":" + tag
-	if err := execFn(ctx, b.Context, nil, []string{"docker", "tag", id, ref}, out, out); err != nil {
+	// Retag from the temp name, not the ID: under docker's containerd image
+	// store the build-reported ID is the config digest, which `docker tag`
+	// does not resolve.
+	if err := execFn(ctx, b.Context, nil, []string{"docker", "tag", tmpRef, ref}, out, out); err != nil {
 		return "", fmt.Errorf("tagging %s: %w", ref, err)
 	}
 	return ref, nil

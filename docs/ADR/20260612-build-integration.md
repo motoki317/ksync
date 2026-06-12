@@ -37,6 +37,13 @@ with builds in it and understand the whole thing.
    (Skaffold's artifacts JSON and similar): ksync simply rebuilds on startup, and a restart
    converges instead of trusting a possibly stale file.
 
+   Two daemon behaviors verified live shape the implementation: docker's default
+   provenance attestation embeds build timestamps, so identical content would get a new ID
+   on every build — ksync passes `--provenance=false` (and `command` builds should do the
+   same for stable tags). And under the containerd image store `docker tag` does not
+   resolve the build-reported config digest, so ksync names every build with a temp tag
+   (`<image>:ksync-build`) and retags from that name.
+
 3. **Tag injection has kustomize `images:` semantics and happens in-process.** The built
    tag is applied to the rendered resmap (before sync objects are extracted) with the same
    filters kustomize's builtin images transformer uses, so the result is identical to the
