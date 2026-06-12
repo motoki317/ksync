@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -130,6 +131,32 @@ func TestAlignedLiveObjs(t *testing.T) {
 	}
 	if aligned[1] != nil {
 		t.Errorf("aligned[1] = %v, want nil (no live state yet)", aligned[1])
+	}
+}
+
+func TestFailedResultsError(t *testing.T) {
+	ok := common.ResourceSyncResult{
+		ResourceKey: kube.ResourceKey{Group: "", Kind: "ConfigMap", Namespace: "team-a", Name: "settings"},
+		Status:      common.ResultCodeSynced,
+	}
+	failed := common.ResourceSyncResult{
+		ResourceKey: kube.ResourceKey{Group: "apps", Kind: "Deployment", Namespace: "team-a", Name: "api-b"},
+		Status:      common.ResultCodeSyncFailed,
+		Message:     "admission webhook denied",
+	}
+
+	if err := failedResultsError([]common.ResourceSyncResult{ok, ok}); err != nil {
+		t.Errorf("all-synced results produced error: %v", err)
+	}
+
+	err := failedResultsError([]common.ResourceSyncResult{ok, failed})
+	if err == nil {
+		t.Fatal("a SyncFailed result must produce an error — returning nil makes the watch loop treat the sync as successful and skip the retry")
+	}
+	for _, want := range []string{"Deployment", "api-b", "admission webhook denied"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
 	}
 }
 

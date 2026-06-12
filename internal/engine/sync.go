@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/cache"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/diff"
@@ -66,7 +68,30 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		}
 	}
 
-	return e.engine.Sync(ctx, target, isManaged, revision(target), opts.Namespace, syncOpts...)
+	results, err := e.engine.Sync(ctx, target, isManaged, revision(target), opts.Namespace, syncOpts...)
+	if err != nil {
+		return results, err
+	}
+	// gitops-engine returns a nil error when the operation completed with
+	// task-level failures (it errors only on operation-level errors), so a
+	// failed apply would otherwise look like success — the watch loop would
+	// log "synced" and never retry.
+	return results, failedResultsError(results)
+}
+
+// failedResultsError condenses task-level failures into one error, or nil if
+// every task succeeded.
+func failedResultsError(results []common.ResourceSyncResult) error {
+	var failed []string
+	for _, res := range results {
+		if res.Status == common.ResultCodeSyncFailed {
+			failed = append(failed, fmt.Sprintf("%s: %s", res.ResourceKey.String(), res.Message))
+		}
+	}
+	if len(failed) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d resource(s) failed to sync:\n%s", len(failed), strings.Join(failed, "\n"))
 }
 
 // fillDefaultNamespace sets namespace on namespaced objects that carry none —
