@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/validate/content"
+	"sigs.k8s.io/kustomize/api/konfig"
 	"sigs.k8s.io/yaml"
 )
 
@@ -206,13 +207,8 @@ func findCycle(apps []App) string {
 	return ""
 }
 
-// Recognized kustomization file names, kept in sync with kustomize's
-// konfig.RecognizedKustomizationFileNames; hardcoded until the kustomize
-// dependency lands with the renderer.
-var kustomizationFileNames = []string{"kustomization.yaml", "kustomization.yml", "Kustomization"}
-
 func hasKustomizationFile(dir string) bool {
-	for _, name := range kustomizationFileNames {
+	for _, name := range konfig.RecognizedKustomizationFileNames() {
 		if st, err := os.Stat(filepath.Join(dir, name)); err == nil && !st.IsDir() {
 			return true
 		}
