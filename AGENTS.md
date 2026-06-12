@@ -34,8 +34,22 @@ re-litigate only with new evidence):
 
 ## Repo at a glance
 
-- `cmd/ksync/main.go` — CLI entry; M1 subcommand stubs (`watch / sync / diff / render / destroy`).
-- `internal/leakcheck` — the no-leak guard (see Conventions). No other app code yet.
+- `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / destroy`
+  implemented; `diff` still a stub).
+- `internal/config` — ksync.yaml model: app list, single explicit kubectl context (the safety
+  model), `needs` DAG; `SortByNeeds`.
+- `internal/render` — in-process kustomize (krusty) replicating
+  `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
+  binary is enforced by test.
+- `internal/watch` — dirty-set mapping (changed path → affected apps), dependency-root
+  derivation (escaping chartHome/resources/values), recursive fsnotify watcher.
+- `internal/schedule` — pure scheduling state machine: debounce/coalesce, per-app
+  serialization, bounded parallelism, needs gating, exponential retry backoff.
+- `internal/engine` — gitops-engine wrapper (pin: argo-cd release-tag commits; k8s.io/* follow
+  the engine's version): warm cluster cache, SSA, tracking-label-scoped prune.
+- `internal/loop` — the watch-mode event loop tying the above together; cluster side injected
+  as a SyncFunc so it tests without a cluster.
+- `internal/leakcheck` — the no-leak guard (see Conventions).
 - `docs/ADR/` — dated decision records (`YYYYMMDD-title.md`, template at `_template.md`).
 - `docs/plans/` — gitignored single-session scratch.
 - `HANDOFF.md` — **gitignored, local-only**: the full research context (tool landscape survey

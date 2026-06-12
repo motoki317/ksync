@@ -16,8 +16,11 @@ What ksync is **not**:
 - Not a hot-reload/file-sync-into-container tool (mirrord/Telepresence cover that inner loop).
 - Not a GitOps controller (no in-cluster component; push-based, local-first).
 
-> **Status: early scaffolding.** The CLI surface (`watch` / `sync` / `diff` / `render` /
-> `destroy`) is stubbed; the sync engine is not implemented yet.
+> **Status: core loop working.** `watch`, `sync`, `render`, and `destroy` are implemented
+> (long-running watch loop with debounced incremental re-render, server-side apply, tracked
+> prune, backoff retries). Not yet done: `diff`, namespace auto-creation, exec-plugin
+> (e.g. ksops) rendering, hook-semantics conformance fixtures, and the perf validation
+> against the target numbers.
 
 ## Design pillars
 
