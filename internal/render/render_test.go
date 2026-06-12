@@ -24,8 +24,12 @@ func TestRender_PlainKustomization(t *testing.T) {
 	if obj.GetName() != "team-a-settings" {
 		t.Errorf("Name = %q, want team-a-settings (namePrefix applied)", obj.GetName())
 	}
-	if !strings.Contains(string(res.YAML), "team-a-settings") {
-		t.Errorf("YAML output does not contain the rendered resource name:\n%s", res.YAML)
+	yml, err := res.YAML()
+	if err != nil {
+		t.Fatalf("YAML: %v", err)
+	}
+	if !strings.Contains(string(yml), "team-a-settings") {
+		t.Errorf("YAML output does not contain the rendered resource name:\n%s", yml)
 	}
 }
 
@@ -68,7 +72,7 @@ func TestRender_HelmChartsInflatedFromSharedChartHome(t *testing.T) {
 		t.Fatalf("Render: %v", err)
 	}
 	if len(res.Objects) != 2 {
-		t.Fatalf("len(Objects) = %d, want 2 (one ConfigMap per release):\n%s", len(res.Objects), res.YAML)
+		t.Fatalf("len(Objects) = %d, want 2 (one ConfigMap per release)", len(res.Objects))
 	}
 	names := map[string]bool{}
 	for _, obj := range res.Objects {
@@ -110,8 +114,12 @@ func TestRender_MatchesKustomizeBuildOutput(t *testing.T) {
 			if err != nil {
 				t.Fatalf("kustomize build: %v", err)
 			}
-			if !bytes.Equal(res.YAML, out) {
-				t.Errorf("in-process output differs from `kustomize build`:\n--- in-process ---\n%s\n--- kustomize build ---\n%s", res.YAML, out)
+			yml, err := res.YAML()
+			if err != nil {
+				t.Fatalf("YAML: %v", err)
+			}
+			if !bytes.Equal(yml, out) {
+				t.Errorf("in-process output differs from `kustomize build`:\n--- in-process ---\n%s\n--- kustomize build ---\n%s", yml, out)
 			}
 		})
 	}

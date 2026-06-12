@@ -110,7 +110,11 @@ func runRender(args []string) error {
 		if i > 0 {
 			fmt.Println("---")
 		}
-		if _, err := os.Stdout.Write(res.YAML); err != nil {
+		yml, err := res.YAML()
+		if err != nil {
+			return fmt.Errorf("app %s: %w", app.Name, err)
+		}
+		if _, err := os.Stdout.Write(yml); err != nil {
 			return err
 		}
 	}

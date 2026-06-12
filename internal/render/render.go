@@ -10,6 +10,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/kustomize/api/krusty"
+	"sigs.k8s.io/kustomize/api/resmap"
 	"sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 )
@@ -23,12 +24,19 @@ type Options struct {
 
 // Result is the rendered output of one kustomization directory.
 type Result struct {
-	// YAML is the multi-document build output, byte-identical to what the
-	// kustomize binary would print (the parity contract with ArgoCD).
-	YAML []byte
-	// Objects are the same resources in build order, decoded for the sync
+	// Objects are the rendered resources in build order, decoded for the sync
 	// engine.
 	Objects []*unstructured.Unstructured
+	resMap  resmap.ResMap
+}
+
+// YAML serializes the multi-document build output, byte-identical to what
+// the kustomize binary would print (the parity contract with ArgoCD). It is
+// a method, not a field: serializing megabytes of YAML costs real time
+// (~170ms measured on a large chart) and only `ksync render` needs it — the
+// sync loop works on Objects.
+func (res *Result) YAML() ([]byte, error) {
+	return res.resMap.AsYaml()
 }
 
 // Renderer renders kustomization directories. It is safe for concurrent use;
@@ -65,10 +73,6 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 		return nil, fmt.Errorf("rendering %s: %w", dir, err)
 	}
 
-	yml, err := resMap.AsYaml()
-	if err != nil {
-		return nil, fmt.Errorf("rendering %s: %w", dir, err)
-	}
 	objs := make([]*unstructured.Unstructured, 0, resMap.Size())
 	for _, res := range resMap.Resources() {
 		// Not res.Map(): kyaml yields YAML-typed values (plain int), which
@@ -85,5 +89,5 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 		}
 		objs = append(objs, obj)
 	}
-	return &Result{YAML: yml, Objects: objs}, nil
+	return &Result{Objects: objs, resMap: resMap}, nil
 }
