@@ -178,6 +178,71 @@ func TestSetImages_RewritesMatchingImagesEverywhere(t *testing.T) {
 	}
 }
 
+func TestForceLocalImagePullPolicy(t *testing.T) {
+	container := func(image, policy string) map[string]any {
+		c := map[string]any{"name": "c", "image": image}
+		if policy != "" {
+			c["imagePullPolicy"] = policy
+		}
+		return c
+	}
+	deploy := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1", "kind": "Deployment",
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			"initContainers": []any{container("example.com/team-a/api-b:ksync-abc", "Always")},
+			"containers": []any{
+				container("example.com/team-a/api-b:ksync-abc", "Always"), // built + Always -> pinned
+				container("example.com/shop/proxy:v1", "Always"),          // unrelated -> untouched
+			},
+		}}},
+	}}
+	job := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "batch/v1", "kind": "Job",
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			"containers": []any{
+				container("example.com/team-a/api-b:ksync-abc", "Never"), // explicit Never -> left as is
+			},
+		}}},
+	}}
+
+	forceLocalImagePullPolicy([]*unstructured.Unstructured{deploy, job},
+		[]Image{{Name: "example.com/team-a/api-b", NewTag: "ksync-abc"}})
+
+	policyAt := func(obj *unstructured.Unstructured, field string, i int) string {
+		list, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		p, _ := list[i].(map[string]any)["imagePullPolicy"].(string)
+		return p
+	}
+	if got := policyAt(deploy, "containers", 0); got != "IfNotPresent" {
+		t.Errorf("built image with Always: policy = %q, want IfNotPresent", got)
+	}
+	if got := policyAt(deploy, "initContainers", 0); got != "IfNotPresent" {
+		t.Errorf("built initContainer with Always: policy = %q, want IfNotPresent", got)
+	}
+	if got := policyAt(deploy, "containers", 1); got != "Always" {
+		t.Errorf("unrelated image: policy = %q, want Always untouched", got)
+	}
+	if got := policyAt(job, "containers", 0); got != "Never" {
+		t.Errorf("explicit Never: policy = %q, want Never untouched", got)
+	}
+}
+
+func TestImageRepo(t *testing.T) {
+	cases := map[string]string{
+		"ghcr.io/org/img:ksync-abc":     "ghcr.io/org/img",
+		"ghcr.io/org/img":               "ghcr.io/org/img",
+		"localhost:5000/img":            "localhost:5000/img", // port colon, no tag
+		"localhost:5000/img:v1":         "localhost:5000/img",
+		"img@sha256:deadbeef":           "img",
+		"ghcr.io/org/img:v1@sha256:abc": "ghcr.io/org/img",
+	}
+	for in, want := range cases {
+		if got := imageRepo(in); got != want {
+			t.Errorf("imageRepo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func findObject(t *testing.T, objs []*unstructured.Unstructured, kind, name string) *unstructured.Unstructured {
 	t.Helper()
 	for _, obj := range objs {

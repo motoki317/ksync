@@ -7,6 +7,7 @@ package render
 
 import (
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/kustomize/api/filters/imagetag"
@@ -77,8 +78,82 @@ func (res *Result) SetImages(images []Image) error {
 	if err != nil {
 		return err
 	}
+	forceLocalImagePullPolicy(objs, images)
 	res.Objects = objs
 	return nil
+}
+
+// forceLocalImagePullPolicy rewrites `imagePullPolicy: Always` to IfNotPresent
+// on every container running an image ksync just built. The injected tag is a
+// content-addressed, local-only ref (`<image>:ksync-<id>`) that exists in no
+// registry, so Always makes the kubelet try to pull it and fail with
+// ErrImagePull/NotFound — even though the image is present locally (and, for
+// separate-store clusters, imported). Only an explicit Always is touched: an
+// omitted policy already defaults to IfNotPresent for the non-:latest dev tag,
+// and Never/IfNotPresent already use the local image.
+func forceLocalImagePullPolicy(objs []*unstructured.Unstructured, images []Image) {
+	built := make(map[string]bool, len(images))
+	for _, img := range images {
+		name := img.Name
+		if img.NewName != "" {
+			name = img.NewName
+		}
+		built[name] = true
+	}
+	// The pod-spec locations of the standard workload kinds (and bare Pods);
+	// jobTemplate covers CronJob.
+	bases := [][]string{
+		{"spec"},
+		{"spec", "template", "spec"},
+		{"spec", "jobTemplate", "spec", "template", "spec"},
+	}
+	for _, obj := range objs {
+		for _, base := range bases {
+			for _, field := range []string{"containers", "initContainers"} {
+				path := append(append([]string{}, base...), field)
+				pinContainers(obj, path, built)
+			}
+		}
+	}
+}
+
+func pinContainers(obj *unstructured.Unstructured, path []string, built map[string]bool) {
+	list, found, err := unstructured.NestedSlice(obj.Object, path...)
+	if err != nil || !found {
+		return
+	}
+	changed := false
+	for _, item := range list {
+		c, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		image, _ := c["image"].(string)
+		if !built[imageRepo(image)] {
+			continue
+		}
+		if c["imagePullPolicy"] == "Always" {
+			c["imagePullPolicy"] = "IfNotPresent"
+			changed = true
+		}
+	}
+	if changed {
+		_ = unstructured.SetNestedSlice(obj.Object, list, path...)
+	}
+}
+
+// imageRepo strips the tag and digest from an image reference, leaving the
+// repository (registry/name) that kustomize's image override matches on.
+func imageRepo(ref string) string {
+	if at := strings.IndexByte(ref, '@'); at >= 0 {
+		ref = ref[:at]
+	}
+	// A ':' starts the tag only when no '/' follows it (otherwise it is a
+	// registry port, e.g. localhost:5000/img).
+	if c := strings.LastIndexByte(ref, ':'); c >= 0 && !strings.ContainsRune(ref[c:], '/') {
+		ref = ref[:c]
+	}
+	return ref
 }
 
 // Renderer renders kustomization directories. It is safe for concurrent use;
