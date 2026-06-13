@@ -47,6 +47,35 @@ func TestRun_SyncsAllAppsOnStartThenOnlyChangedOnes(t *testing.T) {
 	}
 }
 
+func TestRun_ResyncTriggerReSyncsEveryApp(t *testing.T) {
+	tmp := t.TempDir()
+	writeApp(t, tmp, "app1")
+	writeApp(t, tmp, "app2")
+	apps := []config.App{
+		{Name: "app1", Path: filepath.Join(tmp, "app1")},
+		{Name: "app2", Path: filepath.Join(tmp, "app2")},
+	}
+	rec := &recorder{calls: map[string]int{}}
+	resync := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, apps, rec.sync, Options{Debounce: 20 * time.Millisecond, Resync: resync})
+	}()
+
+	// Startup syncs each app once; no file changes follow.
+	waitFor(t, func() bool { return rec.count("app1") == 1 && rec.count("app2") == 1 })
+
+	// A manual resync re-runs every app without any file change.
+	resync <- struct{}{}
+	waitFor(t, func() bool { return rec.count("app1") == 2 && rec.count("app2") == 2 })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestRun_RetriesFailedSyncs(t *testing.T) {
 	tmp := t.TempDir()
 	writeApp(t, tmp, "app1")

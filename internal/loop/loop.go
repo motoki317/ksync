@@ -39,6 +39,10 @@ type Options struct {
 	Render      render.Options
 	Build       BuildFunc // required when any app declares builds
 	Log         logr.Logger
+	// Resync, when a value is received, marks every app dirty — the manual
+	// "redeploy everything now" the watch command wires to keyboard input.
+	// A nil channel simply never fires.
+	Resync <-chan struct{}
 }
 
 func (o *Options) applyDefaults() {
@@ -213,6 +217,12 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-opts.Resync:
+			now := time.Now()
+			for _, a := range apps {
+				sched.MarkDirty(a.Name, now)
+			}
+			log.Info("manual resync requested", "apps", len(apps))
 		case path, ok := <-watcher.Events:
 			if !ok {
 				return nil
@@ -275,15 +285,14 @@ func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo
 	r := result{app: app.Name, built: map[int]string{}}
 	for i, j := range todo {
 		b := app.Build[j]
-		log.Info("building image", "app", app.Name, "image", b.Image)
-		buildStarted := time.Now()
+		// Build progress and failures are reported by the injected BuildFunc
+		// (ui.Activity): a single live line, full log only on failure. Logging
+		// build start/end here too would duplicate that.
 		ref, err := buildFn(ctx, b)
 		if err != nil {
-			log.Error(err, "build failed", "app", app.Name, "image", b.Image)
 			r.failed = todo[i:]
 			return r
 		}
-		log.Info("image built", "app", app.Name, "ref", ref, "took", time.Since(buildStarted).String())
 		tag := build.Tag(ref)
 		r.built[j] = tag
 		tags[j] = tag
