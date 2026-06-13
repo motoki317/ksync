@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/cache"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/diff"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
@@ -70,6 +73,14 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 
 	results, err := e.engine.Sync(ctx, target, isManaged, revision(target), opts.Namespace, syncOpts...)
 	if err != nil {
+		// gitops-engine blocks until the operation completes or ctx is done;
+		// on a health-gated wave (or PostSync hook waiting on Healthy main
+		// resources) a stuck workload — ErrImagePull, CrashLoop — hangs the
+		// sync until the caller's timeout fires. Turn the bare deadline error
+		// into the actionable "which resource is stuck" the user needs.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return results, e.timeoutError(app, target, isManaged)
+		}
 		return results, err
 	}
 	// gitops-engine returns a nil error when the operation completed with
@@ -92,6 +103,55 @@ func failedResultsError(results []common.ResourceSyncResult) error {
 		return nil
 	}
 	return fmt.Errorf("%d resource(s) failed to sync:\n%s", len(failed), strings.Join(failed, "\n"))
+}
+
+// timeoutError explains a sync that did not converge before the deadline by
+// naming the app's managed resources that are not yet Healthy — the ones the
+// sync was waiting on. Health is read from the warm cache (full manifests are
+// cached for managed resources), so this costs no extra API calls.
+func (e *Engine) timeoutError(app string, target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) error {
+	stuck := e.unhealthyManaged(target, isManaged)
+	if len(stuck) == 0 {
+		return fmt.Errorf("sync of %q timed out before converging", app)
+	}
+	return fmt.Errorf("sync of %q timed out; still not healthy:\n  %s", app, strings.Join(stuck, "\n  "))
+}
+
+// unhealthyManaged returns one line per managed live resource whose health is
+// worse than Healthy/Suspended, sorted for stable output. Kinds without a
+// health check (ConfigMap, Service, …) report no health and are treated as
+// healthy — matching how the sync waves gate.
+func (e *Engine) unhealthyManaged(target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) []string {
+	lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
+	if err != nil {
+		return nil
+	}
+	return unhealthyLines(lives)
+}
+
+// unhealthyLines describes the live objects that are worse than Healthy (or
+// Suspended, which is intentional), one sorted line each. Kinds without a
+// health check (ConfigMap, Service, …) report no health and are omitted — the
+// sync waves treat them as immediately healthy, so they are never what a sync
+// waits on.
+func unhealthyLines(lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
+	var lines []string
+	for key, obj := range lives {
+		h, err := health.GetResourceHealth(obj, nil)
+		if err != nil || h == nil {
+			continue
+		}
+		if h.Status == health.HealthStatusHealthy || h.Status == health.HealthStatusSuspended {
+			continue
+		}
+		line := fmt.Sprintf("%s: %s", key.String(), h.Status)
+		if h.Message != "" {
+			line += " — " + strings.TrimSpace(h.Message)
+		}
+		lines = append(lines, line)
+	}
+	sort.Strings(lines)
+	return lines
 }
 
 // fillDefaultNamespace sets namespace on namespaced objects that carry none —

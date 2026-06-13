@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -156,6 +157,41 @@ func TestFailedResultsError(t *testing.T) {
 	for _, want := range []string{"Deployment", "api-b", "admission webhook denied"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestUnhealthyLines(t *testing.T) {
+	key := func(group, kind, ns, name string) kube.ResourceKey {
+		return kube.ResourceKey{Group: group, Kind: kind, Namespace: ns, Name: name}
+	}
+	// A Deployment whose observed generation trails the desired one assesses
+	// as Progressing — the deterministic stand-in for "pods not ready yet"
+	// (e.g. stuck in ErrImagePull) that a health-gated sync waits on.
+	stuckDeploy := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "api-b", "namespace": "team-a", "generation": int64(2)},
+		"spec":       map[string]any{"replicas": int64(1)},
+		"status":     map[string]any{"observedGeneration": int64(1)},
+	}}
+	configMap := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "settings", "namespace": "team-a"},
+	}}
+
+	lines := unhealthyLines(map[kube.ResourceKey]*unstructured.Unstructured{
+		key("apps", "Deployment", "team-a", "api-b"): stuckDeploy,
+		key("", "ConfigMap", "team-a", "settings"):   configMap,
+	})
+
+	if len(lines) != 1 {
+		t.Fatalf("lines = %v, want exactly one (the Deployment; the ConfigMap has no health check)", lines)
+	}
+	for _, want := range []string{"Deployment", "api-b", string(health.HealthStatusProgressing)} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("line %q does not mention %q", lines[0], want)
 		}
 	}
 }
