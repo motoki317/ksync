@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -16,19 +17,28 @@ import (
 	"slices"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
+	"github.com/go-logr/logr"
+	"golang.org/x/term"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/klog/v2/textlogger"
+	"k8s.io/klog/v2"
 
 	"github.com/motoki317/ksync/internal/build"
 	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/engine"
 	"github.com/motoki317/ksync/internal/loop"
 	"github.com/motoki317/ksync/internal/render"
+	"github.com/motoki317/ksync/internal/ui"
 )
+
+// defaultSyncTimeout bounds how long one app's sync may wait to converge.
+// gitops-engine blocks until every health-gated wave is Healthy, so without a
+// bound a single stuck workload (ErrImagePull, CrashLoop) hangs ksync forever.
+// On expiry the sync fails with the names of the resources still unhealthy;
+// in watch mode the scheduler then retries with backoff.
+const defaultSyncTimeout = 5 * time.Minute
 
 // The Milestone 1 CLI surface. Commands without an implementation yet are
 // stubs; listing them all from day one fixes the command names early.
@@ -83,14 +93,35 @@ func usage(w io.Writer) {
 // before calling.
 func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, []string, error) {
 	path := fs.String("f", "ksync.yaml", "path to the ksync config file")
-	if err := fs.Parse(args); err != nil {
+	names, err := parseInterspersed(fs, args)
+	if err != nil {
 		return nil, nil, err
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return nil, nil, err
 	}
-	return cfg, fs.Args(), nil
+	return cfg, names, nil
+}
+
+// parseInterspersed parses fs allowing flags and positional args (app names) in
+// any order — `sync app -timeout 5m` works as well as `sync -timeout 5m app`.
+// Go's flag package stops at the first positional, which surprises developers
+// who put the app name first; this permutes by re-parsing past each positional.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var names []string
+	for len(args) > 0 {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			break
+		}
+		names = append(names, args[0])
+		args = args[1:]
+	}
+	return names, nil
 }
 
 func runRender(args []string) error {
@@ -122,9 +153,32 @@ func runRender(args []string) error {
 	return nil
 }
 
+// setupLogging builds ksync's two loggers and silences the Kubernetes client
+// noise. The app logger carries ksync's own build/sync/watch status; the quiet
+// logger keeps only genuine errors and also backs klog, so client-go and
+// gitops-engine's internal chatter ("Syncing", "Invalidated cluster", request
+// throttling, …) never reaches the terminal. Logs go to stderr so `render`'s
+// stdout stays clean.
+func setupLogging(verbose bool) (app, engineLog logr.Logger) {
+	v := 0
+	if verbose {
+		v = 1
+	}
+	app = ui.New(ui.Options{Writer: os.Stderr, Verbosity: v})
+	// The engine and the routed client-go (klog) share one Error-only logger:
+	// gitops-engine's per-sync chatter ("Syncing", "Tasks (dry-run)",
+	// "Namespace already exists", …) and client-go's request noise are all
+	// Info-level and dropped; only genuine failures reach the terminal.
+	engineLog = ui.New(ui.Options{Writer: os.Stderr, Quiet: true})
+	klog.SetLogger(engineLog)
+	return app, engineLog
+}
+
 func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
+	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
+	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -138,15 +192,16 @@ func runSync(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log := textlogger.NewLogger(textlogger.NewConfig())
-	eng, err := engine.New(cfg.Context, log)
+	_, engineLog := setupLogging(*verbose)
+	eng, err := engine.New(cfg.Context, engineLog)
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
 
+	out := ui.NewColors(os.Stderr)
 	r := render.New(render.Options{})
-	buildFn := makeBuildFunc(cfg)
+	buildFn := makeBuildFunc(cfg, os.Stderr, out)
 	for _, app := range apps {
 		// Build before render so the applied manifests always reference
 		// images that exist in the local daemon.
@@ -167,13 +222,24 @@ func runSync(args []string) error {
 				return fmt.Errorf("app %s: %w", app.Name, err)
 			}
 		}
-		results, err := eng.Sync(ctx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune, Namespace: app.Namespace})
+		syncCtx, cancel := withTimeout(ctx, *timeout)
+		results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune, Namespace: app.Namespace})
+		cancel()
 		if err != nil {
-			return fmt.Errorf("app %s: sync: %w", app.Name, err)
+			return fmt.Errorf("app %s: %w", app.Name, err)
 		}
-		printSyncResults(os.Stdout, app.Name, results)
+		printSummary(os.Stderr, out, app.Name, results)
 	}
 	return nil
+}
+
+// withTimeout bounds ctx by d, or returns it unchanged (with a no-op cancel)
+// when d is non-positive — the documented "no limit" escape hatch.
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
 
 func runWatch(args []string) error {
@@ -181,6 +247,8 @@ func runWatch(args []string) error {
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
 	debounce := fs.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
 	maxParallel := fs.Int("max-parallel", 4, "how many apps may sync concurrently")
+	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
+	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -193,8 +261,8 @@ func runWatch(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log := textlogger.NewLogger(textlogger.NewConfig())
-	eng, err := engine.New(cfg.Context, log)
+	log, engineLog := setupLogging(*verbose)
+	eng, err := engine.New(cfg.Context, engineLog)
 	if err != nil {
 		return err
 	}
@@ -204,43 +272,93 @@ func runWatch(args []string) error {
 	for _, a := range apps {
 		nsByApp[a.Name] = a.Namespace
 	}
+	// The loop logs build/sync state itself; the per-app timeout keeps one
+	// stuck workload from holding a scheduler slot forever — on expiry the
+	// sync fails and the scheduler retries it with backoff.
 	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) error {
-		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app]})
-		if err != nil {
-			return err
-		}
-		printSyncResults(os.Stdout, app, results)
-		return nil
+		ctx, cancel := withTimeout(ctx, *timeout)
+		defer cancel()
+		_, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app]})
+		return err
 	}
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
-		Build:       makeBuildFunc(cfg),
+		Build:       makeBuildFunc(cfg, os.Stderr, ui.NewColors(os.Stderr)),
 		Log:         log,
+		Resync:      resyncOnEnter(ctx, log),
 	})
+}
+
+// resyncOnEnter returns a channel that fires whenever the user presses Enter,
+// the watch loop's manual "redeploy everything" control. It is active only when
+// stdin is an interactive terminal — under a pipe or a process manager there is
+// no keyboard, so it returns nil (the loop treats that as "never"). The reader
+// goroutine ends with the process; Ctrl-C remains the way to quit.
+func resyncOnEnter(ctx context.Context, log logr.Logger) <-chan struct{} {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return nil
+	}
+	log.Info("watching; press Enter to resync all apps, Ctrl-C to quit")
+	ch := make(chan struct{})
+	go func() {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			select {
+			case ch <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
 }
 
 // makeBuildFunc composes building an image with loading it into the cluster, so
 // the same path serves one-shot sync and the watch loop. The load step is a
 // no-op unless the config sets imageLoad (daemon-shared clusters need nothing).
-func makeBuildFunc(cfg *config.Config) loop.BuildFunc {
-	builder := &build.Builder{}
-	loader := &build.Loader{Command: cfg.ImageLoad}
+// Each external command's output is collapsed into a single live progress line
+// (ui.Activity); the verbose build log is shown only when the command fails.
+func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.BuildFunc {
 	return func(ctx context.Context, b config.Build) (string, error) {
+		name := imageName(b.Image)
+		act := ui.StartActivity(w, colors, "build "+name)
+		builder := &build.Builder{Output: act}
 		ref, err := builder.Build(ctx, b)
+		act.Done(err)
 		if err != nil {
 			return "", err
 		}
-		if err := loader.Load(ctx, ref); err != nil {
-			return "", err
+		if cfg.ImageLoad != "" {
+			act := ui.StartActivity(w, colors, "import "+name)
+			loader := &build.Loader{Command: cfg.ImageLoad, Output: act}
+			err := loader.Load(ctx, ref)
+			act.Done(err)
+			if err != nil {
+				return "", err
+			}
 		}
 		return ref, nil
 	}
 }
 
+// imageName is the short, human-facing name of an image ref for progress
+// labels: the last path segment without the tag (ghcr.io/org/ns-auth-dev →
+// ns-auth-dev).
+func imageName(image string) string {
+	if i := strings.LastIndexByte(image, ':'); i > strings.LastIndexByte(image, '/') {
+		image = image[:i]
+	}
+	if i := strings.LastIndexByte(image, '/'); i >= 0 {
+		image = image[i+1:]
+	}
+	return image
+}
+
 func runDestroy(args []string) error {
 	fs := flag.NewFlagSet("destroy", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "confirm deleting every tracked resource of the selected apps")
+	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app's resources to delete (0 = no limit)")
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -263,29 +381,58 @@ func runDestroy(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log := textlogger.NewLogger(textlogger.NewConfig())
-	eng, err := engine.New(cfg.Context, log)
+	_, engineLog := setupLogging(false)
+	eng, err := engine.New(cfg.Context, engineLog)
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
 
+	out := ui.NewColors(os.Stderr)
 	for _, app := range apps {
 		// Destroy is a sync to an empty target set: prune removes everything
 		// the tracking label scopes to this app, and nothing else.
-		results, err := eng.Sync(ctx, app.Name, nil, engine.SyncOptions{Prune: true})
+		syncCtx, cancel := withTimeout(ctx, *timeout)
+		results, err := eng.Sync(syncCtx, app.Name, nil, engine.SyncOptions{Prune: true})
+		cancel()
 		if err != nil {
 			return fmt.Errorf("app %s: destroy: %w", app.Name, err)
 		}
-		printSyncResults(os.Stdout, app.Name, results)
+		printSummary(os.Stderr, out, app.Name, results)
 	}
 	return nil
 }
 
-func printSyncResults(w io.Writer, app string, results []common.ResourceSyncResult) {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+// printSummary condenses one app's sync into a single status line — the count
+// of resources applied/pruned, failures called out in red — and lists only the
+// resources that failed or ran as hooks. The full per-resource dump is noise on
+// a healthy sync (which is the common case); the line is what a developer scans.
+func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult) {
+	var b strings.Builder
+	var applied, pruned, failed int
 	for _, res := range results {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", app, res.ResourceKey.String(), res.Status, res.Message)
+		switch res.Status {
+		case common.ResultCodePruned:
+			pruned++
+		case common.ResultCodeSyncFailed:
+			failed++
+			fmt.Fprintf(&b, "  %s %s: %s\n", c.Red("✗"), res.ResourceKey.String(), res.Message)
+		default:
+			applied++
+		}
 	}
-	tw.Flush()
+
+	parts := []string{fmt.Sprintf("%d applied", applied)}
+	if pruned > 0 {
+		parts = append(parts, fmt.Sprintf("%d pruned", pruned))
+	}
+	if failed > 0 {
+		parts = append(parts, c.Red(fmt.Sprintf("%d failed", failed)))
+	}
+	symbol := c.Green("✓")
+	if failed > 0 {
+		symbol = c.Red("✗")
+	}
+	fmt.Fprintf(&b, "%s %s  %s\n", symbol, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
+	_, _ = io.WriteString(w, b.String())
 }
