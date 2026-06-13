@@ -157,6 +157,93 @@ apps:
 	}
 }
 
+func TestParse_BuildGroup(t *testing.T) {
+	yml := `
+context: docker-desktop
+buildGroups:
+  - name: go-components
+    command: docker buildx bake $KSYNC_IMAGES
+apps:
+  - path: apps/ns
+    build:
+      - image: ghcr.io/team-a/controller
+        context: ..
+        watch: [cmd, pkg]
+        group: go-components
+      - image: ghcr.io/team-a/gateway
+        context: ..
+        watch: [cmd, pkg]
+        group: go-components
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.BuildGroups) != 1 || cfg.BuildGroups[0].Name != "go-components" {
+		t.Fatalf("BuildGroups = %+v", cfg.BuildGroups)
+	}
+	for i, b := range cfg.Apps[0].Build {
+		if b.Group != "go-components" {
+			t.Errorf("build[%d].Group = %q, want go-components", i, b.Group)
+		}
+		if b.Dockerfile != "" {
+			t.Errorf("build[%d].Dockerfile = %q, want empty (the group builds it)", i, b.Dockerfile)
+		}
+		if want := filepath.Clean("/"); b.Context != want {
+			t.Errorf("build[%d].Context = %q, want %q", i, b.Context, want)
+		}
+	}
+}
+
+func TestApp_BuildBatches(t *testing.T) {
+	app := App{Build: []Build{
+		{Image: "dashboard"},               // 0 ungrouped
+		{Image: "controller", Group: "go"}, // 1
+		{Image: "sablier"},                 // 2 ungrouped
+		{Image: "gateway", Group: "go"},    // 3
+		{Image: "migrate", Group: "go"},    // 4
+	}}
+
+	// All entries dirty: each ungrouped is its own batch; the group coalesces at
+	// its first member's position.
+	got := app.BuildBatches([]int{0, 1, 2, 3, 4})
+	want := [][]int{{0}, {1, 3, 4}, {2}}
+	if !equalBatches(got, want) {
+		t.Errorf("BuildBatches(all) = %v, want %v", got, want)
+	}
+
+	// Only some group members dirty: the batch carries just those.
+	got = app.BuildBatches([]int{3, 4})
+	want = [][]int{{3, 4}}
+	if !equalBatches(got, want) {
+		t.Errorf("BuildBatches(partial group) = %v, want %v", got, want)
+	}
+
+	// A single ungrouped entry.
+	got = app.BuildBatches([]int{2})
+	want = [][]int{{2}}
+	if !equalBatches(got, want) {
+		t.Errorf("BuildBatches(single) = %v, want %v", got, want)
+	}
+}
+
+func equalBatches(a, b [][]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if len(a[i]) != len(b[i]) {
+			return false
+		}
+		for j := range a[i] {
+			if a[i][j] != b[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func TestParse_BuildImageWithRegistryPortIsValid(t *testing.T) {
 	yml := `
 context: docker-desktop
@@ -259,6 +346,97 @@ apps:
         context: ../src/two
 `,
 			wantErr: []string{"apps[1] (shop) build[0]", `image "shared"`, `"api-b"`},
+		},
+		{
+			name: "grouped build references unknown group",
+			yml: `context: docker-desktop
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src
+        group: nope
+`,
+			wantErr: []string{"build[0]", "unknown build group", `"nope"`},
+		},
+		{
+			name: "grouped build also sets command",
+			yml: `context: docker-desktop
+buildGroups:
+  - name: g
+    command: bake
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src
+        group: g
+        command: just build
+`,
+			wantErr: []string{"build[0]", "neither command nor dockerfile", `"g"`},
+		},
+		{
+			name: "build group without command",
+			yml: `context: docker-desktop
+buildGroups:
+  - name: g
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src
+        group: g
+`,
+			wantErr: []string{"buildGroups[0] (g)", "command is required"},
+		},
+		{
+			name: "duplicate build group name",
+			yml: `context: docker-desktop
+buildGroups:
+  - name: g
+    command: bake
+  - name: g
+    command: bake2
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src
+        group: g
+`,
+			wantErr: []string{"buildGroups[1]", "duplicate group name", `"g"`},
+		},
+		{
+			name: "build group with no members",
+			yml: `context: docker-desktop
+buildGroups:
+  - name: g
+    command: bake
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src
+`,
+			wantErr: []string{"buildGroups[0] (g)", "no build entry joins"},
+		},
+		{
+			name: "build group mixes contexts",
+			yml: `context: docker-desktop
+buildGroups:
+  - name: g
+    command: bake
+apps:
+  - path: apps/api-b
+    build:
+      - image: api-b
+        context: ../src/one
+        group: g
+      - image: api-c
+        context: ../src/two
+        group: g
+`,
+			wantErr: []string{"build[1]", "mixes contexts", `"g"`},
 		},
 	}
 	for _, tt := range tests {

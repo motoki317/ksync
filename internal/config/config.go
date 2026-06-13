@@ -22,17 +22,39 @@ type Config struct {
 	// ksync will ever use — there is deliberately no fallback to the ambient
 	// current-context, so a config can never accidentally point at production.
 	Context string `json:"context"`
-	// ImageLoad makes a freshly built image visible to a cluster whose image
+	// ImageLoad makes freshly built images visible to a cluster whose image
 	// store is separate from the local docker daemon (k3d, kind, a remote
-	// registry). It runs once per built ref via `sh -c` with $KSYNC_IMAGE set
-	// to that ref — the same contract as a build command — so ksync needs no
-	// per-cluster-type knowledge. Empty for daemon-shared clusters (Docker
+	// registry). It runs once per build batch via `sh -c` with $KSYNC_IMAGES set
+	// to the newline-separated built refs ($KSYNC_IMAGE holds the first, for the
+	// single-image case) — the same contract as a build command — so ksync needs
+	// no per-cluster-type knowledge. Empty for daemon-shared clusters (Docker
 	// Desktop). Examples:
-	//   k3d image import --cluster dev $KSYNC_IMAGE
-	//   kind load docker-image --name dev $KSYNC_IMAGE
+	//   k3d image import --cluster dev $KSYNC_IMAGES
+	//   kind load docker-image --name dev $KSYNC_IMAGES
 	//   docker push $KSYNC_IMAGE
 	ImageLoad string `json:"imageLoad,omitempty"`
-	Apps      []App  `json:"apps"`
+	// BuildGroups batch several build entries into one bulk command (see
+	// BuildGroup). Optional; a config can build every image individually.
+	BuildGroups []BuildGroup `json:"buildGroups,omitempty"`
+	Apps        []App        `json:"apps"`
+}
+
+// BuildGroup batches several build entries into a single bulk command — one
+// `docker buildx bake <targets>`, one host compile producing many images — so
+// shared work (a common base image, a single compiler pass, one cluster import)
+// happens once instead of once per image. A build entry joins a group by
+// setting its `group` field to the group's name. Design rationale:
+// docs/ADR/20260614-bulk-build-groups.md.
+type BuildGroup struct {
+	// Name is what a build entry's `group` field references.
+	Name string `json:"name"`
+	// Command runs via `sh -c` and must leave every requested image tagged
+	// <image>:ksync-build in the local docker daemon. It receives $KSYNC_IMAGES:
+	// the newline-separated temp refs to produce — only the dirty subset of the
+	// group, which may be a single image. This mirrors the single-build
+	// `command` contract ($KSYNC_IMAGE), scaled to many images. It runs in the
+	// shared context directory of the group's members.
+	Command string `json:"command"`
 }
 
 // App is one kustomization directory managed by ksync.
@@ -78,6 +100,37 @@ type Build struct {
 	// host-side compilation, …). It runs via `sh -c` in the context directory
 	// and must leave the image tagged $KSYNC_IMAGE in the local docker daemon.
 	Command string `json:"command,omitempty"`
+	// Group, when set, makes this image part of a BuildGroup of that name: its
+	// build is delegated to the group's bulk command instead of a per-image
+	// docker build or command. A grouped entry sets neither command nor
+	// dockerfile (the group builds it); context and watch still scope what
+	// dirties it.
+	Group string `json:"group,omitempty"`
+}
+
+// BuildBatches partitions the given build-entry indices of a into the batches
+// the loop builds as a unit: each ungrouped entry is its own batch (one docker
+// build / command), and the entries of one group coalesce into a single batch
+// (one bulk command). Batch order follows the first appearance of each entry in
+// indices, so the build order stays deterministic. indices must be valid
+// indices into a.Build.
+func (a *App) BuildBatches(indices []int) [][]int {
+	var batches [][]int
+	groupAt := make(map[string]int) // group name -> its batch index
+	for _, j := range indices {
+		g := a.Build[j].Group
+		if g == "" {
+			batches = append(batches, []int{j})
+			continue
+		}
+		if at, ok := groupAt[g]; ok {
+			batches[at] = append(batches[at], j)
+			continue
+		}
+		groupAt[g] = len(batches)
+		batches = append(batches, []int{j})
+	}
+	return batches
 }
 
 // Load reads, parses, and validates the config file at path, additionally
@@ -109,7 +162,9 @@ func Load(path string) (*Config, error) {
 				errs = append(errs, fmt.Errorf("%s: build context %s is not a directory", where, b.Context))
 				continue
 			}
-			if b.Command == "" {
+			// Grouped and command builds produce the image themselves; only a
+			// plain docker build needs a Dockerfile on disk.
+			if b.Command == "" && b.Group == "" {
 				if st, err := os.Stat(b.Dockerfile); err != nil || st.IsDir() {
 					errs = append(errs, fmt.Errorf("%s: no Dockerfile at %s (set dockerfile: or command:)", where, b.Dockerfile))
 				}
@@ -175,6 +230,27 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 		paths[app.Path] = true
 	}
 
+	// Build groups must be declared before a build entry can join one. Track
+	// each group's shared context (all its members must build from the same
+	// directory, where its command runs) and whether any entry referenced it.
+	knownGroups := make(map[string]bool, len(cfg.BuildGroups))
+	groupContext := make(map[string]string, len(cfg.BuildGroups))
+	groupUsed := make(map[string]bool, len(cfg.BuildGroups))
+	for i := range cfg.BuildGroups {
+		g := &cfg.BuildGroups[i]
+		switch {
+		case g.Name == "":
+			errs = append(errs, fmt.Errorf("buildGroups[%d]: name is required", i))
+		case knownGroups[g.Name]:
+			errs = append(errs, fmt.Errorf("buildGroups[%d]: duplicate group name %q", i, g.Name))
+		default:
+			knownGroups[g.Name] = true
+		}
+		if g.Command == "" {
+			errs = append(errs, fmt.Errorf("buildGroups[%d] (%s): command is required (it must produce every $KSYNC_IMAGES ref)", i, g.Name))
+		}
+	}
+
 	// One build definition per image, across all apps: two recipes for the
 	// same name would race over which tag the manifests get.
 	imageOwner := make(map[string]string)
@@ -201,6 +277,26 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 				b.Context = filepath.Join(baseDir, b.Context)
 			}
 			b.Context = filepath.Clean(b.Context)
+			if b.Group != "" {
+				// A grouped entry is built by the group's bulk command, not by a
+				// per-image docker build or command of its own.
+				if b.Command != "" || b.Dockerfile != "" {
+					errs = append(errs, fmt.Errorf("%s: a grouped build sets neither command nor dockerfile (group %q builds it)", where, b.Group))
+				}
+				if !knownGroups[b.Group] {
+					errs = append(errs, fmt.Errorf("%s: unknown build group %q (declare it under buildGroups)", where, b.Group))
+				} else {
+					groupUsed[b.Group] = true
+					if prev, ok := groupContext[b.Group]; ok && prev != b.Context {
+						errs = append(errs, fmt.Errorf("%s: build group %q mixes contexts %q and %q (its command runs in one directory)", where, b.Group, prev, b.Context))
+					}
+					groupContext[b.Group] = b.Context
+				}
+				for k, w := range b.Watch {
+					b.Watch[k] = resolveAgainst(b.Context, w)
+				}
+				continue
+			}
 			if b.Command != "" && b.Dockerfile != "" {
 				errs = append(errs, fmt.Errorf("%s: command and dockerfile are mutually exclusive (a command build must produce $KSYNC_IMAGE itself)", where))
 			}
@@ -213,6 +309,11 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 			for k, w := range b.Watch {
 				b.Watch[k] = resolveAgainst(b.Context, w)
 			}
+		}
+	}
+	for i := range cfg.BuildGroups {
+		if g := cfg.BuildGroups[i]; g.Name != "" && knownGroups[g.Name] && !groupUsed[g.Name] {
+			errs = append(errs, fmt.Errorf("buildGroups[%d] (%s): no build entry joins this group", i, g.Name))
 		}
 	}
 
