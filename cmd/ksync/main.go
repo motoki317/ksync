@@ -126,7 +126,9 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 }
 
 func runRender(args []string) error {
-	cfg, names, err := loadConfig(flag.NewFlagSet("render", flag.ContinueOnError), args)
+	fs := flag.NewFlagSet("render", flag.ContinueOnError)
+	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
 	}
@@ -134,7 +136,12 @@ func runRender(args []string) error {
 	if err != nil {
 		return err
 	}
-	r := render.New(render.Options{})
+	renderOpts, cleanup, err := renderOptions(cfg.Context, *offline)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	r := render.New(renderOpts)
 	for i, app := range apps {
 		res, err := r.Render(app.Path)
 		if err != nil {
@@ -180,6 +187,7 @@ func runSync(args []string) error {
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
+	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -201,7 +209,12 @@ func runSync(args []string) error {
 	defer eng.Close()
 
 	out := ui.NewColors(os.Stderr)
-	r := render.New(render.Options{})
+	renderOpts, cleanup, err := renderOptions(cfg.Context, *offline)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	r := render.New(renderOpts)
 	buildFn := makeBuildFunc(cfg, os.Stderr, out)
 	for _, app := range apps {
 		// Build before render so the applied manifests always reference
@@ -261,6 +274,7 @@ func runWatch(args []string) error {
 	maxParallel := fs.Int("max-parallel", 4, "how many apps may sync concurrently")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
+	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -274,6 +288,11 @@ func runWatch(args []string) error {
 	defer stop()
 
 	log, engineLog := setupLogging(*verbose)
+	renderOpts, cleanup, err := renderOptions(cfg.Context, *offline)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	eng, err := engine.New(cfg.Context, engineLog)
 	if err != nil {
 		return err
@@ -296,6 +315,7 @@ func runWatch(args []string) error {
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
+		Render:      renderOpts,
 		Build:       makeBuildFunc(cfg, os.Stderr, ui.NewColors(os.Stderr)),
 		Log:         log,
 		Resync:      resyncOnEnter(ctx, log),

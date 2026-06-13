@@ -461,12 +461,22 @@ ksync render > all.yaml     # render every app
 ```
 
 Renders the kustomization (including helm chart inflation) and prints the result. It does not
-talk to the cluster — and it does not run docker: the output shows the manifests as written,
-without locally built dev tags. Use it to check what ksync *would* apply, or to debug a
-kustomization.
+run docker: the output shows the manifests as written, without locally built dev tags. Use it
+to check what ksync *would* apply, or to debug a kustomization.
 
-The output is the same bytes that `kustomize build --enable-helm --load-restrictor
-LoadRestrictionsNone <dir>` produces — this is verified by tests.
+By default ksync renders helm charts **against your cluster** (`--dry-run=server`), so a chart's
+`lookup` calls — reading a live Service, ConfigMap, etc. at template time — resolve. This is the
+common "helm but not GitOps" pattern (e.g. resolving a Service's ClusterIP into a pod
+`hostAliases`); a plain offline `helm template` returns empty for those and a chart that `fail`s
+on a missing lookup will not render at all. ksync can do this because it only ever runs against
+one explicitly allowlisted local context. The render output is otherwise unchanged — for a chart
+that uses no `lookup`, it is byte-identical to offline.
+
+Pass `--offline-render` (on `render`, `sync`, and `watch`) to render with a plain offline
+`helm template` instead — useful for a quick `ksync render` with no cluster reachable, or to
+avoid the small per-render cluster round-trip. Offline, the output is the same bytes that
+`kustomize build --enable-helm --load-restrictor LoadRestrictionsNone <dir>` produces (verified
+by tests); charts that require `lookup` will not render.
 
 ### `ksync destroy` — delete what ksync created
 
