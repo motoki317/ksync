@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -156,25 +157,47 @@ spec:
 `
 
 type fakeBuilder struct {
-	mu    sync.Mutex
-	count int
-	fail  int // fail this many leading calls
+	mu     sync.Mutex
+	count  int // total images built (sum over batches)
+	calls  int // buildFn invocations (batches)
+	maxLen int // largest batch seen
+	fail   int // fail this many leading images
 }
 
-func (f *fakeBuilder) build(_ context.Context, b config.Build) (string, error) {
+func (f *fakeBuilder) build(_ context.Context, builds []config.Build) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.count++
-	if f.count <= f.fail {
-		return "", errors.New("induced build failure")
+	f.calls++
+	if len(builds) > f.maxLen {
+		f.maxLen = len(builds)
 	}
-	return fmt.Sprintf("%s:ksync-%012d", b.Image, f.count), nil
+	refs := make([]string, len(builds))
+	for i, b := range builds {
+		f.count++
+		if f.count <= f.fail {
+			return nil, errors.New("induced build failure")
+		}
+		refs[i] = fmt.Sprintf("%s:ksync-%012d", b.Image, f.count)
+	}
+	return refs, nil
 }
 
 func (f *fakeBuilder) builds() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.count
+}
+
+func (f *fakeBuilder) widest() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxLen
+}
+
+func (f *fakeBuilder) batches() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 // objectSink captures the image of the synced Deployment per call.
@@ -238,6 +261,90 @@ func TestRun_BuildsOnStartupAndInjectsTheTag(t *testing.T) {
 	}
 	if got := sink.synced()[2]; got != "api-b:ksync-000000000002" {
 		t.Errorf("synced image = %q, want the new dev tag", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// groupApp writes an app with two grouped build entries sharing one context,
+// and a kustomization deploying both images.
+func groupApp(t *testing.T, base string) config.App {
+	t.Helper()
+	writeFile(t, filepath.Join(base, "app1", "kustomization.yaml"), "resources:\n  - deployment.yaml\n")
+	writeFile(t, filepath.Join(base, "app1", "deployment.yaml"), twoImageDeploymentYAML)
+	src := filepath.Join(base, "src")
+	writeFile(t, filepath.Join(src, "main.go"), "package main\n")
+	return config.App{
+		Name: "app1",
+		Path: filepath.Join(base, "app1"),
+		Build: []config.Build{
+			{Image: "api-b", Context: src, Group: "g"},
+			{Image: "api-c", Context: src, Group: "g"},
+		},
+	}
+}
+
+const twoImageDeploymentYAML = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-b
+spec:
+  selector:
+    matchLabels: {app: api-b}
+  template:
+    metadata:
+      labels: {app: api-b}
+    spec:
+      containers:
+        - name: api
+          image: api-b:main
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-c
+spec:
+  selector:
+    matchLabels: {app: api-c}
+  template:
+    metadata:
+      labels: {app: api-c}
+    spec:
+      containers:
+        - name: api
+          image: api-c:main
+`
+
+func TestRun_BuildGroupBatchesDirtyMembers(t *testing.T) {
+	tmp := t.TempDir()
+	app := groupApp(t, tmp)
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build})
+	}()
+
+	// Startup builds both grouped images in ONE batch (one bulk command), and
+	// both tags are injected.
+	waitFor(t, func() bool { return len(sink.synced()) == 2 })
+	if got := builder.widest(); got != 2 {
+		t.Errorf("widest batch = %d, want 2 (both group members built together)", got)
+	}
+	if imgs := sink.synced(); !slices.Contains(imgs, "api-b:ksync-000000000001") || !slices.Contains(imgs, "api-c:ksync-000000000002") {
+		t.Errorf("synced images = %v, want both group tags injected", imgs)
+	}
+
+	// A source edit dirties both members; they rebuild together in one batch.
+	calls := builder.batches()
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	waitFor(t, func() bool { return len(sink.synced()) == 4 })
+	if got := builder.batches() - calls; got != 1 {
+		t.Errorf("batches for the shared edit = %d, want 1 (one bulk rebuild)", got)
 	}
 
 	cancel()

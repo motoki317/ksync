@@ -26,9 +26,11 @@ import (
 // SyncFunc applies one app's rendered objects to the cluster.
 type SyncFunc func(ctx context.Context, app string, objects []*unstructured.Unstructured) error
 
-// BuildFunc produces the image of one build entry and returns the full
-// content-addressed ref.
-type BuildFunc func(ctx context.Context, b config.Build) (string, error)
+// BuildFunc produces the images of one build batch and returns their full
+// content-addressed refs in the same order. A batch is either a single
+// ungrouped entry or all the dirty members of one build group (built by one
+// bulk command); the loop forms the batches via App.BuildBatches.
+type BuildFunc func(ctx context.Context, builds []config.Build) ([]string, error)
 
 // Options tune the loop; zero values get sensible watch-mode defaults.
 type Options struct {
@@ -276,6 +278,18 @@ type result struct {
 	failed []int          // entries whose build must run again
 }
 
+// unbuilt returns the todo entries that built does not record — what a build
+// failure must re-dirty so the scheduler retries them.
+func unbuilt(todo []int, built map[int]string) []int {
+	var failed []int
+	for _, j := range todo {
+		if _, ok := built[j]; !ok {
+			failed = append(failed, j)
+		}
+	}
+	return failed
+}
+
 // runApp is one scheduled run of one app: build the dirty entries, render,
 // inject the known dev tags, sync. A build failure aborts before render —
 // syncing manifests whose images were never built would deploy whatever tag
@@ -283,19 +297,26 @@ type result struct {
 func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo []int, tags map[int]string, buildFn BuildFunc, syncFn SyncFunc, log logr.Logger) result {
 	started := time.Now()
 	r := result{app: app.Name, built: map[int]string{}}
-	for i, j := range todo {
-		b := app.Build[j]
+	for _, batch := range app.BuildBatches(todo) {
+		builds := make([]config.Build, len(batch))
+		for k, j := range batch {
+			builds[k] = app.Build[j]
+		}
 		// Build progress and failures are reported by the injected BuildFunc
 		// (ui.Activity): a single live line, full log only on failure. Logging
 		// build start/end here too would duplicate that.
-		ref, err := buildFn(ctx, b)
+		refs, err := buildFn(ctx, builds)
 		if err != nil {
-			r.failed = todo[i:]
+			// Re-dirty everything not yet built this run: the failed batch and
+			// any later batches. Successful earlier batches keep their tags.
+			r.failed = unbuilt(todo, r.built)
 			return r
 		}
-		tag := build.Tag(ref)
-		r.built[j] = tag
-		tags[j] = tag
+		for k, j := range batch {
+			tag := build.Tag(refs[k])
+			r.built[j] = tag
+			tags[j] = tag
+		}
 	}
 
 	res, err := renderer.Render(app.Path)

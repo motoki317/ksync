@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -204,14 +205,25 @@ func runSync(args []string) error {
 	buildFn := makeBuildFunc(cfg, os.Stderr, out)
 	for _, app := range apps {
 		// Build before render so the applied manifests always reference
-		// images that exist in the local daemon.
+		// images that exist in the local daemon. Batch by build group so a
+		// shared bake/compile runs once (App.BuildBatches over all entries).
+		all := make([]int, len(app.Build))
+		for i := range all {
+			all[i] = i
+		}
 		images := make([]render.Image, 0, len(app.Build))
-		for _, b := range app.Build {
-			ref, err := buildFn(ctx, b)
-			if err != nil {
-				return fmt.Errorf("app %s: building %s: %w", app.Name, b.Image, err)
+		for _, batch := range app.BuildBatches(all) {
+			builds := make([]config.Build, len(batch))
+			for k, j := range batch {
+				builds[k] = app.Build[j]
 			}
-			images = append(images, render.Image{Name: b.Image, NewTag: build.Tag(ref)})
+			refs, err := buildFn(ctx, builds)
+			if err != nil {
+				return fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
+			}
+			for k, j := range batch {
+				images = append(images, render.Image{Name: app.Build[j].Image, NewTag: build.Tag(refs[k])})
+			}
 		}
 		res, err := r.Render(app.Path)
 		if err != nil {
@@ -320,25 +332,71 @@ func resyncOnEnter(ctx context.Context, log logr.Logger) <-chan struct{} {
 // Each external command's output is collapsed into a single live progress line
 // (ui.Activity); the verbose build log is shown only when the command fails.
 func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.BuildFunc {
-	return func(ctx context.Context, b config.Build) (string, error) {
-		name := imageName(b.Image)
-		act := ui.StartActivity(w, colors, "build "+name)
-		builder := &build.Builder{Output: act}
-		ref, err := builder.Build(ctx, b)
-		act.Done(err)
-		if err != nil {
-			return "", err
+	groupCmd := make(map[string]string, len(cfg.BuildGroups))
+	for _, g := range cfg.BuildGroups {
+		groupCmd[g.Name] = g.Command
+	}
+	// imported remembers the refs already made visible to the cluster this
+	// session, so a rebuild that yields an unchanged ref (a save that does not
+	// change the image — a comment, a reformat — produces the same fingerprint)
+	// skips the import. A content-addressed ref names exactly one image; once
+	// imported it stays in the cluster's store (a deployed image is not GC'd),
+	// so re-importing it is pure waste — and on k3d/kind that waste is seconds.
+	var mu sync.Mutex
+	imported := map[string]bool{}
+	return func(ctx context.Context, builds []config.Build) ([]string, error) {
+		if len(builds) == 0 {
+			return nil, nil
 		}
-		if cfg.ImageLoad != "" {
-			act := ui.StartActivity(w, colors, "import "+name)
-			loader := &build.Loader{Command: cfg.ImageLoad, Output: act}
-			err := loader.Load(ctx, ref)
+		var refs []string
+		// A batch is either one ungrouped entry or all the dirty members of one
+		// group; builds[0].Group tells which, since the loop never mixes them.
+		label := imageName(builds[0].Image)
+		if group := builds[0].Group; group != "" {
+			label = group
+			act := ui.StartActivity(w, colors, "build "+label)
+			builder := &build.Builder{Output: act}
+			r, err := builder.BuildGroup(ctx, groupCmd[group], builds)
 			act.Done(err)
 			if err != nil {
-				return "", err
+				return nil, err
+			}
+			refs = r
+		} else {
+			act := ui.StartActivity(w, colors, "build "+label)
+			builder := &build.Builder{Output: act}
+			ref, err := builder.Build(ctx, builds[0])
+			act.Done(err)
+			if err != nil {
+				return nil, err
+			}
+			refs = []string{ref}
+		}
+		if cfg.ImageLoad != "" {
+			mu.Lock()
+			fresh := make([]string, 0, len(refs))
+			for _, ref := range refs {
+				if !imported[ref] {
+					fresh = append(fresh, ref)
+				}
+			}
+			mu.Unlock()
+			if len(fresh) > 0 {
+				act := ui.StartActivity(w, colors, "import "+label)
+				loader := &build.Loader{Command: cfg.ImageLoad, Output: act}
+				err := loader.Load(ctx, fresh)
+				act.Done(err)
+				if err != nil {
+					return nil, err
+				}
+				mu.Lock()
+				for _, ref := range fresh {
+					imported[ref] = true
+				}
+				mu.Unlock()
 			}
 		}
-		return ref, nil
+		return refs, nil
 	}
 }
 
