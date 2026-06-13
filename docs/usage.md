@@ -70,6 +70,11 @@ A full example:
 # context, so it can never touch the wrong cluster by accident.
 context: docker-desktop
 
+# Optional. Only for clusters whose image store is separate from your docker
+# daemon (k3d, kind, a remote cluster). Runs once per freshly built image with
+# $KSYNC_IMAGE set. Leave it out for Docker Desktop. See "Building images".
+# imageLoad: k3d image import --cluster dev $KSYNC_IMAGE
+
 apps:
   # The smallest possible app: only a path.
   # The app name defaults to the directory name ("shop" here).
@@ -94,6 +99,7 @@ The fields, one by one:
 | Field | Required | Meaning |
 |---|---|---|
 | `context` | yes | The only kubectl context ksync will use. |
+| `imageLoad` | no | Shell command that makes a freshly built image visible to the cluster (k3d/kind/remote). Runs once per built image with `$KSYNC_IMAGE` set. See "Making built images visible". |
 | `apps[].path` | yes | Directory with a kustomization file. Relative paths are resolved from the config file's directory. |
 | `apps[].name` | no | Name of the app. Default: the directory name. Used in commands (`ksync sync api-b`), in logs, and as the tracking label value. |
 | `apps[].namespace` | no | Default namespace for resources that do not set one (like ArgoCD's `destination.namespace`). ksync creates this namespace if it does not exist. |
@@ -180,19 +186,53 @@ build:
   - image: example.com/team-a/api-b
     context: ../..
     watch: [apps/api-b, lib]
-    command: docker buildx bake --load --set 'api-b.tags=$KSYNC_IMAGE' api-b
+    command: docker buildx bake --load --set "api-b.tags=$KSYNC_IMAGE" api-b
 ```
+
+Quote `$KSYNC_IMAGE` with **double** quotes, not single quotes: `sh -c` does not expand a
+variable inside single quotes, so `--set 'api-b.tags=$KSYNC_IMAGE'` passes the literal text
+`$KSYNC_IMAGE` to the build and fails with "invalid reference format". Use double quotes around
+any argument that contains it, and single quotes only around arguments that must *not* expand
+(e.g. a bake `--set '*.platform=…'`, where `*` would otherwise glob).
 
 Tip: pass `--provenance=false` to docker in your command. Without it, docker adds a
 build-time attestation that gives the same content a different image ID on every build, so
 every rebuild would restart pods even when nothing changed. (ksync's own `docker build`
 already does this.)
 
-### Limits, in plain words
+### Making built images visible to the cluster
 
-- The cluster must be able to see your docker daemon's images. **Docker Desktop Kubernetes
-  works out of the box.** Clusters with their own image store (kind, remote clusters) need
-  an image-load step that ksync does not do yet.
+ksync builds into your **local docker daemon**. Docker Desktop's Kubernetes runs pods straight
+from there, so nothing else is needed. But k3d and kind keep their own image store inside the
+node, and a remote cluster cannot see your daemon at all — a freshly built `ksync-<hash>` tag
+never reaches them, and the pod fails to start.
+
+For those, set `imageLoad`: a command ksync runs once for every image it builds, with
+`$KSYNC_IMAGE` set to the full built reference (`<image>:ksync-<hash>`). It is the mirror image
+of a build `command` — a build *produces* `$KSYNC_IMAGE`, `imageLoad` *consumes* it.
+
+```yaml
+# k3d:
+imageLoad: k3d image import --cluster dev $KSYNC_IMAGE
+# kind:
+imageLoad: kind load docker-image --name dev $KSYNC_IMAGE
+# remote cluster that pulls from a registry your manifests point at:
+imageLoad: docker push $KSYNC_IMAGE
+```
+
+ksync stays out of the way here on purpose: it has no built-in idea of "k3d" or "kind", so the
+one line above is exactly what runs — and any other tool or transport works the same way without
+waiting for a ksync release. The load runs only when an image is actually (re)built, so the
+fast manifest-only loop never pays for it. With k3d/kind, set the pods' `imagePullPolicy` to
+`Never` or `IfNotPresent` so the kubelet uses the imported image instead of trying to pull it.
+
+One cost to know: `k3d image import` (and `kind load`) transfer a tarball per call, a few
+seconds each. Editing one service rebuilds and imports just that one image — fast. A cold
+`watch` start that builds many images imports them one after another, so first convergence on a
+big project takes a little longer; steady-state editing does not.
+
+### Other limits, in plain words
+
 - Containers that set `imagePullPolicy: Always` cannot use locally built images — the
   kubelet would try to pull the ksync tag from a registry. Most charts let you change the
   policy; the Kubernetes default (`IfNotPresent` for non-`latest` tags) is fine.

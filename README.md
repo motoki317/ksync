@@ -20,9 +20,9 @@ What ksync is **not**:
 > **Status: core loop + native builds working.** `watch`, `sync`, `render`, and `destroy` are
 > implemented (long-running watch loop with debounced incremental re-render, server-side
 > apply, tracked prune, namespace auto-creation, backoff retries, source-triggered image
-> builds with content-addressed dev tags). Not yet done: `diff`, exec-plugin (e.g. ksops)
-> rendering, hook-semantics conformance fixtures, and image loaders for clusters that cannot
-> see the docker daemon (kind, k3d).
+> builds with content-addressed dev tags, and an `imageLoad` hook for clusters with a separate
+> image store (k3d, kind, remote). Not yet done: `diff`, exec-plugin (e.g. ksops) rendering,
+> and hook-semantics conformance fixtures.
 
 ## Quickstart
 
@@ -30,6 +30,7 @@ Declare your apps in a `ksync.yaml`:
 
 ```yaml
 context: docker-desktop        # the ONLY kubectl context ksync will touch
+# imageLoad: k3d image import --cluster dev $KSYNC_IMAGE   # only for k3d/kind/remote
 apps:
   - path: apps/shop
   - name: api-b
