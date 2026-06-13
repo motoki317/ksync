@@ -11,8 +11,11 @@ import (
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/cache"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/engine"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/tracing"
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -34,9 +37,13 @@ type resourceInfo struct {
 // Engine is a connected sync engine with a running cluster cache.
 type Engine struct {
 	clusterCache cache.ClusterCache
-	engine       engine.GitOpsEngine
 	stop         engine.StopFunc
-	log          logr.Logger
+	// cfg and kubectl let Sync drive gitops-engine's pkg/sync directly, in a
+	// re-reconciling loop, instead of the one-shot engine.GitOpsEngine.Sync
+	// convenience wrapper — see Sync for why that wrapper deadlocks on hooks.
+	cfg     *rest.Config
+	kubectl kube.Kubectl
+	log     logr.Logger
 }
 
 // New connects to the cluster behind the named kubectl context and starts
@@ -58,12 +65,23 @@ func New(kubeContext string, log logr.Logger) (*Engine, error) {
 			return &resourceInfo{app: app}, app != ""
 		}),
 	)
+	// Run() only warms the cache (EnsureSynced) and returns Invalidate as its
+	// stop; Sync no longer goes through GitOpsEngine, but this keeps the cache
+	// lifecycle and its kubectl defaults identical to the engine's.
 	gitopsEngine := engine.NewEngine(cfg, clusterCache, engine.WithLogr(log))
 	stop, err := gitopsEngine.Run()
 	if err != nil {
 		return nil, fmt.Errorf("starting gitops engine: %w", err)
 	}
-	return &Engine{clusterCache: clusterCache, engine: gitopsEngine, stop: stop, log: log}, nil
+	return &Engine{
+		clusterCache: clusterCache,
+		stop:         stop,
+		cfg:          cfg,
+		// The same kubectl engine.NewEngine builds by default (ctl.go), recreated
+		// here because that one is not reachable through the GitOpsEngine surface.
+		kubectl: &kube.KubectlCmd{Log: log, Tracer: tracing.NopTracer{}},
+		log:     log,
+	}, nil
 }
 
 // Close stops the cluster cache watches.

@@ -5,10 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/cache"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/diff"
@@ -16,9 +16,16 @@ import (
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// operationRefresh is how often the sync loop re-reconciles live state while an
+// operation is still running (matching gitops-engine's own cadence). It only
+// adds latency to apps that genuinely wait (hooks, health-gated waves); a
+// hookless app completes on the first iteration with no poll.
+const operationRefresh = time.Second
 
 // SyncOptions tune one Sync call.
 type SyncOptions struct {
@@ -48,46 +55,99 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		fillDefaultNamespace(target, opts.Namespace, e.clusterCache.IsNamespaced)
 	}
 
-	syncOpts := []sync.SyncOpt{
-		sync.WithLogr(e.log),
-		sync.WithPrune(opts.Prune),
-		// Production parity: the reference ArgoCD setup applies everything
-		// server-side.
-		sync.WithServerSideApply(true),
-		sync.WithServerSideApplyManager(fieldManager),
-		// Registering a namespace modifier turns on gitops-engine's namespace
-		// auto-creation for opts.Namespace (a no-op when it is empty).
-		sync.WithNamespaceModifier(createNamespaceIfMissing),
-	}
-
-	// Apply only resources whose desired state differs from the warm cache's
-	// live state (ArgoCD's ApplyOutOfSyncOnly). On a large app this is the
-	// difference between O(changed) and O(all) API round-trips per sync; a
-	// no-change sync applies nothing. Skipped on error: applying everything
-	// is the safe fallback.
-	if lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged); err == nil {
-		if diffRes, err := diff.DiffArray(target, alignedLiveObjs(target, lives)); err == nil {
-			syncOpts = append(syncOpts, sync.WithResourceModificationChecker(true, diffRes))
+	// Drive the sync operation ourselves rather than via engine.GitOpsEngine.Sync.
+	// That convenience wrapper reconciles the live state ONCE and reuses the
+	// snapshot for the whole operation; a hook resource CREATED during the sync
+	// (a Helm pre-install/pre-upgrade Job → ArgoCD PreSync/Sync) is therefore
+	// never in the snapshot, so its live health is never read and the operation
+	// waits on it forever — every first install of an app with a hook hangs
+	// until the caller's timeout. ArgoCD's controller avoids this by
+	// re-reconciling each cycle; we do the same. A fresh GetManagedLiveObjs +
+	// Reconcile every iteration lets the created hook's health be read;
+	// WithInitialState threads the accumulated results back in so completed work
+	// (and the hook itself) is not re-run within the operation.
+	revision := revision(target)
+	startedAt := metav1.Now()
+	var phase common.OperationPhase
+	var message string
+	var results []common.ResourceSyncResult
+	// skipHooks is decided once, from the first reconcile, then held for the
+	// whole operation. This reproduces gitops-engine's own rule (skip hooks when
+	// the initial diff is empty) exactly, so a no-change sync behaves as before —
+	// while a *changed* sync keeps hooks enabled across every re-reconcile. The
+	// latter is what makes the wait correct: once a hook is created its source
+	// diff goes quiet, and re-deciding skipHooks per iteration would drop the
+	// still-running hook and report success early.
+	skipHooks := false
+	firstReconcile := true
+	for {
+		live, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
+		if err != nil {
+			return results, fmt.Errorf("reading live state of %q: %w", app, err)
 		}
-	}
+		recRes := sync.Reconcile(target, live, opts.Namespace, e.clusterCache)
+		diffRes, err := diff.DiffArray(recRes.Target, recRes.Live, diff.WithLogr(e.log))
+		if err != nil {
+			return results, fmt.Errorf("diffing %q: %w", app, err)
+		}
+		if firstReconcile {
+			skipHooks = !diffRes.Modified
+			firstReconcile = false
+		}
 
-	results, err := e.engine.Sync(ctx, target, isManaged, revision(target), opts.Namespace, syncOpts...)
-	if err != nil {
-		// gitops-engine blocks until the operation completes or ctx is done;
-		// on a health-gated wave (or PostSync hook waiting on Healthy main
-		// resources) a stuck workload — ErrImagePull, CrashLoop — hangs the
-		// sync until the caller's timeout fires. Turn the bare deadline error
-		// into the actionable "which resource is stuck" the user needs.
-		if errors.Is(err, context.DeadlineExceeded) {
+		syncCtx, cleanup, err := sync.NewSyncContext(revision, recRes, e.cfg, e.cfg, e.kubectl, opts.Namespace, e.clusterCache.GetOpenAPISchema(),
+			sync.WithLogr(e.log),
+			sync.WithPrune(opts.Prune),
+			// Production parity: the reference ArgoCD setup applies everything
+			// server-side.
+			sync.WithServerSideApply(true),
+			sync.WithServerSideApplyManager(fieldManager),
+			// Registering a namespace modifier turns on gitops-engine's namespace
+			// auto-creation for opts.Namespace (a no-op when it is empty).
+			sync.WithNamespaceModifier(createNamespaceIfMissing),
+			// Apply only resources whose desired state differs from live
+			// (ArgoCD's ApplyOutOfSyncOnly): O(changed), not O(all), API calls.
+			sync.WithResourceModificationChecker(true, diffRes),
+			sync.WithSkipHooks(skipHooks),
+			// Carry the operation's accumulated state across re-reconciles so a
+			// completed hook/resource is recognized, not re-run.
+			sync.WithInitialState(phase, message, results, startedAt),
+		)
+		if err != nil {
+			return results, fmt.Errorf("preparing sync of %q: %w", app, err)
+		}
+		syncCtx.Sync()
+		phase, message, results = syncCtx.GetState()
+		cleanup()
+
+		if phase.Completed() {
+			// gitops-engine reports task-level apply failures via the result
+			// phase, not the operation error, so surface them explicitly — else
+			// a failed apply looks like success and the watch loop never retries.
+			if phase == common.OperationError || phase == common.OperationFailed {
+				return results, syncFailedError(app, phase, message, results)
+			}
+			return results, failedResultsError(results)
+		}
+
+		select {
+		case <-ctx.Done():
+			// A health-gated wave or a hook waiting on a stuck workload
+			// (ErrImagePull, CrashLoop) holds the operation here until the
+			// deadline; name the resource the sync is stuck on.
 			return results, e.timeoutError(app, target, isManaged)
+		case <-time.After(operationRefresh):
 		}
-		return results, err
 	}
-	// gitops-engine returns a nil error when the operation completed with
-	// task-level failures (it errors only on operation-level errors), so a
-	// failed apply would otherwise look like success — the watch loop would
-	// log "synced" and never retry.
-	return results, failedResultsError(results)
+}
+
+// syncFailedError explains an operation that ended in Failed/Error, preferring
+// the per-resource failures (the actionable detail) over the bare phase message.
+func syncFailedError(app string, phase common.OperationPhase, message string, results []common.ResourceSyncResult) error {
+	if err := failedResultsError(results); err != nil {
+		return err
+	}
+	return fmt.Errorf("sync of %q %s: %s", app, phase, message)
 }
 
 // failedResultsError condenses task-level failures into one error, or nil if
