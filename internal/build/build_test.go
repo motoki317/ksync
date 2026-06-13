@@ -2,6 +2,8 @@ package build
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -14,17 +16,31 @@ import (
 )
 
 func TestDevTag(t *testing.T) {
-	id := "sha256:" + strings.Repeat("ab", 32)
-	tag, err := devTag(id)
+	fp := `{"Entrypoint":["/app"]}["sha256:aaa","sha256:bbb"]`
+	tag, err := devTag(fp)
 	if err != nil {
 		t.Fatalf("devTag: %v", err)
 	}
-	if tag != "ksync-abababababab" {
-		t.Errorf("devTag = %q, want ksync-abababababab", tag)
+	if want := "ksync-" + fpHash(fp); tag != want {
+		t.Errorf("devTag = %q, want %q", tag, want)
 	}
-	if _, err := devTag("sha256:short"); err == nil {
-		t.Error("devTag accepted a truncated image ID")
+	// Deterministic for identical content, changes when content changes — the
+	// property that makes unchanged rebuilds not roll pods.
+	if t2, _ := devTag(fp); t2 != tag {
+		t.Error("devTag is not deterministic")
 	}
+	if t3, _ := devTag(fp + "x"); t3 == tag {
+		t.Error("devTag did not change when the fingerprint changed")
+	}
+	if _, err := devTag("   "); err == nil {
+		t.Error("devTag accepted an empty fingerprint")
+	}
+}
+
+// fpHash mirrors devTag's hashing so tests can assert the exact dev tag.
+func fpHash(fingerprint string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(fingerprint)))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 type call struct {
@@ -33,9 +49,10 @@ type call struct {
 	argv []string
 }
 
-// fakeExec scripts process execution: it emulates docker's --iidfile contract
-// and answers `docker image inspect` with the given image ID.
-func fakeExec(calls *[]call, imageID string, failOn func(argv []string) error) ExecFunc {
+// fakeExec scripts process execution: it answers `docker image inspect` (the
+// fingerprint query) with the given fingerprint string, which ksync hashes into
+// the dev tag.
+func fakeExec(calls *[]call, fingerprint string, failOn func(argv []string) error) ExecFunc {
 	return func(_ context.Context, dir string, env []string, argv []string, stdout, _ io.Writer) error {
 		*calls = append(*calls, call{dir: dir, env: env, argv: argv})
 		if failOn != nil {
@@ -43,13 +60,8 @@ func fakeExec(calls *[]call, imageID string, failOn func(argv []string) error) E
 				return err
 			}
 		}
-		if i := slices.Index(argv, "--iidfile"); i >= 0 && argv[0] == "docker" && argv[1] == "build" {
-			if err := os.WriteFile(argv[i+1], []byte(imageID+"\n"), 0o644); err != nil {
-				return err
-			}
-		}
 		if argv[0] == "docker" && argv[1] == "image" && argv[2] == "inspect" {
-			_, _ = io.WriteString(stdout, imageID+"\n")
+			_, _ = io.WriteString(stdout, fingerprint+"\n")
 		}
 		return nil
 	}
@@ -62,31 +74,33 @@ func TestBuilder_DockerfileBuild(t *testing.T) {
 		Context:    ctxDir,
 		Dockerfile: filepath.Join(ctxDir, "Dockerfile"),
 	}
-	imageID := "sha256:" + strings.Repeat("0123", 16)
+	fingerprint := `{"Entrypoint":["/app/api-b"]}["sha256:1111","sha256:2222"]`
 	var calls []call
-	builder := &Builder{Exec: fakeExec(&calls, imageID, nil), Output: io.Discard}
+	builder := &Builder{Exec: fakeExec(&calls, fingerprint, nil), Output: io.Discard}
 
 	ref, err := builder.Build(context.Background(), b)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if want := "example.com/team-a/api-b:ksync-012301230123"; ref != want {
+	if want := "example.com/team-a/api-b:ksync-" + fpHash(fingerprint); ref != want {
 		t.Errorf("ref = %q, want %q", ref, want)
 	}
-	if len(calls) != 2 {
-		t.Fatalf("calls = %d, want 2 (build, tag)", len(calls))
+	if len(calls) != 3 {
+		t.Fatalf("calls = %d, want 3 (build, inspect, tag)", len(calls))
 	}
 	bld := calls[0]
 	if bld.dir != ctxDir {
 		t.Errorf("build dir = %q, want the context", bld.dir)
 	}
-	// --provenance=false is load-bearing: the attestation embeds timestamps,
-	// so identical content would otherwise get a new ID (and roll pods) on
-	// every rebuild.
+	// --provenance=false drops the default attestation. ksync no longer trusts
+	// the image ID for content addressing (it drifts), so there is no --iidfile.
 	for _, want := range []string{"docker", "build", "--provenance=false", "-f", b.Dockerfile, ctxDir} {
 		if !slices.Contains(bld.argv, want) {
 			t.Errorf("build argv %v missing %q", bld.argv, want)
 		}
+	}
+	if slices.Contains(bld.argv, "--iidfile") {
+		t.Errorf("build argv %v must not use --iidfile (ksync fingerprints the built image instead)", bld.argv)
 	}
 	// Retagging must go through the temp name: the containerd image store
 	// does not resolve config digests in `docker tag`.
@@ -94,7 +108,10 @@ func TestBuilder_DockerfileBuild(t *testing.T) {
 	if !slices.Contains(bld.argv, tmpRef) {
 		t.Errorf("build argv %v missing temp tag %q", bld.argv, tmpRef)
 	}
-	if got := calls[1].argv; !slices.Equal(got, []string{"docker", "tag", tmpRef, ref}) {
+	if got := calls[1].argv; got[0] != "docker" || got[1] != "image" || got[2] != "inspect" || !slices.Contains(got, tmpRef) {
+		t.Errorf("inspect argv = %v, want docker image inspect of the temp tag", got)
+	}
+	if got := calls[2].argv; !slices.Equal(got, []string{"docker", "tag", tmpRef, ref}) {
 		t.Errorf("tag argv = %v, want docker tag %s %s", got, tmpRef, ref)
 	}
 }
@@ -106,15 +123,15 @@ func TestBuilder_CommandBuild(t *testing.T) {
 		Context: ctxDir,
 		Command: "just build-api-b",
 	}
-	imageID := "sha256:" + strings.Repeat("ef", 32)
+	fingerprint := `{"Entrypoint":["/api-b"]}["sha256:efef"]`
 	var calls []call
-	builder := &Builder{Exec: fakeExec(&calls, imageID, nil), Output: io.Discard}
+	builder := &Builder{Exec: fakeExec(&calls, fingerprint, nil), Output: io.Discard}
 
 	ref, err := builder.Build(context.Background(), b)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if want := "api-b:ksync-efefefefefef"; ref != want {
+	if want := "api-b:ksync-" + fpHash(fingerprint); ref != want {
 		t.Errorf("ref = %q, want %q", ref, want)
 	}
 	if len(calls) != 3 {
@@ -135,6 +152,76 @@ func TestBuilder_CommandBuild(t *testing.T) {
 	}
 	if got := calls[2].argv; !slices.Equal(got, []string{"docker", "tag", "api-b:ksync-build", ref}) {
 		t.Errorf("tag argv = %v, want retag from the temp name", got)
+	}
+}
+
+func TestBuilder_BuildGroup(t *testing.T) {
+	ctxDir := t.TempDir()
+	builds := []config.Build{
+		{Image: "ghcr.io/team-a/api-b", Context: ctxDir, Group: "g"},
+		{Image: "ghcr.io/team-a/api-c", Context: ctxDir, Group: "g"},
+	}
+	fingerprint := `{"Entrypoint":["/srv"]}["sha256:abab"]`
+	var calls []call
+	builder := &Builder{Exec: fakeExec(&calls, fingerprint, nil), Output: io.Discard}
+
+	refs, err := builder.BuildGroup(context.Background(), "docker buildx bake $KSYNC_IMAGES", builds)
+	if err != nil {
+		t.Fatalf("BuildGroup: %v", err)
+	}
+	// Both images share the fake fingerprint, so they share a dev tag — valid,
+	// since they are distinct repositories (NeoShowcase's components likewise
+	// share layers and differ only by image name).
+	tag := "ksync-" + fpHash(fingerprint)
+	want := []string{"ghcr.io/team-a/api-b:" + tag, "ghcr.io/team-a/api-c:" + tag}
+	if !slices.Equal(refs, want) {
+		t.Errorf("refs = %v, want %v", refs, want)
+	}
+	// One bulk command + per image (inspect, tag): 1 + 2*2 = 5 calls.
+	if len(calls) != 5 {
+		t.Fatalf("calls = %d, want 5 (1 command + 2x(inspect, tag))", len(calls))
+	}
+	cmd := calls[0]
+	if !slices.Equal(cmd.argv, []string{"sh", "-c", "docker buildx bake $KSYNC_IMAGES"}) {
+		t.Errorf("command argv = %v", cmd.argv)
+	}
+	if cmd.dir != ctxDir {
+		t.Errorf("command dir = %q, want the shared context", cmd.dir)
+	}
+	// The command learns its targets from $KSYNC_IMAGES — the newline-separated
+	// temp refs it must produce — not $KSYNC_IMAGE.
+	wantImages := "KSYNC_IMAGES=ghcr.io/team-a/api-b:ksync-build\nghcr.io/team-a/api-c:ksync-build"
+	if !slices.Contains(cmd.env, wantImages) {
+		t.Errorf("command env = %v, must carry %q", cmd.env, wantImages)
+	}
+	// Each image is content-tagged from its own temp name.
+	if got := calls[2].argv; !slices.Equal(got, []string{"docker", "tag", "ghcr.io/team-a/api-b:ksync-build", want[0]}) {
+		t.Errorf("api-b tag argv = %v", got)
+	}
+	if got := calls[4].argv; !slices.Equal(got, []string{"docker", "tag", "ghcr.io/team-a/api-c:ksync-build", want[1]}) {
+		t.Errorf("api-c tag argv = %v", got)
+	}
+}
+
+func TestBuilder_BuildGroupCommandFailureStopsBeforeTagging(t *testing.T) {
+	ctxDir := t.TempDir()
+	builds := []config.Build{{Image: "api-b", Context: ctxDir, Group: "g"}}
+	var calls []call
+	boom := errors.New("bake failed")
+	builder := &Builder{
+		Exec: fakeExec(&calls, "", func(argv []string) error {
+			if argv[0] == "sh" {
+				return boom
+			}
+			return nil
+		}),
+		Output: io.Discard,
+	}
+	if _, err := builder.BuildGroup(context.Background(), "bake", builds); !errors.Is(err, boom) {
+		t.Fatalf("BuildGroup error = %v, want the command failure", err)
+	}
+	if len(calls) != 1 {
+		t.Errorf("calls = %d, want 1 — a failed bulk command must not inspect or tag", len(calls))
 	}
 }
 
