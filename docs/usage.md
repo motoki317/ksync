@@ -163,8 +163,21 @@ is the same, nothing differs, and **no pod restarts**. This is also why ksync ne
 file — on startup it simply builds everything once (fast, thanks to docker's layer cache)
 and lands on the tags that are already deployed.
 
+ksync also rewrites `imagePullPolicy: Always` to `IfNotPresent` on the containers running an
+image it built. The injected `ksync-…` tag only ever exists locally (and, with `imageLoad`, in
+the cluster's store) — never in a registry — so `Always` would make the kubelet try to pull it
+and fail with `ErrImagePull`. Only an explicit `Always` is changed; `Never`, `IfNotPresent`,
+and an omitted policy are left alone (an omitted policy already means `IfNotPresent` for these
+non-`latest` tags). Images ksync does not build are never touched.
+
 Manifest-only edits never run docker: the last built tag is remembered and re-used, so the
 fast manifest loop stays fast.
+
+While a build (or image import) runs, ksync collapses the tool's output into a single live
+line — `⠹ build api-b  <latest output line>  12s` — and prints a `✓ build api-b (12s)` when it
+finishes. The full, verbose build log is shown **only if the command fails**, so a normal
+build stays quiet and a broken one gives you everything. (In a pipe or CI, the spinner is
+replaced by plain start/finish lines.)
 
 ### `.dockerignore` decides what triggers a rebuild
 
@@ -265,7 +278,8 @@ What it does:
    the error, keeps running, and retries with growing wait times. The next file save resets
    the retry and syncs immediately again.
 
-Stop it with Ctrl-C.
+Stop it with Ctrl-C. When ksync is running in an interactive terminal, **press Enter to resync
+every app** — handy after restarting a dependency by hand, or to re-pull an image that failed.
 
 Flags:
 
@@ -274,6 +288,8 @@ Flags:
 | `-debounce` | `200ms` | Quiet period after the last change before re-rendering. |
 | `-max-parallel` | `4` | How many apps may sync at the same time. |
 | `-prune` | `true` | Delete tracked resources that you removed from the files. |
+| `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
+| `-v` | `false` | Verbose: also log every detected file change. |
 
 ### `ksync sync` — one-time sync
 
@@ -286,13 +302,16 @@ Renders and applies once, then exits. Useful for scripts, or to converge the clu
 starting `watch`. Apps are synced in dependency order (`needs` first). Apps with `build`
 entries build their images first, so what gets applied always points at images that exist.
 
-Example output:
+Each app prints a one-line summary; only failures are listed in detail:
 
 ```text
-api-b  /Namespace//team-a            Synced  namespace/team-a serverside-applied
-api-b  /ConfigMap/team-a/api-config  Synced  configmap/api-config serverside-applied
-api-b  apps/Deployment/team-a/api-b  Synced  deployment.apps/api-b serverside-applied
+✓ api-b  3 applied, 1 pruned
 ```
+
+It takes the same `-timeout` (default `5m`) and `-v` flags as `watch`. The timeout matters
+most here: a one-time sync waits for the app to become healthy, so without it a pod stuck in
+`ErrImagePull` would hang `ksync sync` forever. On timeout the sync fails and names the
+resources that never became healthy, so you know where to look.
 
 ### `ksync render` — print the YAML
 
@@ -319,7 +338,18 @@ ksync destroy -yes shop     # delete only one app's resources
 
 Deletes every resource that ksync tracks for the selected apps — and nothing else. Apps go
 down in reverse dependency order (dependents first). Namespaces are never deleted, even
-namespaces that ksync created.
+namespaces that ksync created. Like `sync`, it takes `-timeout` (default `5m`) to bound how
+long it waits for resources to finish deleting.
+
+## Output and logs
+
+ksync writes its status (build, sync, watch events) to **stderr**, so `ksync render`'s manifest
+output on **stdout** stays clean and pipeable. The Kubernetes client and the sync engine are
+silenced down to genuine errors — only ksync's own events and real failures are shown.
+
+Output is colored when stderr is an interactive terminal. Set `NO_COLOR` (any value) to disable
+color; it is off automatically when the output is piped or redirected. Pass `-v` to `sync` or
+`watch` to also see each detected file change.
 
 ### `ksync diff` — not implemented yet
 
@@ -408,10 +438,20 @@ local cluster with many CRDs). Every sync after that uses the warm cache and is 
 `watch` running instead of restarting it.
 
 **Pods of a built image show `ErrImagePull` or `ImagePullBackOff`**
-The kubelet tried to pull the `ksync-…` tag from a registry, which does not have it. Two
-common causes: the container sets `imagePullPolicy: Always` (change it — locally built
-images cannot be pulled), or the cluster cannot see your docker daemon's images (use Docker
-Desktop Kubernetes, or another cluster that shares the daemon).
+The kubelet tried to pull the `ksync-…` tag from a registry, which does not have it. ksync
+already rewrites an explicit `imagePullPolicy: Always` to `IfNotPresent` for images it builds,
+so the usual remaining causes are: the image is referenced by a manifest with **no matching
+`build` entry**, so ksync never built or imported it (add the `build` entry — this is the most
+common mistake); or the cluster keeps a **separate image store** and `imageLoad` is not set, so
+the built image was never imported (see "Making built images visible"); or the cluster simply
+cannot see your docker daemon's images (use Docker Desktop Kubernetes, or set `imageLoad`).
+
+**`sync of "X" timed out; still not healthy: …`**
+A sync waits for the app's resources to become healthy (so dependent apps and PostSync hooks
+see a ready dependency). If something never becomes healthy — a pod stuck in `ErrImagePull`,
+a crash loop — the sync gives up after `-timeout` (default `5m`) and lists the resources it
+was waiting on. Fix the named resource (see the `ErrImagePull` entry above), then sync again.
+Raise `-timeout` for genuinely slow rollouts, or set it to `0` to wait forever.
 
 **Pods restart on every rebuild, even when nothing changed**
 The image ID changes on every build. The usual cause is docker's provenance attestation,

@@ -50,7 +50,13 @@ re-litigate only with new evidence):
   20260612-build-integration and 20260613-image-load-hook.
 - `internal/render` — in-process kustomize (krusty) replicating
   `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
-  binary is enforced by test.
+  binary is enforced by test. `SetImages` (the build-tag injection path) also rewrites an
+  explicit `imagePullPolicy: Always` to `IfNotPresent` for images ksync builds — the
+  content-addressed local tag exists in no registry, so `Always` would force a doomed pull.
+- `internal/ui` — human-facing output: a `logr.LogSink` that renders clean, colored,
+  single-line records (a quiet variant drops Info/V noise; used for the engine and the routed
+  klog/client-go stream), color helpers (NO_COLOR + TTY aware), and `Activity`, the nix-style
+  single-line progress for external build/import commands (full log shown only on failure).
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.

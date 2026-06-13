@@ -70,6 +70,9 @@ is in **[docs/usage.md](docs/usage.md)**.
 - **Native builds without ceremony** — two fields (`image`, `context`) per built image;
   content-addressed dev tags mean unchanged source never rolls a pod, and no build state is
   persisted anywhere. `.dockerignore` decides what triggers rebuilds.
+- **Readable output** — clean, colored, single-line status on stderr (the Kubernetes client and
+  sync engine are silenced to real errors); a bounded sync timeout turns a stuck pod into a
+  clear "still not healthy" message instead of a hang.
 - **Safety** — explicit kubectl-context allowlist; prune scoped by a ksync tracking label.
 
 ## Development
