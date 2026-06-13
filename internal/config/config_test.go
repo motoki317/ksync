@@ -32,6 +32,22 @@ apps:
 	}
 }
 
+func TestParse_ImageLoadField(t *testing.T) {
+	yml := `
+context: k3d-dev
+imageLoad: k3d image import --cluster dev $KSYNC_IMAGE
+apps:
+  - path: apps/api-b
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if want := "k3d image import --cluster dev $KSYNC_IMAGE"; cfg.ImageLoad != want {
+		t.Errorf("ImageLoad = %q, want %q", cfg.ImageLoad, want)
+	}
+}
+
 func TestParse_ExplicitNameAndNeeds(t *testing.T) {
 	yml := `
 context: k3d-local

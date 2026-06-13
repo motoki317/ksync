@@ -22,7 +22,17 @@ type Config struct {
 	// ksync will ever use — there is deliberately no fallback to the ambient
 	// current-context, so a config can never accidentally point at production.
 	Context string `json:"context"`
-	Apps    []App  `json:"apps"`
+	// ImageLoad makes a freshly built image visible to a cluster whose image
+	// store is separate from the local docker daemon (k3d, kind, a remote
+	// registry). It runs once per built ref via `sh -c` with $KSYNC_IMAGE set
+	// to that ref — the same contract as a build command — so ksync needs no
+	// per-cluster-type knowledge. Empty for daemon-shared clusters (Docker
+	// Desktop). Examples:
+	//   k3d image import --cluster dev $KSYNC_IMAGE
+	//   kind load docker-image --name dev $KSYNC_IMAGE
+	//   docker push $KSYNC_IMAGE
+	ImageLoad string `json:"imageLoad,omitempty"`
+	Apps      []App  `json:"apps"`
 }
 
 // App is one kustomization directory managed by ksync.

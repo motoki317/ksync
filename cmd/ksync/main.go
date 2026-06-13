@@ -146,13 +146,13 @@ func runSync(args []string) error {
 	defer eng.Close()
 
 	r := render.New(render.Options{})
-	builder := &build.Builder{}
+	buildFn := makeBuildFunc(cfg)
 	for _, app := range apps {
 		// Build before render so the applied manifests always reference
 		// images that exist in the local daemon.
 		images := make([]render.Image, 0, len(app.Build))
 		for _, b := range app.Build {
-			ref, err := builder.Build(ctx, b)
+			ref, err := buildFn(ctx, b)
 			if err != nil {
 				return fmt.Errorf("app %s: building %s: %w", app.Name, b.Image, err)
 			}
@@ -212,13 +212,30 @@ func runWatch(args []string) error {
 		printSyncResults(os.Stdout, app, results)
 		return nil
 	}
-	builder := &build.Builder{}
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
-		Build:       builder.Build,
+		Build:       makeBuildFunc(cfg),
 		Log:         log,
 	})
+}
+
+// makeBuildFunc composes building an image with loading it into the cluster, so
+// the same path serves one-shot sync and the watch loop. The load step is a
+// no-op unless the config sets imageLoad (daemon-shared clusters need nothing).
+func makeBuildFunc(cfg *config.Config) loop.BuildFunc {
+	builder := &build.Builder{}
+	loader := &build.Loader{Command: cfg.ImageLoad}
+	return func(ctx context.Context, b config.Build) (string, error) {
+		ref, err := builder.Build(ctx, b)
+		if err != nil {
+			return "", err
+		}
+		if err := loader.Load(ctx, ref); err != nil {
+			return "", err
+		}
+		return ref, nil
+	}
 }
 
 func runDestroy(args []string) error {
