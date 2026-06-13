@@ -99,7 +99,8 @@ The fields, one by one:
 | Field | Required | Meaning |
 |---|---|---|
 | `context` | yes | The only kubectl context ksync will use. |
-| `imageLoad` | no | Shell command that makes a freshly built image visible to the cluster (k3d/kind/remote). Runs once per built image with `$KSYNC_IMAGE` set. See "Making built images visible". |
+| `imageLoad` | no | Shell command that makes freshly built images visible to the cluster (k3d/kind/remote). Runs once per build batch with `$KSYNC_IMAGES` set (and `$KSYNC_IMAGE` to the first). See "Making built images visible". |
+| `buildGroups` | no | Named bulk-build commands several `build` entries can share, so one `docker buildx bake`/compile produces many images. See "Build groups". |
 | `apps[].path` | yes | Directory with a kustomization file. Relative paths are resolved from the config file's directory. |
 | `apps[].name` | no | Name of the app. Default: the directory name. Used in commands (`ksync sync api-b`), in logs, and as the tracking label value. |
 | `apps[].namespace` | no | Default namespace for resources that do not set one (like ArgoCD's `destination.namespace`). ksync creates this namespace if it does not exist. |
@@ -147,12 +148,14 @@ That is all you need for the common case: a directory with a `Dockerfile` in it.
 | `dockerfile` | no | Path to the Dockerfile, relative to `context`. Default: `Dockerfile` in the context. |
 | `watch` | no | Only these paths (relative to `context`) trigger a rebuild. Useful in monorepos where one big context feeds many images. Default: the whole context. |
 | `command` | no | Replaces `docker build` with your own build command (see below). |
+| `group` | no | Build this image as part of a `buildGroups` entry of this name — one bulk command builds it together with the group's other dirty images. Mutually exclusive with `command`/`dockerfile`. See "Build groups". |
 
 ### How it works
 
 1. When a watched source file changes, ksync runs `docker build` on the context.
-2. The built image gets a tag made from its **content**: `ksync-` plus 12 hex digits of the
-   image ID. Same source in, same tag out.
+2. The built image gets a tag made from its **content**: `ksync-` plus 12 hex digits of a hash
+   of the image's fingerprint — its layer contents plus its runtime config (entrypoint, env,
+   …). Same content in, same tag out; an unchanged rebuild yields the identical tag.
 3. ksync renders the app and replaces the tag of every matching image — in memory only,
    your manifest files are never modified.
 4. The app syncs as usual. Because the tag changed, Kubernetes restarts the pods with the
@@ -162,6 +165,12 @@ The content-based tag has a nice effect: if you rebuild without changing anythin
 is the same, nothing differs, and **no pod restarts**. This is also why ksync needs no state
 file — on startup it simply builds everything once (fast, thanks to docker's layer cache)
 and lands on the tags that are already deployed.
+
+ksync fingerprints the image it built (its layers and config) rather than trusting the image
+ID, because some builders — notably `docker buildx bake` — stamp a fresh build timestamp into
+the image config every time, giving unchanged content a new ID. Fingerprinting the layers and
+config sidesteps that, so unchanged images keep their tag and their pods do **not** roll, even
+through a bake `command` or a build group.
 
 ksync also rewrites `imagePullPolicy: Always` to `IfNotPresent` on the containers running an
 image it built. The injected `ksync-…` tag only ever exists locally (and, with `imageLoad`, in
@@ -208,10 +217,91 @@ variable inside single quotes, so `--set 'api-b.tags=$KSYNC_IMAGE'` passes the l
 any argument that contains it, and single quotes only around arguments that must *not* expand
 (e.g. a bake `--set '*.platform=…'`, where `*` would otherwise glob).
 
-Tip: pass `--provenance=false` to docker in your command. Without it, docker adds a
-build-time attestation that gives the same content a different image ID on every build, so
-every rebuild would restart pods even when nothing changed. (ksync's own `docker build`
-already does this.)
+You do not need to make your build reproducible for content addressing to work: ksync tags by
+the built image's layers and runtime config, not its image ID, so a `docker buildx bake` (which
+restamps the image ID every build) still produces a stable tag for unchanged content. Passing
+`--provenance=false` is still tidy — it drops an attestation manifest you do not need locally —
+but it is no longer required to avoid needless pod restarts.
+
+### Build groups: building many images with one command
+
+When several images come out of **one** build — a multi-target `docker buildx bake`, a host
+compile that produces many binaries — running a separate `command` per image is wasteful: the
+shared work (a common base image, one compiler pass) repeats, the builds run one after another,
+and each image imports into the cluster separately. A **build group** hands the whole set to a
+single command instead.
+
+Declare the group at the top level and point the member `build` entries at it with `group`:
+
+```yaml
+buildGroups:
+  - name: services
+    # Builds every image the batch asks for. $KSYNC_IMAGES is the newline-separated
+    # list of <image>:ksync-build temp tags to produce — only the images that
+    # actually changed, which may be just one.
+    command: |
+      sets=""; targets=""
+      for ref in $KSYNC_IMAGES; do          # ref = ghcr.io/team-a/api-b:ksync-build
+        t=${ref%:*}; t=${t##*/}             # -> api-b  (the bake target name)
+        sets="$sets --set ${t}.tags=${ref}"
+        targets="$targets $t"
+      done
+      docker buildx bake --load --set '*.attest=' $sets $targets
+
+apps:
+  - name: services
+    path: manifests/services
+    build:
+      - image: ghcr.io/team-a/api-b          # no command/dockerfile: the group builds it
+        context: ../..
+        watch: [services/api-b, lib]
+        group: services
+      - image: ghcr.io/team-a/api-c
+        context: ../..
+        watch: [services/api-c, lib]
+        group: services
+```
+
+How it behaves:
+
+- A grouped entry sets **neither `command` nor `dockerfile`** — the group's command builds it.
+  It keeps `context` and `watch`, which still decide what dirties it.
+- ksync builds only the **dirty subset**: edit one service and the command runs with a single
+  ref in `$KSYNC_IMAGES`; edit shared code and all the dirty members build in one invocation.
+- After the command finishes, ksync content-tags each image exactly as for a single build, so
+  the no-rollout-on-unchanged guarantee still holds **per image**: a bulk bake of six targets
+  where only two changed rolls only those two pods.
+- All members of a group must share one `context` (the command's working directory).
+- The command must leave each requested image tagged `<image>:ksync-build` in the daemon —
+  the same temp-tag contract as a single `command` build, just for many images at once.
+- The command runs under `sh -c`. `$KSYNC_IMAGES` is newline-separated specifically so an
+  unquoted `for ref in $KSYNC_IMAGES` word-splits into one ref per iteration. Leave it unquoted
+  in the loop (the refs never contain spaces).
+
+A group's command is arbitrary shell, so it also fits the **host-compile then thin image**
+shape: pre-build the binaries on the host (one compiler pass), then `bake` thin Dockerfiles that
+just `COPY` them in. Only the dirty subset is asked for, so editing one service compiles and
+bakes only that one:
+
+```yaml
+buildGroups:
+  - name: services
+    command: |
+      names=""; sets=""
+      for ref in $KSYNC_IMAGES; do          # ref = ghcr.io/team-a/svc-x:ksync-build
+        n=${ref%:*}; n=${n##*/}             # -> svc-x  (service / bake target name)
+        names="$names $n"
+        sets="$sets --set ${n}.tags=${ref}"
+      done
+      just prebuild $names                  # host compile (e.g. cargo zigbuild) -> ./.build/…
+      docker buildx bake --load --set '*.attest=' $sets $names
+```
+
+ksync content-tags each thin image by its fingerprint (the copied binary's layer), so editing
+one service's source rebuilds its binary, changes its image, and rolls only that pod — the rest
+keep their tags. (ksync renders kustomize; if your services are deployed another way — a raw
+helmfile, say — give each a small kustomization that inflates its chart via `helmCharts:` so
+ksync can render and tag-inject it.)
 
 ### Making built images visible to the cluster
 
@@ -220,18 +310,23 @@ from there, so nothing else is needed. But k3d and kind keep their own image sto
 node, and a remote cluster cannot see your daemon at all — a freshly built `ksync-<hash>` tag
 never reaches them, and the pod fails to start.
 
-For those, set `imageLoad`: a command ksync runs once for every image it builds, with
-`$KSYNC_IMAGE` set to the full built reference (`<image>:ksync-<hash>`). It is the mirror image
-of a build `command` — a build *produces* `$KSYNC_IMAGE`, `imageLoad` *consumes* it.
+For those, set `imageLoad`: a command ksync runs once per build batch, with `$KSYNC_IMAGES` set
+to the newline-separated built references (`<image>:ksync-<hash>`) and `$KSYNC_IMAGE` to the
+first of them. It is the mirror image of a build `command` — a build *produces* the refs,
+`imageLoad` *consumes* them.
 
 ```yaml
-# k3d:
-imageLoad: k3d image import --cluster dev $KSYNC_IMAGE
+# k3d (imports every image of the batch in one call):
+imageLoad: k3d image import --cluster dev $KSYNC_IMAGES
 # kind:
-imageLoad: kind load docker-image --name dev $KSYNC_IMAGE
+imageLoad: kind load docker-image --name dev $KSYNC_IMAGES
 # remote cluster that pulls from a registry your manifests point at:
-imageLoad: docker push $KSYNC_IMAGE
+imageLoad: for i in $KSYNC_IMAGES; do docker push "$i"; done
 ```
+
+Use `$KSYNC_IMAGES` (plural) so a build group's images import together; `$KSYNC_IMAGE` (the
+first ref) still works for the single-image case. `$KSYNC_IMAGES` is newline-separated, so an
+unquoted use word-splits into one argument per image.
 
 ksync stays out of the way here on purpose: it has no built-in idea of "k3d" or "kind", so the
 one line above is exactly what runs — and any other tool or transport works the same way without
@@ -239,10 +334,55 @@ waiting for a ksync release. The load runs only when an image is actually (re)bu
 fast manifest-only loop never pays for it. With k3d/kind, set the pods' `imagePullPolicy` to
 `Never` or `IfNotPresent` so the kubelet uses the imported image instead of trying to pull it.
 
-One cost to know: `k3d image import` (and `kind load`) transfer a tarball per call, a few
-seconds each. Editing one service rebuilds and imports just that one image — fast. A cold
-`watch` start that builds many images imports them one after another, so first convergence on a
-big project takes a little longer; steady-state editing does not.
+One cost to know: `k3d image import` (and `kind load`) transfer a *whole image tarball* per call —
+a few seconds each (measured ~3.3s for a ~120 MB image; `k3d image import --mode direct` shaves it
+to ~2.8s). It re-sends every layer even when only the top one changed, because a tarball has no
+notion of "already present". Editing one service rebuilds and imports just that one image — fast.
+A cold `watch` start that builds many images imports them one after another, so first convergence
+on a big project takes a little longer; steady-state editing does not.
+
+#### k3d fast-path: push to a registry instead of importing
+
+`k3d image import` is the zero-setup default, but the tarball transfer dominates the loop once the
+build itself is incremental. If you want a sub-second load, give the cluster a local registry and
+**push** instead — a registry only transfers the layers it does not already have, so an incremental
+rebuild moves one layer:
+
+```yaml
+# imageLoad: retag each built ref to the local registry and push it.
+imageLoad: |
+  for ref in $KSYNC_IMAGES; do
+    docker tag "$ref" "localhost:5111/${ref#*/}"
+    docker push "localhost:5111/${ref#*/}"
+  done
+```
+
+Measured against the same image as above: **~0.8s** to push (cold *and* warm — the layers are
+local), versus ~3.3s to import. On a one-service edit that brings the cluster-load step from the
+biggest cost after the build down to noise.
+
+Two pieces of cluster setup make it transparent — the pod keeps pulling its original
+`ghcr.io/...` (or any registry) name, no manifest rewrite:
+
+- Create k3d with a registry it can pull from: `k3d cluster create … --registry-use <name>:5111`
+  (or `k3d registry create` + `--registry-use`).
+- Add a **mirror** so the manifests' registry resolves to that local one, via
+  `k3d cluster create … --registry-config <file>` where the file maps the host:
+
+  ```yaml
+  mirrors:
+    "ghcr.io":                          # whatever host your image names use
+      endpoint:
+        - "http://<registry-name>:5000" # the registry's in-cluster address
+  ```
+
+  Push to `localhost:5111/<path>` (the registry's host-side port); the kubelet, pulling
+  `ghcr.io/<path>`, is redirected to `http://<registry-name>:5000/<path>` — the same blob.
+
+Use `imagePullPolicy: IfNotPresent` (not `Never`) so the kubelet pulls each new `ksync-<hash>` tag
+from the mirror the first time it sees it; unchanged tags stay cached on the node. The pull of one
+fresh ~28 MB layer from a local registry is ~250 ms. The result is a k3d loop whose only real costs
+are the build and the pod roll — the cluster transport is no longer one of them.
 
 ### Other limits, in plain words
 
