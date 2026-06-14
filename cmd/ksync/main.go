@@ -461,9 +461,9 @@ func resyncOnEnter(ctx context.Context, log logr.Logger) <-chan struct{} {
 // build vs an image-load vs an apply all otherwise lead with the same ✓. They
 // front each line's label (after the status symbol).
 const (
-	iconBuild  = "🔨"  // docker build / bake
-	iconImport = "📦"  // imageLoad into the cluster store
-	iconSync   = "☸️" // apply to the cluster
+	iconBuild  = "🔨" // docker build / bake
+	iconImport = "📦" // imageLoad into the cluster store
+	iconSync   = "🚀" // apply / deploy to the cluster
 )
 
 // makeBuildFunc composes building an image with loading it into the cluster, so
@@ -660,7 +660,7 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
-	// The ☸ icon marks this as an apply line, distinct from a 🔨 build line.
+	// The 🚀 icon marks this as an apply line, distinct from a 🔨 build line.
 	fmt.Fprintf(&b, "%s %s %s  %s\n", symbol, iconSync, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
 	// Through ui.WriteLine so the line erases any in-flight build spinner before
 	// printing — apps sync concurrently, so a summary can land mid-spinner.
