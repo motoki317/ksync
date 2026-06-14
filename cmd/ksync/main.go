@@ -410,6 +410,7 @@ func runWatch(args []string) error {
 	}
 	defer eng.Close()
 
+	out := ui.NewColors(os.Stderr)
 	nsByApp := make(map[string]string, len(apps))
 	for _, a := range apps {
 		nsByApp[a.Name] = a.Namespace
@@ -427,12 +428,19 @@ func runWatch(args []string) error {
 		}
 		return stats, err
 	}
+	// Frame the startup convergence like a `ksync sync` run — a Plan, a live
+	// Summary footer, then the committed Summary once every app has synced once
+	// — after which incremental syncs just stream. Stop the footer on exit so a
+	// Ctrl-C mid-convergence never leaves it pinned.
+	reporter := startWatchReporter(os.Stderr, out, apps, cfg.Context)
+	defer reporter.stop()
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
 		Render:      renderOpts,
-		Build:       makeBuildFunc(cfg, os.Stderr, ui.NewColors(os.Stderr)),
+		Build:       makeBuildFunc(cfg, os.Stderr, out),
 		Log:         log,
+		Report:      reporter.report,
 		Resync:      resyncOnEnter(ctx, log),
 	})
 }
@@ -460,6 +468,86 @@ func resyncOnEnter(ctx context.Context, log logr.Logger) <-chan struct{} {
 	}()
 	return ch
 }
+
+// watchReporter renders the watch loop's per-app sync lines and, for a
+// whole-stack watch, frames the startup convergence the way a `ksync sync` run
+// is framed: a Plan up front, a live Summary footer pinned with the running
+// tally, and the committed Summary block once every app has synced once. After
+// that first convergence it streams incremental syncs with no footer — a
+// per-keystroke summary block would be noise. A single-app watch skips all of
+// it (footer == nil) and just streams the one ship line, like a one-app sync.
+type watchReporter struct {
+	w       io.Writer
+	out     ui.Colors
+	total   int
+	started time.Time
+
+	mu           sync.Mutex
+	agg          loop.SyncStats
+	degradedApps []string
+	seen         map[string]bool // apps that have completed their first sync
+	converged    bool
+	footer       *ui.Footer
+}
+
+// startWatchReporter prints the Plan and pins the live Summary footer for a
+// multi-app watch; a single-app watch gets an inert reporter (no Plan/footer).
+func startWatchReporter(w io.Writer, out ui.Colors, apps []config.App, kubeContext string) *watchReporter {
+	r := &watchReporter{w: w, out: out, total: len(apps), started: time.Now(), seen: make(map[string]bool, len(apps))}
+	if r.total <= 1 {
+		return r
+	}
+	printPlan(w, out, apps, kubeContext)
+	r.footer = ui.StartFooter(w, out, func() []string {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return summaryLines(out, r.total, len(r.seen), r.agg, r.degradedApps, time.Since(r.started), false)
+	})
+	return r
+}
+
+// report renders one completed app sync (the loop's Report hook) as the shared
+// ship-emoji apply line, and on the run that completes the initial convergence
+// commits the Summary block and removes the footer.
+func (r *watchReporter) report(app string, stats loop.SyncStats, took time.Duration) {
+	line := appSyncLine(r.out, app, stats, took)
+	done := false
+	r.mu.Lock()
+	// Tally each app's FIRST sync only, so the Summary reflects one convergence
+	// rather than every later edit; convergence is when all apps have synced.
+	// Idle (no app dirty/running) is reached only when every app has succeeded,
+	// so a stuck app holds the footer open instead of committing a false "done".
+	if r.footer != nil && !r.converged && !r.seen[app] {
+		r.seen[app] = true
+		r.agg.Applied += stats.Applied
+		r.agg.Pruned += stats.Pruned
+		r.agg.Failed += stats.Failed
+		r.agg.Degraded += stats.Degraded
+		if stats.Degraded > 0 {
+			r.degradedApps = append(r.degradedApps, app)
+		}
+		if len(r.seen) == r.total {
+			r.converged = true
+			done = true
+		}
+	}
+	r.mu.Unlock()
+
+	ui.WriteLine(r.w, line+"\n")
+
+	if done {
+		r.footer.Stop()
+		r.mu.Lock()
+		final := summaryLines(r.out, r.total, len(r.seen), r.agg, r.degradedApps, time.Since(r.started), true)
+		r.mu.Unlock()
+		printSummaryBlock(r.w, final)
+	}
+}
+
+// stop removes the live footer; idempotent, so the deferred call after the loop
+// exits is harmless when convergence already stopped it. It matters when Ctrl-C
+// arrives mid-convergence — without it the footer stays pinned.
+func (r *watchReporter) stop() { r.footer.Stop() }
 
 // Stage icons distinguish the kinds of progress/result lines at a glance — a
 // build vs an image-load vs an apply all otherwise lead with the same ✓. They
