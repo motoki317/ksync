@@ -183,11 +183,13 @@ Manifest-only edits never run docker: the last built tag is remembered and re-us
 fast manifest loop stays fast.
 
 While a build (or image import) runs, ksync collapses the tool's output into a single live
-line — `⠹ build api-b  <latest output line>  12s` — and prints a `✓ build api-b (12s)` when it
-finishes. When several builds run at once (a whole-stack sync), each gets its own live line,
-stacked together; per-app sync summaries print above them as they complete. The full, verbose
-build log is shown **only if the command fails**, so a normal build stays quiet and a broken
-one gives you everything. (In a pipe or CI, the spinner is replaced by plain start/finish lines.)
+line — `⠹ 🔨 api-b  <latest output line>  12s` — and prints a `✓ 🔨 api-b (12s)` when it
+finishes. A leading icon marks the stage so build, image-load, and apply lines never blur
+together: **🔨 build**, **📦 image-load**, **☸️ apply**. When several builds run at once (a
+whole-stack sync), each gets its own live line, stacked together; per-app apply summaries print
+above them as they complete. The full, verbose build log is shown **only if the command fails**,
+so a normal build stays quiet and a broken one gives you everything. (In a pipe or CI, the
+spinner is replaced by plain start/finish lines.)
 
 ### `.dockerignore` decides what triggers a rebuild
 
@@ -451,14 +453,14 @@ needs have finished — the same model `watch` uses, so a one-time sync is never
 loop's startup pass. Apps with `build` entries build their images first, so what gets applied
 always points at images that exist.
 
-Each app prints a one-line summary; failures and degraded resources are listed in detail. The
-symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠` applied but a resource is
-broken at runtime, `✗` a sync task failed:
+Each app prints a one-line summary, led by the ☸️ apply icon (so it reads distinctly from a 🔨
+build line). The status symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠`
+applied but a resource is broken at runtime, `✗` a sync task failed:
 
 ```text
-✓ api-b  3 applied, 1 pruned
+✓ ☸️ api-b  3 applied, 1 pruned
   ⚠ apps/Deployment/shop/web: Degraded — progress deadline exceeded
-⚠ shop  0 applied, 1 degraded
+⚠ ☸️ shop  0 applied, 1 degraded
 ```
 
 The `⚠` is a post-sync health snapshot: a resource that applied cleanly but is **Degraded** (a
@@ -478,7 +480,8 @@ Plan
   16 apps → docker-desktop
   postgres redis traefik … duo sistema
 
-… per-app lines stream above the pinned, live-updating block:
+✓ 🔨 rust-services (duo)  (4.6s)    ← build (🔨) and apply (☸️) lines stream above
+✓ ☸️ duo  0 applied                   the pinned, live-updating block:
 
 Summary
       Apps  12/16 synced

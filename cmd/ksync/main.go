@@ -457,6 +457,15 @@ func resyncOnEnter(ctx context.Context, log logr.Logger) <-chan struct{} {
 	return ch
 }
 
+// Stage icons distinguish the kinds of progress/result lines at a glance — a
+// build vs an image-load vs an apply all otherwise lead with the same ✓. They
+// front each line's label (after the status symbol).
+const (
+	iconBuild  = "🔨"  // docker build / bake
+	iconImport = "📦"  // imageLoad into the cluster store
+	iconSync   = "☸️" // apply to the cluster
+)
+
 // makeBuildFunc composes building an image with loading it into the cluster, so
 // the same path serves one-shot sync and the watch loop. The load step is a
 // no-op unless the config sets imageLoad (daemon-shared clusters need nothing).
@@ -489,7 +498,7 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 		label := imageName(builds[0].Image)
 		if group := builds[0].Group; group != "" {
 			label = group + " (" + app + ")"
-			act := ui.StartActivity(w, colors, "build "+label)
+			act := ui.StartActivity(w, colors, iconBuild+" "+label)
 			builder := &build.Builder{Output: act}
 			r, err := builder.BuildGroup(ctx, groupCmd[group], builds)
 			act.Done(err)
@@ -498,7 +507,7 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 			}
 			refs = r
 		} else {
-			act := ui.StartActivity(w, colors, "build "+label)
+			act := ui.StartActivity(w, colors, iconBuild+" "+label)
 			builder := &build.Builder{Output: act}
 			ref, err := builder.Build(ctx, builds[0])
 			act.Done(err)
@@ -517,7 +526,7 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 			}
 			mu.Unlock()
 			if len(fresh) > 0 {
-				act := ui.StartActivity(w, colors, "import "+label)
+				act := ui.StartActivity(w, colors, iconImport+" "+label)
 				loader := &build.Loader{Command: cfg.ImageLoad, Output: act}
 				err := loader.Load(ctx, fresh)
 				act.Done(err)
@@ -651,7 +660,8 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
-	fmt.Fprintf(&b, "%s %s  %s\n", symbol, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
+	// The ☸ icon marks this as an apply line, distinct from a 🔨 build line.
+	fmt.Fprintf(&b, "%s %s %s  %s\n", symbol, iconSync, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
 	// Through ui.WriteLine so the line erases any in-flight build spinner before
 	// printing — apps sync concurrently, so a summary can land mid-spinner.
 	ui.WriteLine(w, b.String())
@@ -705,7 +715,10 @@ func summaryLines(c ui.Colors, total, synced int, agg loop.SyncStats, degradedAp
 			width = len(ln.label)
 		}
 	}
-	lines := []string{c.Bold("Summary")}
+	// Lead with a blank line so the block is set off from the log above it — both
+	// while pinned live (this footer) and when committed (printSummaryBlock), so
+	// the spacing is identical in both states.
+	lines := []string{"", c.Bold("Summary")}
 	for _, ln := range rows {
 		// Right-align the label (padding added before color-wrapping, so the
 		// columns line up regardless of escape codes), value after a 2-space gap.
@@ -714,8 +727,9 @@ func summaryLines(c ui.Colors, total, synced int, agg loop.SyncStats, degradedAp
 	return lines
 }
 
-// printSummaryBlock commits the final summary block to scrollback, set off by a
-// leading blank line — matching the live footer that was just cleared.
+// printSummaryBlock commits the final summary block to scrollback. The leading
+// blank line comes from summaryLines, matching the live footer that was just
+// cleared.
 func printSummaryBlock(w io.Writer, lines []string) {
-	ui.WriteLine(w, "\n"+strings.Join(lines, "\n")+"\n")
+	ui.WriteLine(w, strings.Join(lines, "\n")+"\n")
 }
