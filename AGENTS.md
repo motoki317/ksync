@@ -63,8 +63,12 @@ re-litigate only with new evidence):
 - `internal/schedule` — pure scheduling state machine: debounce/coalesce, per-app
   serialization, bounded parallelism, needs gating, exponential retry backoff.
 - `internal/engine` — gitops-engine wrapper (pin: argo-cd release-tag commits; k8s.io/* follow
-  the engine's version): warm cluster cache, SSA, tracking-label-scoped prune, app-namespace
-  auto-creation (create-if-missing only).
+  the engine's version): warm cluster cache, SSA, tracking-label-scoped prune, namespace
+  auto-creation (create-if-missing — the app's own *and* every other namespace its resources
+  reference, the latter bare/untracked so prune never touches it; ADR
+  20260614-ensure-referenced-namespaces). After apply, a **health gate** blocks until every
+  non-hook resource is Healthy (or `--timeout`), so a completed `Sync` means deployed-and-healthy
+  and a `needs` edge waits for the dependency to actually serve (ADR 20260614-sync-health-gate).
 - `internal/loop` — the watch-mode event loop tying the above together; cluster and docker
   sides injected as SyncFunc/BuildFunc so it tests without either. Builds run per dirty
   (app, entry) before render; manifest-only edits never invoke docker.

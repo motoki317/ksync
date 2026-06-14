@@ -104,7 +104,7 @@ The fields, one by one:
 | `apps[].path` | yes | Directory with a kustomization file. Relative paths are resolved from the config file's directory. |
 | `apps[].name` | no | Name of the app. Default: the directory name. Used in commands (`ksync sync api-b`), in logs, and as the tracking label value. |
 | `apps[].namespace` | no | Default namespace for resources that do not set one (like ArgoCD's `destination.namespace`). ksync creates this namespace if it does not exist. |
-| `apps[].needs` | no | Apps that must sync before this one. ksync checks that there is no cycle. |
+| `apps[].needs` | no | Apps that must sync **and become Healthy** before this one starts. ksync checks that there is no cycle. |
 | `apps[].build` | no | Images to build from local source code. See "Building images from source" below. |
 
 Unknown fields are an error. This protects you from typos: `need:` instead of `needs:` fails
@@ -481,6 +481,21 @@ loop's startup pass. Apps with `build` entries build their images first, so what
 always points at images that exist — and an app's own independent images (its ungrouped entries and
 each build group) build concurrently too, also up to `-max-parallel`, so a multi-image app is not
 bottlenecked on building one at a time.
+
+An app **finishes only once its resources are Healthy**, not merely applied: after applying, ksync
+waits for every workload to reach Ready (Deployments rolled out, StatefulSets up, Jobs complete),
+up to `-timeout`. This is what makes `needs` meaningful — a dependent does not start against a
+database whose pod is still pulling its image; it waits until that database is actually serving.
+While an app is in this wait it shows a live `🚢 <app>  waiting for health` line (on a terminal),
+then resolves to its apply line once Ready. An app that cannot become Healthy (e.g. a workload
+crash-looping on a missing external prerequisite) blocks until `-timeout` and then fails, naming the
+resources still not healthy — so a broken deploy surfaces instead of passing as `✓ applied`. An
+already-healthy re-sync returns immediately (the wait finds nothing pending).
+
+If an app's resources reference namespaces it does not own (a chart that fans RBAC out across other
+apps' namespaces, say), ksync creates those namespaces if missing — bare and untracked, so prune
+never touches them and the app that owns one adopts it on its own sync. The common single-namespace
+app is unaffected.
 
 Each app prints a one-line summary, led by the 🚢 apply icon (so it reads distinctly from a 🔨
 build line). The status symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠`
