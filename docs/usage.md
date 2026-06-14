@@ -431,6 +431,11 @@ Flags:
 | `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
 | `-v` | `false` | Verbose: also log every detected file change. |
 
+Each sync logs one line — `synced  app=api-b applied=2 took=0.9s`. `applied` is what actually
+changed (so a no-op edit reads `applied=0`); `pruned`, `failed`, and `degraded` are added only when
+nonzero. `degraded=N` is the same post-sync health check `ksync sync` shows (see below): your edit
+applied, but `N` of the app's resources are broken at runtime.
+
 ### `ksync sync` — one-time sync
 
 ```bash
@@ -445,11 +450,31 @@ needs have finished — the same model `watch` uses, so a one-time sync is never
 loop's startup pass. Apps with `build` entries build their images first, so what gets applied
 always points at images that exist.
 
-Each app prints a one-line summary; only failures are listed in detail:
+Each app prints a one-line summary; failures and degraded resources are listed in detail. The
+symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠` applied but a resource is
+broken at runtime, `✗` a sync task failed:
 
 ```text
 ✓ api-b  3 applied, 1 pruned
+  ⚠ apps/Deployment/shop/web: Degraded — progress deadline exceeded
+⚠ shop  0 applied, 1 degraded
 ```
+
+The `⚠` is a post-sync health snapshot: a resource that applied cleanly but is **Degraded** (a
+crash-looping or failed workload, a Deployment whose rollout gave up). It is read from the warm
+cache, so it adds no cluster round-trips, and it only flags genuinely-broken resources — a rollout
+still in flight is *Progressing*, not Degraded, so a healthy edit never trips a false warning. (The
+flip side: a wedged StatefulSet carries no progress deadline and stays Progressing, so it is not
+caught.) A multi-app sync closes with one summary line so the whole result is legible without
+scanning every app:
+
+```text
+16 synced · 1 degraded · 1.6s
+```
+
+For a large stack (many apps), raising `-max-parallel` past the default `4` (e.g. `8`) shortens the
+run until it saturates on CPU — rendering is the bottleneck and each app's helm inflation is
+CPU-bound, so oversubscribing (more than your core count) starts to regress.
 
 It takes the same `-timeout` (default `5m`), `-max-parallel`, and `-v` flags as `watch`. The timeout matters
 most here: a one-time sync waits for the app to become healthy, so without it a pod stuck in
