@@ -8,23 +8,26 @@ import (
 	"time"
 )
 
-// newTrack builds a track with a fixed clock and width for deterministic output.
+// newTrack builds a track with a fixed clock for deterministic output.
 func newTrack(label string) *track {
 	clk := func() time.Time { return time.Unix(0, 0) }
-	return &track{label: label, colors: Colors{}, now: clk, start: clk(), cols: func() int { return 80 }}
+	return &track{label: label, colors: Colors{}, now: clk, start: clk()}
 }
+
+// cols80 is a fixed 80-column width source for tests.
+func cols80() int { return 80 }
 
 // newConsole gives each test its own coordinator (the package singleton would
 // leak the ticker goroutine and shared state across tests).
-func newConsole(w *bytes.Buffer) *console { return &console{w: w} }
+func newConsole(w *bytes.Buffer) *console { return &console{w: w, cols: cols80} }
 
 // Several concurrent builds must each get their own line — the bug this guards:
 // only one build animated while the rest sat as static "stuck" lines.
 func TestConsole_AllActiveTracksRendered(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	c.addTrack(&buf, newTrack("build duo"))
-	c.addTrack(&buf, newTrack("build sistema"))
+	c.addTrack(&buf, cols80, newTrack("build duo"))
+	c.addTrack(&buf, cols80, newTrack("build sistema"))
 	c.stopTicker() // halt animation so the buffer is stable
 
 	got := buf.String()
@@ -38,7 +41,7 @@ func TestConsole_AllActiveTracksRendered(t *testing.T) {
 func TestConsole_LinePrintsAboveBlock(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	c.addTrack(&buf, newTrack("build duo"))
+	c.addTrack(&buf, cols80, newTrack("build duo"))
 	buf.Reset() // ignore the initial paint; focus on what line() emits
 	c.line(&buf, "✓ postgres  0 applied\n")
 	c.stopTicker()
@@ -59,8 +62,8 @@ func TestConsole_FinishPrintsDoneAndKeepsOthers(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
 	t1, t2 := newTrack("build duo"), newTrack("build sistema")
-	c.addTrack(&buf, t1)
-	c.addTrack(&buf, t2)
+	c.addTrack(&buf, cols80, t1)
+	c.addTrack(&buf, cols80, t2)
 	buf.Reset()
 	c.finishTrack(t1, "✓ build duo  (6.1s)\n")
 	c.stopTicker()
@@ -92,8 +95,8 @@ func TestConsole_FooterRendersBelowAndPersists(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
 	build := newTrack("build duo")
-	c.addTrack(&buf, build)
-	c.setFooter(&buf, func() []string { return []string{"Summary", "  Apps  1/2 synced"} })
+	c.addTrack(&buf, cols80, build)
+	c.setFooter(&buf, cols80, func() []string { return []string{"Summary", "  Apps  1/2 synced"} })
 	buf.Reset()
 	c.finishTrack(build, "✓ build duo  (4s)\n") // last build done; footer remains
 	c.stopTicker()
@@ -112,7 +115,7 @@ func TestConsole_FooterRendersBelowAndPersists(t *testing.T) {
 func TestConsole_LineAboveFooterOnly(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	c.setFooter(&buf, func() []string { return []string{"Summary", "  Apps  0/4 synced"} })
+	c.setFooter(&buf, cols80, func() []string { return []string{"Summary", "  Apps  0/4 synced"} })
 	buf.Reset()
 	c.line(&buf, "✓ postgres  0 applied\n")
 	c.stopTicker()
@@ -123,6 +126,28 @@ func TestConsole_LineAboveFooterOnly(t *testing.T) {
 	}
 	if i := strings.Index(got, "✓ postgres"); i < 0 || strings.Index(got, "Summary") < i {
 		t.Errorf("status line should print above the repainted footer: %q", got)
+	}
+}
+
+// drawBlock must clamp every painted line — emoji-prefixed track lines included —
+// to within the terminal width, so none wraps and the cursor-up erase stays
+// accurate. Guards the regression where the 🔨 icon (two columns counted as one)
+// pushed lines one past the edge, wrapping them and corrupting the block.
+func TestConsole_DrawBlockClampsToWidth(t *testing.T) {
+	var buf bytes.Buffer
+	const width = 24
+	c := &console{w: &buf, cols: func() int { return width }}
+	a := newTrack("🔨 rust-services (duo)")
+	a.setTail("loading metadata for a very long image reference :nonroot")
+	b := newTrack("📦 some-other-build")
+	c.tracks = append(c.tracks, a, b)
+	c.drawBlock()
+	c.stopTicker()
+
+	for _, ln := range strings.Split(buf.String(), "\n") {
+		if w := displayWidth(ln); w > width {
+			t.Errorf("painted line is %d cols, exceeds terminal width %d: %q", w, width, ln)
+		}
 	}
 }
 
@@ -138,7 +163,7 @@ func TestConsole_ConcurrentChurnIsRaceFree(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			tr := newTrack("build x")
-			c.addTrack(&buf, tr)
+			c.addTrack(&buf, cols80, tr)
 			for j := 0; j < 50; j++ {
 				c.line(&buf, "LINE\n")
 			}

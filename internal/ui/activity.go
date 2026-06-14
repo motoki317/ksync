@@ -60,9 +60,8 @@ func startActivity(w io.Writer, c Colors, label string, now func() time.Time) *A
 			colors: c,
 			start:  a.start,
 			now:    now,
-			cols:   func() int { return cols(fd) },
 		}
-		liveTerm.addTrack(w, a.track)
+		liveTerm.addTrack(w, func() int { return cols(fd) }, a.track)
 		return a
 	}
 	// Non-interactive: a plain start line, through liveTerm so it interleaves
@@ -134,21 +133,6 @@ func lastNonEmptyLine(p []byte) string {
 func sanitizeLine(s string) string {
 	s = ansiPattern.ReplaceAllString(s, "")
 	return strings.Join(strings.Fields(s), " ")
-}
-
-// truncateRunes shortens s to at most max runes, marking a cut with an ellipsis.
-func truncateRunes(s string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	if max == 1 {
-		return "…"
-	}
-	return string(r[:max-1]) + "…"
 }
 
 // Duration renders an elapsed time compactly for human status lines: "0.4s",

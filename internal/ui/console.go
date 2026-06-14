@@ -30,9 +30,18 @@ const eraseLine = "\r\x1b[K"
 // cursorUp moves the cursor up one row (column is unchanged).
 const cursorUp = "\x1b[1A"
 
+// liveMargin is how many columns the block holds back from the terminal's full
+// width. East-Asian width is not perfectly predictable in every terminal — an
+// emoji with a variation selector (e.g. ☸️) may render as two columns where the
+// Unicode tables say one — and many terminals defer the wrap when a glyph lands
+// in the final column (auto-margin). Painting strictly narrower than the screen
+// absorbs both so a line can never wrap.
+const liveMargin = 2
+
 type console struct {
 	mu     sync.Mutex
-	w      io.Writer       // the terminal the live block renders to; set by the first track
+	w      io.Writer       // the terminal the live block renders to; set on first use
+	cols   func() int      // terminal width source, bound alongside w
 	tracks []*track        // active build/import lines, top-to-bottom in start order
 	footer func() []string // optional pinned block (the live run summary), rendered below the tracks
 	shown  int             // how many block lines are currently on screen
@@ -41,21 +50,43 @@ type console struct {
 	stop   chan struct{}
 }
 
+// attach binds the output stream and its width source the first time the block
+// is used; later tracks/footers on the same terminal reuse them. Caller holds mu.
+func (c *console) attach(w io.Writer, cols func() int) {
+	if c.w == nil {
+		c.w, c.cols = w, cols
+	}
+}
+
+// budget is the per-line column limit: the terminal width less liveMargin (or a
+// sane default off a terminal). Every painted line is clamped to it.
+func (c *console) budget() int {
+	w := 80
+	if c.cols != nil {
+		if n := c.cols(); n > 0 {
+			w = n
+		}
+	}
+	if w-liveMargin < 1 {
+		return 1
+	}
+	return w - liveMargin
+}
+
 // blockEmpty reports whether nothing is being rendered (no tracks, no footer);
 // the ticker runs exactly while the block is non-empty. Caller holds mu.
 func (c *console) blockEmpty() bool { return len(c.tracks) == 0 && c.footer == nil }
 
 // track is one live progress line, owned by an Activity. Its tail (the latest
 // line of the command's output) is updated as the command runs; liveTerm's
-// ticker reads it and repaints. cols reports the current terminal width so the
-// line is truncated to a single row (multi-row wrap would break the block's
-// line accounting).
+// ticker reads it and repaints. The line is composed in full here; the console
+// clamps it to the terminal width when painting (see drawBlock), so a track need
+// not know the width.
 type track struct {
 	label  string
 	colors Colors
 	start  time.Time
 	now    func() time.Time
-	cols   func() int
 
 	mu   sync.Mutex
 	tail string
@@ -67,7 +98,9 @@ func (t *track) setTail(s string) {
 	t.mu.Unlock()
 }
 
-// render is the track's current single-line content for the given spinner frame.
+// render is the track's full single-line content for the given spinner frame.
+// It is not width-limited here; drawBlock clamps it (tail first, since it is
+// rightmost) so the label stays visible until the terminal is very narrow.
 func (t *track) render(frame rune) string {
 	t.mu.Lock()
 	tail := t.tail
@@ -77,23 +110,16 @@ func (t *track) render(frame rune) string {
 	if tail != "" {
 		meta = tail + "  " + meta
 	}
-	// Only the meta tail is truncated; the spinner+label prefix is short and
-	// always shown. Width math uses plain rune counts (no color codes yet).
-	prefix := string(frame) + " " + t.label + "  "
-	if room := t.cols() - len([]rune(prefix)); room > 0 {
-		meta = truncateRunes(meta, room)
-	}
 	return fmt.Sprintf("%s %s  %s", t.colors.Cyan(string(frame)), t.colors.Bold(t.label), t.colors.Dim(meta))
 }
 
 // addTrack registers a live line and (re)paints the block. The first track to
-// arrive fixes the output stream and starts the animation ticker.
-func (c *console) addTrack(w io.Writer, t *track) {
+// arrive fixes the output stream and width source and starts the animation
+// ticker.
+func (c *console) addTrack(w io.Writer, cols func() int, t *track) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.w == nil {
-		c.w = w
-	}
+	c.attach(w, cols)
 	c.eraseBlock()
 	c.tracks = append(c.tracks, t)
 	c.drawBlock()
@@ -126,12 +152,10 @@ func (c *console) finishTrack(t *track, doneLine string) {
 // own, so the summary stays visible — and updating — after the last build
 // finishes. render is called from the ticker goroutine, so it must be safe to
 // call concurrently with the caller's own state updates.
-func (c *console) setFooter(w io.Writer, render func() []string) {
+func (c *console) setFooter(w io.Writer, cols func() int, render func() []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.w == nil {
-		c.w = w
-	}
+	c.attach(w, cols)
 	c.eraseBlock()
 	c.footer = render
 	c.drawBlock()
@@ -192,11 +216,12 @@ func (c *console) drawBlock() {
 	if c.footer != nil {
 		lines = append(lines, c.footer()...)
 	}
+	budget := c.budget()
 	for i, s := range lines {
 		if i > 0 {
 			_, _ = io.WriteString(c.w, "\n")
 		}
-		_, _ = io.WriteString(c.w, s)
+		_, _ = io.WriteString(c.w, clampANSI(s, budget))
 	}
 	c.shown = len(lines)
 }

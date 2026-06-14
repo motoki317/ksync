@@ -21,26 +21,6 @@ func TestSanitizeLine(t *testing.T) {
 	}
 }
 
-func TestTruncateRunes(t *testing.T) {
-	cases := []struct {
-		s    string
-		max  int
-		want string
-	}{
-		{"hello", 10, "hello"},
-		{"hello", 5, "hello"},
-		{"hello", 4, "hel…"},
-		{"hello", 1, "…"},
-		{"hello", 0, ""},
-		{"日本語テスト", 3, "日本…"}, // rune-aware, not byte-aware
-	}
-	for _, c := range cases {
-		if got := truncateRunes(c.s, c.max); got != c.want {
-			t.Errorf("truncateRunes(%q, %d) = %q, want %q", c.s, c.max, got, c.want)
-		}
-	}
-}
-
 func TestDuration(t *testing.T) {
 	cases := map[time.Duration]string{
 		400 * time.Millisecond: "0.4s",

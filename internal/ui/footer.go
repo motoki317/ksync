@@ -28,7 +28,8 @@ func StartFooter(w io.Writer, c Colors, render func() []string) *Footer {
 		return f
 	}
 	f.active = true
-	liveTerm.setFooter(w, render)
+	fd := int(file.Fd())
+	liveTerm.setFooter(w, func() int { return cols(fd) }, render)
 	return f
 }
 
