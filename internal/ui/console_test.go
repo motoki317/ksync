@@ -85,6 +85,46 @@ func TestConsole_LinePlainWhenNoBlock(t *testing.T) {
 	}
 }
 
+// The footer (overall-progress line) renders below the build tracks and keeps
+// the block alive on its own — after the last build finishes it stays visible.
+func TestConsole_FooterRendersBelowAndPersists(t *testing.T) {
+	var buf bytes.Buffer
+	c := newConsole(&buf)
+	build := newTrack("build duo")
+	c.addTrack(&buf, build)
+	c.setFooter(&buf, newTrack("syncing"))
+	buf.Reset()
+	c.finishTrack(build, "✓ build duo  (4s)\n") // last build done; footer remains
+	c.stopTicker()
+
+	got := buf.String()
+	if !strings.Contains(got, "✓ build duo  (4s)") {
+		t.Errorf("finished build's done line missing: %q", got)
+	}
+	if !strings.Contains(got, "syncing") {
+		t.Errorf("footer should persist after the last build finishes: %q", got)
+	}
+}
+
+// A status line erases the footer-only block, prints above it, and repaints it —
+// so per-app summaries scroll above the pinned progress line.
+func TestConsole_LineAboveFooterOnly(t *testing.T) {
+	var buf bytes.Buffer
+	c := newConsole(&buf)
+	c.setFooter(&buf, newTrack("syncing"))
+	buf.Reset()
+	c.line(&buf, "✓ postgres  0 applied\n")
+	c.stopTicker()
+
+	got := buf.String()
+	if !strings.HasPrefix(got, eraseLine) {
+		t.Errorf("line() should erase the footer block first: %q", got)
+	}
+	if i := strings.Index(got, "✓ postgres"); i < 0 || strings.Index(got, "syncing") < i {
+		t.Errorf("status line should print above the repainted footer: %q", got)
+	}
+}
+
 // Concurrent track churn and status lines must not race or panic. Under -race
 // this exercises the shared block state from the ticker, addTrack/finishTrack,
 // and line() at once.

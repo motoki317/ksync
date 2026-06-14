@@ -217,12 +217,24 @@ func runSync(args []string) error {
 	defer cleanup()
 	r := render.New(renderOpts)
 	buildFn := makeBuildFunc(cfg, os.Stderr, out)
+	// A whole-stack run gets a plan up front, a live "done/total" line pinned to
+	// the bottom while it runs, and a standout closing block; a single-app run
+	// already says it all in its one line, so it stays minimal.
+	multi := len(apps) > 1
+	if multi {
+		printPlan(os.Stderr, out, apps, cfg.Context)
+	}
+	var prog *ui.Progress
+	if multi {
+		prog = ui.StartProgress(os.Stderr, out, "syncing", len(apps))
+	}
 	// Independent apps build/render/sync concurrently; the needs DAG still
 	// serializes a dependent after the apps it needs (watch mode already does
 	// this — one-shot sync should not be slower than the loop's initial pass).
 	var mu sync.Mutex
 	var agg loop.SyncStats
 	var synced int
+	var degradedApps []string
 	started := time.Now()
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
 		stats, err := syncOneApp(ctx, r, eng, buildFn, out, app, *prune, *timeout)
@@ -233,14 +245,21 @@ func runSync(args []string) error {
 		synced++
 		agg.Applied += stats.Applied
 		agg.Pruned += stats.Pruned
+		agg.Failed += stats.Failed
 		agg.Degraded += stats.Degraded
+		if stats.Degraded > 0 {
+			degradedApps = append(degradedApps, app.Name)
+		}
 		mu.Unlock()
+		prog.Done()
 		return nil
 	})
-	// One closing line for a multi-app run so the whole-stack result is legible
-	// without scanning every app line; a single-app run already says it all.
-	if len(apps) > 1 {
-		printRunSummary(os.Stderr, out, synced, agg, time.Since(started))
+	prog.Stop()
+	if multi {
+		printRunSummary(os.Stderr, out, runResult{
+			synced: synced, agg: agg, degradedApps: degradedApps,
+			context: cfg.Context, start: started, took: time.Since(started),
+		})
 	}
 	return err
 }
@@ -630,14 +649,64 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	ui.WriteLine(w, b.String())
 }
 
-// printRunSummary closes a multi-app sync with one line: how many apps synced,
-// how many carry degraded resources, and the wall-clock time. Counts of apps,
-// not objects — the per-app lines already carry object detail.
-func printRunSummary(w io.Writer, c ui.Colors, synced int, agg loop.SyncStats, took time.Duration) {
-	parts := []string{c.Dim(fmt.Sprintf("%d synced", synced))}
-	if agg.Degraded > 0 {
-		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", agg.Degraded)))
+// printPlan opens a whole-stack sync with an overview: how many apps, the
+// target context, and the app names — so the developer sees the scope before
+// the per-app lines start streaming.
+func printPlan(w io.Writer, c ui.Colors, apps []config.App, kubeContext string) {
+	names := make([]string, len(apps))
+	for i, a := range apps {
+		names[i] = a.Name
 	}
-	parts = append(parts, c.Dim(ui.Duration(took)))
-	ui.WriteLine(w, strings.Join(parts, c.Dim(" · "))+"\n")
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n%s %s %s %s\n", c.Cyan("❯"), c.Bold(fmt.Sprintf("sync %d apps", len(apps))), c.Dim("→"), c.Bold(kubeContext))
+	fmt.Fprintf(&b, "%s\n", c.Dim("  "+strings.Join(names, " ")))
+	ui.WriteLine(w, b.String())
+}
+
+// runResult is the closing tally of a multi-app sync, passed to printRunSummary.
+type runResult struct {
+	synced       int
+	agg          loop.SyncStats
+	degradedApps []string
+	context      string
+	start        time.Time
+	took         time.Duration
+}
+
+// printRunSummary closes a whole-stack sync with a standout block (vitest-style
+// right-aligned labels): apps synced, any degraded/failed apps, the target
+// context, and start + duration. Counts of apps, not objects — the per-app
+// lines already carry object detail; this is the at-a-glance result.
+func printRunSummary(w io.Writer, c ui.Colors, r runResult) {
+	type row struct{ label, value string }
+	rows := []row{{"Apps", c.Bold(fmt.Sprintf("%d synced", r.synced))}}
+	if r.agg.Failed > 0 {
+		rows = append(rows, row{"Failed", c.Red(fmt.Sprintf("%d failed", r.agg.Failed))})
+	}
+	if r.agg.Degraded > 0 {
+		v := c.Yellow(fmt.Sprintf("%d degraded", r.agg.Degraded))
+		if len(r.degradedApps) > 0 {
+			v += c.Dim("  " + strings.Join(r.degradedApps, ", "))
+		}
+		rows = append(rows, row{"Degraded", v})
+	}
+	rows = append(rows,
+		row{"Context", r.context},
+		row{"Start at", r.start.Format("15:04:05")},
+		row{"Duration", ui.Duration(r.took)},
+	)
+	width := 0
+	for _, ln := range rows {
+		if len(ln.label) > width {
+			width = len(ln.label)
+		}
+	}
+	var b strings.Builder
+	b.WriteByte('\n')
+	for _, ln := range rows {
+		// Right-align the label (padding added before color-wrapping, so the
+		// columns line up regardless of escape codes), value after a 2-space gap.
+		fmt.Fprintf(&b, "%s  %s\n", c.Dim(fmt.Sprintf("%*s", width, ln.label)), ln.value)
+	}
+	ui.WriteLine(w, b.String())
 }

@@ -33,12 +33,17 @@ const cursorUp = "\x1b[1A"
 type console struct {
 	mu     sync.Mutex
 	w      io.Writer // the terminal the live block renders to; set by the first track
-	tracks []*track  // active live lines, top-to-bottom in start order
+	tracks []*track  // active build/import lines, top-to-bottom in start order
+	footer *track    // optional overall-progress line, pinned below the tracks
 	shown  int       // how many block lines are currently on screen
 	frame  int       // spinner frame index, advanced by the ticker
 	ticker *time.Ticker
 	stop   chan struct{}
 }
+
+// blockEmpty reports whether nothing is being rendered (no tracks, no footer);
+// the ticker runs exactly while the block is non-empty. Caller holds mu.
+func (c *console) blockEmpty() bool { return len(c.tracks) == 0 && c.footer == nil }
 
 // track is one live progress line, owned by an Activity. Its tail (the latest
 // line of the command's output) is updated as the command runs; liveTerm's
@@ -111,7 +116,38 @@ func (c *console) finishTrack(t *track, doneLine string) {
 		}
 	}
 	c.drawBlock()
-	if len(c.tracks) == 0 {
+	if c.blockEmpty() {
+		c.stopTicker()
+	}
+}
+
+// setFooter pins t as the overall-progress line below the build tracks, or
+// replaces the current one. The footer keeps the block (and the ticker) alive
+// on its own, so it stays visible after the last build finishes.
+func (c *console) setFooter(w io.Writer, t *track) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.w == nil {
+		c.w = w
+	}
+	c.eraseBlock()
+	c.footer = t
+	c.drawBlock()
+	c.ensureTicker()
+}
+
+// clearFooter removes the progress line, printing doneLine above whatever
+// remains (usually nothing). The ticker stops once the block is empty.
+func (c *console) clearFooter(doneLine string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.eraseBlock()
+	if doneLine != "" {
+		_, _ = io.WriteString(c.w, doneLine)
+	}
+	c.footer = nil
+	c.drawBlock()
+	if c.blockEmpty() {
 		c.stopTicker()
 	}
 }
@@ -122,7 +158,7 @@ func (c *console) finishTrack(t *track, doneLine string) {
 func (c *console) line(w io.Writer, s string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.tracks) == 0 {
+	if c.blockEmpty() {
 		_, _ = io.WriteString(w, s)
 		return
 	}
@@ -149,13 +185,17 @@ func (c *console) eraseBlock() {
 // Caller holds mu and has just erased any prior block.
 func (c *console) drawBlock() {
 	frame := spinnerFrames[c.frame%len(spinnerFrames)]
-	for i, t := range c.tracks {
+	lines := c.tracks
+	if c.footer != nil {
+		lines = append(append([]*track(nil), c.tracks...), c.footer)
+	}
+	for i, t := range lines {
 		if i > 0 {
 			_, _ = io.WriteString(c.w, "\n")
 		}
 		_, _ = io.WriteString(c.w, t.render(frame))
 	}
-	c.shown = len(c.tracks)
+	c.shown = len(lines)
 }
 
 func (c *console) ensureTicker() {

@@ -9,6 +9,7 @@ import (
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
 
+	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/loop"
 	"github.com/motoki317/ksync/internal/ui"
 )
@@ -68,20 +69,41 @@ func TestPrintSummary_FailedIsCross(t *testing.T) {
 	}
 }
 
-// The run summary closes a multi-app sync with app counts and wall time.
+// The run summary closes a multi-app sync with a standout block: apps synced,
+// degraded apps (named), the context, and the duration.
 func TestPrintRunSummary_CountsAppsAndDegraded(t *testing.T) {
 	var b bytes.Buffer
-	printRunSummary(&b, ui.NewColors(&b), 16, loop.SyncStats{Degraded: 2}, 1600*time.Millisecond)
+	printRunSummary(&b, ui.NewColors(&b), runResult{
+		synced: 16, agg: loop.SyncStats{Degraded: 2}, degradedApps: []string{"api-b", "shop"},
+		context: "prod-cluster", start: time.Unix(0, 0).UTC(), took: 1600 * time.Millisecond,
+	})
 	out := b.String()
-	if !strings.Contains(out, "16 synced") || !strings.Contains(out, "2 degraded") || !strings.Contains(out, "1.6s") {
-		t.Errorf("run summary = %q, want 16 synced · 2 degraded · 1.6s", out)
+	for _, want := range []string{"16 synced", "2 degraded", "api-b, shop", "prod-cluster", "1.6s", "Duration"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("run summary = %q, want it to contain %q", out, want)
+		}
 	}
 }
 
 func TestPrintRunSummary_OmitsDegradedWhenZero(t *testing.T) {
 	var b bytes.Buffer
-	printRunSummary(&b, ui.NewColors(&b), 16, loop.SyncStats{}, 1600*time.Millisecond)
+	printRunSummary(&b, ui.NewColors(&b), runResult{
+		synced: 16, context: "prod-cluster", start: time.Unix(0, 0).UTC(), took: 1600 * time.Millisecond,
+	})
 	if out := b.String(); strings.Contains(out, "degraded") {
 		t.Errorf("clean run summary must omit degraded: %q", out)
+	}
+}
+
+// The plan opens a whole-stack sync with the count, the context, and the names.
+func TestPrintPlan_ListsScope(t *testing.T) {
+	var b bytes.Buffer
+	apps := []config.App{{Name: "api-b"}, {Name: "shop"}, {Name: "team-a"}}
+	printPlan(&b, ui.NewColors(&b), apps, "prod-cluster")
+	out := b.String()
+	for _, want := range []string{"sync 3 apps", "prod-cluster", "api-b", "shop", "team-a"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plan = %q, want it to contain %q", out, want)
+		}
 	}
 }

@@ -466,12 +466,29 @@ crash-looping or failed workload, a Deployment whose rollout gave up). It is rea
 cache, so it adds no cluster round-trips, and it only flags genuinely-broken resources — a rollout
 still in flight is *Progressing*, not Degraded, so a healthy edit never trips a false warning. (The
 flip side: a wedged StatefulSet carries no progress deadline and stays Progressing, so it is not
-caught.) A multi-app sync closes with one summary line so the whole result is legible without
-scanning every app:
+caught.)
+
+A whole-stack sync (more than one app) frames the run: a **plan** up front shows the scope, a live
+**progress line** stays pinned to the bottom and counts up as apps finish (the per-app lines scroll
+above it), and a standout **summary block** closes it out — so the result is legible at a glance
+without scanning every line:
 
 ```text
-16 synced · 1 degraded · 1.6s
+❯ sync 16 apps → docker-desktop
+  postgres redis traefik … duo sistema
+
+… per-app lines stream here, ⠹ syncing 12/16 0.8s pinned below …
+
+     Apps  16 synced
+ Degraded  1  shop
+  Context  docker-desktop
+ Start at  15:40:52
+ Duration  1.6s
 ```
+
+The plan, progress line, and block appear only for a multi-app run; a single-app sync stays one
+line. In a pipe or CI the progress line is dropped (no terminal to pin it to), but the plan,
+per-app lines, and summary block still print.
 
 For a large stack (many apps), raising `-max-parallel` past the default `4` (e.g. `8`) shortens the
 run until it saturates on CPU — rendering is the bottleneck and each app's helm inflation is
