@@ -34,6 +34,7 @@ Mechanism: ksync hands kustomize a tiny `helm` wrapper as its `HelmConfig.Comman
 `template` subcommand the wrapper appends
 
     --dry-run=server --take-ownership --kube-context <ksync's context>
+    --kube-version <server version> --api-versions <each discovered group/version[/Kind]>
 
 and passes every other helm subcommand (`version`, `pull`, …) straight through.
 
@@ -43,6 +44,13 @@ and passes every other helm subcommand (`version`, `pull`, …) straight through
   labels. ksync's resources are SSA-managed under its own tracking label, not Helm's, so without it
   the server dry-run aborts with "cannot be imported into the current release" the moment an app is
   already deployed.
+- `--kube-version` / `--api-versions` feed helm the cluster's real capabilities, so a version-gated
+  template (a PDB guarded by `.Capabilities.APIVersions.Has "policy/v1/PodDisruptionBudget"`)
+  renders for the actual target. **Helm v3 does not backfill `.Capabilities` from `--dry-run=server`
+  — only helm v4 does** — so without this a v3 dev shell silently rendered a removed apiVersion
+  (`policy/v1beta1`) that then failed to apply. ksync discovers the set once per command
+  (`engine.DiscoverCapabilities`); the api-versions list is long, so the wrapper reads it from a
+  file rather than from baked-in args. This matches what ArgoCD passes to helm.
 
 The real helm path and the context are passed to the wrapper through environment variables, never
 interpolated into the script, so a context name cannot become shell injection. The wrapper lives
