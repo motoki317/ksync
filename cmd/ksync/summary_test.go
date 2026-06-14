@@ -69,39 +69,52 @@ func TestPrintSummary_FailedIsCross(t *testing.T) {
 	}
 }
 
-// The run summary closes a multi-app sync with a standout block: apps synced,
-// degraded apps (named), the context, and the duration.
-func TestPrintRunSummary_CountsAppsAndDegraded(t *testing.T) {
-	var b bytes.Buffer
-	printRunSummary(&b, ui.NewColors(&b), runResult{
-		synced: 16, agg: loop.SyncStats{Degraded: 2}, degradedApps: []string{"api-b", "shop"},
-		context: "prod-cluster", start: time.Unix(0, 0).UTC(), took: 1600 * time.Millisecond,
-	})
-	out := b.String()
-	for _, want := range []string{"16 synced", "2 degraded", "api-b, shop", "prod-cluster", "1.6s", "Duration"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("run summary = %q, want it to contain %q", out, want)
+// The committed (final) summary block is titled, names the degraded apps, shows
+// the absolute synced count and duration — and drops Context / Start at.
+func TestSummaryLines_FinalNamesDegraded(t *testing.T) {
+	c := ui.NewColors(&bytes.Buffer{}) // not a TTY → plain, assertable text
+	got := strings.Join(summaryLines(c, 18, 16, loop.SyncStats{Degraded: 2}, []string{"api-b", "shop"}, 1600*time.Millisecond, true), "\n")
+	for _, want := range []string{"Summary", "16 synced", "2 degraded", "api-b, shop", "Duration", "1.6s"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("final summary = %q, want it to contain %q", got, want)
+		}
+	}
+	for _, gone := range []string{"Context", "Start at"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("final summary = %q, should no longer contain %q", got, gone)
 		}
 	}
 }
 
-func TestPrintRunSummary_OmitsDegradedWhenZero(t *testing.T) {
-	var b bytes.Buffer
-	printRunSummary(&b, ui.NewColors(&b), runResult{
-		synced: 16, context: "prod-cluster", start: time.Unix(0, 0).UTC(), took: 1600 * time.Millisecond,
-	})
-	if out := b.String(); strings.Contains(out, "degraded") {
-		t.Errorf("clean run summary must omit degraded: %q", out)
+// The live footer shows running progress ("k/N synced") and stays short — it
+// never names the degraded apps, so a long list cannot wrap the pinned block.
+func TestSummaryLines_LiveIsProgressAndShort(t *testing.T) {
+	c := ui.NewColors(&bytes.Buffer{})
+	got := strings.Join(summaryLines(c, 18, 12, loop.SyncStats{Degraded: 1}, []string{"shop"}, 800*time.Millisecond, false), "\n")
+	if !strings.Contains(got, "12/18 synced") || !strings.Contains(got, "1 degraded") {
+		t.Errorf("live summary = %q, want 12/18 synced and 1 degraded", got)
+	}
+	if strings.Contains(got, "shop") {
+		t.Errorf("live summary must not name degraded apps (wrap risk): %q", got)
 	}
 }
 
-// The plan opens a whole-stack sync with the count, the context, and the names.
+func TestSummaryLines_OmitsDegradedWhenZero(t *testing.T) {
+	c := ui.NewColors(&bytes.Buffer{})
+	got := strings.Join(summaryLines(c, 16, 16, loop.SyncStats{}, nil, 1600*time.Millisecond, true), "\n")
+	if strings.Contains(got, "degraded") {
+		t.Errorf("clean summary must omit degraded: %q", got)
+	}
+}
+
+// The plan is titled and opens a whole-stack sync with the count, the context,
+// and the names.
 func TestPrintPlan_ListsScope(t *testing.T) {
 	var b bytes.Buffer
 	apps := []config.App{{Name: "api-b"}, {Name: "shop"}, {Name: "team-a"}}
 	printPlan(&b, ui.NewColors(&b), apps, "prod-cluster")
 	out := b.String()
-	for _, want := range []string{"sync 3 apps", "prod-cluster", "api-b", "shop", "team-a"} {
+	for _, want := range []string{"Plan", "3 apps", "prod-cluster", "api-b", "shop", "team-a"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("plan = %q, want it to contain %q", out, want)
 		}

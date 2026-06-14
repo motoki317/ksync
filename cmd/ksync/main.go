@@ -217,16 +217,12 @@ func runSync(args []string) error {
 	defer cleanup()
 	r := render.New(renderOpts)
 	buildFn := makeBuildFunc(cfg, os.Stderr, out)
-	// A whole-stack run gets a plan up front, a live "done/total" line pinned to
-	// the bottom while it runs, and a standout closing block; a single-app run
-	// already says it all in its one line, so it stays minimal.
+	// A whole-stack run gets a plan up front, the summary block pinned live to
+	// the bottom (updating as apps finish), and the same block committed on
+	// completion; a single-app run already says it all in its one line.
 	multi := len(apps) > 1
 	if multi {
 		printPlan(os.Stderr, out, apps, cfg.Context)
-	}
-	var prog *ui.Progress
-	if multi {
-		prog = ui.StartProgress(os.Stderr, out, "syncing", len(apps))
 	}
 	// Independent apps build/render/sync concurrently; the needs DAG still
 	// serializes a dependent after the apps it needs (watch mode already does
@@ -236,11 +232,23 @@ func runSync(args []string) error {
 	var synced int
 	var degradedApps []string
 	started := time.Now()
+	var footer *ui.Footer
+	if multi {
+		// The ticker calls render from another goroutine, so read the tally under
+		// the same lock the run goroutines write it with.
+		footer = ui.StartFooter(os.Stderr, out, func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return summaryLines(out, len(apps), synced, agg, degradedApps, time.Since(started), false)
+		})
+	}
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
-		stats, err := syncOneApp(ctx, r, eng, buildFn, out, app, *prune, *timeout)
+		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, app, *prune, *timeout)
 		if err != nil {
 			return err
 		}
+		stats := syncStats(results)
+		stats.Degraded = len(degraded)
 		mu.Lock()
 		synced++
 		agg.Applied += stats.Applied
@@ -251,23 +259,27 @@ func runSync(args []string) error {
 			degradedApps = append(degradedApps, app.Name)
 		}
 		mu.Unlock()
-		prog.Done()
+		// Print after tallying so the ✓ line and the footer's bumped count land
+		// together (printSummary repaints the footer as it writes the line).
+		printSummary(os.Stderr, out, app.Name, results, degraded)
 		return nil
 	})
-	prog.Stop()
+	footer.Stop()
 	if multi {
-		printRunSummary(os.Stderr, out, runResult{
-			synced: synced, agg: agg, degradedApps: degradedApps,
-			context: cfg.Context, start: started, took: time.Since(started),
-		})
+		mu.Lock()
+		final := summaryLines(out, len(apps), synced, agg, degradedApps, time.Since(started), true)
+		mu.Unlock()
+		printSummaryBlock(os.Stderr, final)
 	}
 	return err
 }
 
 // syncOneApp builds (by group batch), renders, injects built image tags, and
-// applies one app, printing its result summary. Build precedes render so the
-// applied manifests always reference images that exist in the local daemon.
-func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, out ui.Colors, app config.App, prune bool, timeout time.Duration) (loop.SyncStats, error) {
+// applies one app, returning the per-resource sync results and the names of any
+// degraded resources. Build precedes render so the applied manifests always
+// reference images that exist in the local daemon. The caller prints the
+// summary line — after tallying — so the live footer's count tracks the ✓ lines.
+func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, app config.App, prune bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
 	all := make([]int, len(app.Build))
 	for i := range all {
 		all[i] = i
@@ -280,7 +292,7 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 		}
 		refs, err := buildFn(ctx, app.Name, builds)
 		if err != nil {
-			return loop.SyncStats{}, fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
+			return nil, nil, fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
 		}
 		for k, j := range batch {
 			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: build.Tag(refs[k])})
@@ -288,24 +300,20 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 	}
 	res, err := r.Render(app.Path)
 	if err != nil {
-		return loop.SyncStats{}, fmt.Errorf("app %s: %w", app.Name, err)
+		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {
-			return loop.SyncStats{}, fmt.Errorf("app %s: %w", app.Name, err)
+			return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 	}
 	syncCtx, cancel := withTimeout(ctx, timeout)
 	defer cancel()
 	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace})
 	if err != nil {
-		return loop.SyncStats{}, fmt.Errorf("app %s: %w", app.Name, err)
+		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 	}
-	degraded := eng.AppDegraded(app.Name, app.Namespace, res.Objects)
-	printSummary(os.Stderr, out, app.Name, results, degraded)
-	stats := syncStats(results)
-	stats.Degraded = len(degraded)
-	return stats, nil
+	return results, eng.AppDegraded(app.Name, app.Namespace, res.Objects), nil
 }
 
 // runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
@@ -649,64 +657,65 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	ui.WriteLine(w, b.String())
 }
 
-// printPlan opens a whole-stack sync with an overview: how many apps, the
+// printPlan opens a whole-stack sync with a titled overview: how many apps, the
 // target context, and the app names — so the developer sees the scope before
-// the per-app lines start streaming.
+// the per-app lines start streaming. The trailing blank line sets it apart from
+// the streamed log that follows.
 func printPlan(w io.Writer, c ui.Colors, apps []config.App, kubeContext string) {
 	names := make([]string, len(apps))
 	for i, a := range apps {
 		names[i] = a.Name
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n%s %s %s %s\n", c.Cyan("❯"), c.Bold(fmt.Sprintf("sync %d apps", len(apps))), c.Dim("→"), c.Bold(kubeContext))
-	fmt.Fprintf(&b, "%s\n", c.Dim("  "+strings.Join(names, " ")))
+	fmt.Fprintf(&b, "\n%s\n", c.Bold("Plan"))
+	fmt.Fprintf(&b, "  %s %s %s\n", fmt.Sprintf("%d apps", len(apps)), c.Dim("→"), c.Bold(kubeContext))
+	fmt.Fprintf(&b, "  %s\n\n", c.Dim(strings.Join(names, " ")))
 	ui.WriteLine(w, b.String())
 }
 
-// runResult is the closing tally of a multi-app sync, passed to printRunSummary.
-type runResult struct {
-	synced       int
-	agg          loop.SyncStats
-	degradedApps []string
-	context      string
-	start        time.Time
-	took         time.Duration
-}
-
-// printRunSummary closes a whole-stack sync with a standout block (vitest-style
-// right-aligned labels): apps synced, any degraded/failed apps, the target
-// context, and start + duration. Counts of apps, not objects — the per-app
-// lines already carry object detail; this is the at-a-glance result.
-func printRunSummary(w io.Writer, c ui.Colors, r runResult) {
+// summaryLines renders the titled run-summary block (vitest-style right-aligned
+// labels): apps synced, any failed/degraded apps, and the elapsed time. It is
+// both the live footer (final=false → "k/N synced", refreshed each tick) and
+// the committed close (final=true → "N synced", with degraded apps named).
+// Returns the block's lines without trailing newlines.
+func summaryLines(c ui.Colors, total, synced int, agg loop.SyncStats, degradedApps []string, elapsed time.Duration, final bool) []string {
 	type row struct{ label, value string }
-	rows := []row{{"Apps", c.Bold(fmt.Sprintf("%d synced", r.synced))}}
-	if r.agg.Failed > 0 {
-		rows = append(rows, row{"Failed", c.Red(fmt.Sprintf("%d failed", r.agg.Failed))})
+	appsVal := fmt.Sprintf("%d/%d synced", synced, total)
+	if final {
+		appsVal = fmt.Sprintf("%d synced", synced)
 	}
-	if r.agg.Degraded > 0 {
-		v := c.Yellow(fmt.Sprintf("%d degraded", r.agg.Degraded))
-		if len(r.degradedApps) > 0 {
-			v += c.Dim("  " + strings.Join(r.degradedApps, ", "))
+	rows := []row{{"Apps", c.Bold(appsVal)}}
+	if agg.Failed > 0 {
+		rows = append(rows, row{"Failed", c.Red(fmt.Sprintf("%d failed", agg.Failed))})
+	}
+	if agg.Degraded > 0 {
+		v := c.Yellow(fmt.Sprintf("%d degraded", agg.Degraded))
+		// Name the degraded apps only in the committed block — the live footer
+		// stays short so a long list cannot wrap and break the pinned block.
+		if final && len(degradedApps) > 0 {
+			v += c.Dim("  " + strings.Join(degradedApps, ", "))
 		}
 		rows = append(rows, row{"Degraded", v})
 	}
-	rows = append(rows,
-		row{"Context", r.context},
-		row{"Start at", r.start.Format("15:04:05")},
-		row{"Duration", ui.Duration(r.took)},
-	)
+	rows = append(rows, row{"Duration", ui.Duration(elapsed)})
+
 	width := 0
 	for _, ln := range rows {
 		if len(ln.label) > width {
 			width = len(ln.label)
 		}
 	}
-	var b strings.Builder
-	b.WriteByte('\n')
+	lines := []string{c.Bold("Summary")}
 	for _, ln := range rows {
 		// Right-align the label (padding added before color-wrapping, so the
 		// columns line up regardless of escape codes), value after a 2-space gap.
-		fmt.Fprintf(&b, "%s  %s\n", c.Dim(fmt.Sprintf("%*s", width, ln.label)), ln.value)
+		lines = append(lines, fmt.Sprintf("  %s  %s", c.Dim(fmt.Sprintf("%*s", width, ln.label)), ln.value))
 	}
-	ui.WriteLine(w, b.String())
+	return lines
+}
+
+// printSummaryBlock commits the final summary block to scrollback, set off by a
+// leading blank line — matching the live footer that was just cleared.
+func printSummaryBlock(w io.Writer, lines []string) {
+	ui.WriteLine(w, "\n"+strings.Join(lines, "\n")+"\n")
 }

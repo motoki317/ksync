@@ -85,14 +85,15 @@ func TestConsole_LinePlainWhenNoBlock(t *testing.T) {
 	}
 }
 
-// The footer (overall-progress line) renders below the build tracks and keeps
-// the block alive on its own — after the last build finishes it stays visible.
+// The footer (the live summary block) renders below the build tracks and keeps
+// the block alive on its own — after the last build finishes it stays visible
+// and can span multiple lines.
 func TestConsole_FooterRendersBelowAndPersists(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
 	build := newTrack("build duo")
 	c.addTrack(&buf, build)
-	c.setFooter(&buf, newTrack("syncing"))
+	c.setFooter(&buf, func() []string { return []string{"Summary", "  Apps  1/2 synced"} })
 	buf.Reset()
 	c.finishTrack(build, "✓ build duo  (4s)\n") // last build done; footer remains
 	c.stopTicker()
@@ -101,17 +102,17 @@ func TestConsole_FooterRendersBelowAndPersists(t *testing.T) {
 	if !strings.Contains(got, "✓ build duo  (4s)") {
 		t.Errorf("finished build's done line missing: %q", got)
 	}
-	if !strings.Contains(got, "syncing") {
-		t.Errorf("footer should persist after the last build finishes: %q", got)
+	if !strings.Contains(got, "Summary") || !strings.Contains(got, "1/2 synced") {
+		t.Errorf("multi-line footer should persist after the last build finishes: %q", got)
 	}
 }
 
-// A status line erases the footer-only block, prints above it, and repaints it —
-// so per-app summaries scroll above the pinned progress line.
+// A status line erases the footer block, prints above it, and repaints it — so
+// per-app summaries scroll above the pinned live summary.
 func TestConsole_LineAboveFooterOnly(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	c.setFooter(&buf, newTrack("syncing"))
+	c.setFooter(&buf, func() []string { return []string{"Summary", "  Apps  0/4 synced"} })
 	buf.Reset()
 	c.line(&buf, "✓ postgres  0 applied\n")
 	c.stopTicker()
@@ -120,7 +121,7 @@ func TestConsole_LineAboveFooterOnly(t *testing.T) {
 	if !strings.HasPrefix(got, eraseLine) {
 		t.Errorf("line() should erase the footer block first: %q", got)
 	}
-	if i := strings.Index(got, "✓ postgres"); i < 0 || strings.Index(got, "syncing") < i {
+	if i := strings.Index(got, "✓ postgres"); i < 0 || strings.Index(got, "Summary") < i {
 		t.Errorf("status line should print above the repainted footer: %q", got)
 	}
 }

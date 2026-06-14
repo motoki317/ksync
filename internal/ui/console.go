@@ -32,11 +32,11 @@ const cursorUp = "\x1b[1A"
 
 type console struct {
 	mu     sync.Mutex
-	w      io.Writer // the terminal the live block renders to; set by the first track
-	tracks []*track  // active build/import lines, top-to-bottom in start order
-	footer *track    // optional overall-progress line, pinned below the tracks
-	shown  int       // how many block lines are currently on screen
-	frame  int       // spinner frame index, advanced by the ticker
+	w      io.Writer       // the terminal the live block renders to; set by the first track
+	tracks []*track        // active build/import lines, top-to-bottom in start order
+	footer func() []string // optional pinned block (the live run summary), rendered below the tracks
+	shown  int             // how many block lines are currently on screen
+	frame  int             // spinner frame index, advanced by the ticker
 	ticker *time.Ticker
 	stop   chan struct{}
 }
@@ -121,30 +121,30 @@ func (c *console) finishTrack(t *track, doneLine string) {
 	}
 }
 
-// setFooter pins t as the overall-progress line below the build tracks, or
-// replaces the current one. The footer keeps the block (and the ticker) alive
-// on its own, so it stays visible after the last build finishes.
-func (c *console) setFooter(w io.Writer, t *track) {
+// setFooter pins render's lines below the build tracks (the live run summary),
+// re-rendered on every tick. It keeps the block (and the ticker) alive on its
+// own, so the summary stays visible — and updating — after the last build
+// finishes. render is called from the ticker goroutine, so it must be safe to
+// call concurrently with the caller's own state updates.
+func (c *console) setFooter(w io.Writer, render func() []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.w == nil {
 		c.w = w
 	}
 	c.eraseBlock()
-	c.footer = t
+	c.footer = render
 	c.drawBlock()
 	c.ensureTicker()
 }
 
-// clearFooter removes the progress line, printing doneLine above whatever
-// remains (usually nothing). The ticker stops once the block is empty.
-func (c *console) clearFooter(doneLine string) {
+// clearFooter removes the pinned summary; the caller prints the final summary
+// itself (so it also lands in piped/CI output, where no footer ever ran). The
+// ticker stops once the block is empty.
+func (c *console) clearFooter() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.eraseBlock()
-	if doneLine != "" {
-		_, _ = io.WriteString(c.w, doneLine)
-	}
 	c.footer = nil
 	c.drawBlock()
 	if c.blockEmpty() {
@@ -185,15 +185,18 @@ func (c *console) eraseBlock() {
 // Caller holds mu and has just erased any prior block.
 func (c *console) drawBlock() {
 	frame := spinnerFrames[c.frame%len(spinnerFrames)]
-	lines := c.tracks
-	if c.footer != nil {
-		lines = append(append([]*track(nil), c.tracks...), c.footer)
+	lines := make([]string, 0, len(c.tracks)+1)
+	for _, t := range c.tracks {
+		lines = append(lines, t.render(frame))
 	}
-	for i, t := range lines {
+	if c.footer != nil {
+		lines = append(lines, c.footer()...)
+	}
+	for i, s := range lines {
 		if i > 0 {
 			_, _ = io.WriteString(c.w, "\n")
 		}
-		_, _ = io.WriteString(c.w, t.render(frame))
+		_, _ = io.WriteString(c.w, s)
 	}
 	c.shown = len(lines)
 }

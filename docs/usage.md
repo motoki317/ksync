@@ -468,27 +468,33 @@ still in flight is *Progressing*, not Degraded, so a healthy edit never trips a 
 flip side: a wedged StatefulSet carries no progress deadline and stays Progressing, so it is not
 caught.)
 
-A whole-stack sync (more than one app) frames the run: a **plan** up front shows the scope, a live
-**progress line** stays pinned to the bottom and counts up as apps finish (the per-app lines scroll
-above it), and a standout **summary block** closes it out — so the result is legible at a glance
-without scanning every line:
+A whole-stack sync (more than one app) frames the run: a titled **Plan** up front shows the scope,
+a live **Summary** block stays pinned to the bottom and updates as apps finish (the per-app lines
+scroll above it), and the same block is committed when the run completes — so the result is legible
+at a glance without scanning every line:
 
 ```text
-❯ sync 16 apps → docker-desktop
+Plan
+  16 apps → docker-desktop
   postgres redis traefik … duo sistema
 
-… per-app lines stream here, ⠹ syncing 12/16 0.8s pinned below …
+… per-app lines stream above the pinned, live-updating block:
 
-     Apps  16 synced
- Degraded  1  shop
-  Context  docker-desktop
- Start at  15:40:52
- Duration  1.6s
+Summary
+      Apps  12/16 synced
+  Duration  0.8s
+
+… and on completion the block is committed with the final tally:
+
+Summary
+      Apps  16 synced
+  Degraded  1  shop
+  Duration  1.6s
 ```
 
-The plan, progress line, and block appear only for a multi-app run; a single-app sync stays one
-line. In a pipe or CI the progress line is dropped (no terminal to pin it to), but the plan,
-per-app lines, and summary block still print.
+The plan and the pinned/committed Summary appear only for a multi-app run; a single-app sync stays
+one line. In a pipe or CI the live block is dropped (no terminal to pin it to), but the plan,
+per-app lines, and final Summary still print.
 
 For a large stack (many apps), raising `-max-parallel` past the default `4` (e.g. `8`) shortens the
 run until it saturates on CPU — rendering is the bottleneck and each app's helm inflation is
