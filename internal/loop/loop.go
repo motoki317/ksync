@@ -47,7 +47,7 @@ type BuildFunc func(ctx context.Context, app string, builds []config.Build) ([]s
 // Options tune the loop; zero values get sensible watch-mode defaults.
 type Options struct {
 	Debounce    time.Duration // default 200ms
-	MaxParallel int           // default 4
+	MaxParallel int           // 0 = no limit (matches schedule.Options)
 	RetryBase   time.Duration // default 1s
 	RetryMax    time.Duration // default 2m
 	Render      render.Options
@@ -63,9 +63,9 @@ func (o *Options) applyDefaults() {
 	if o.Debounce <= 0 {
 		o.Debounce = 200 * time.Millisecond
 	}
-	if o.MaxParallel <= 0 {
-		o.MaxParallel = 4
-	}
+	// MaxParallel is passed through untouched: the scheduler treats 0 (or
+	// negative) as no cap, so the CLI default (CPU cores) and an explicit
+	// --max-parallel 0 both reach it intact.
 	if o.RetryBase <= 0 {
 		o.RetryBase = time.Second
 	}

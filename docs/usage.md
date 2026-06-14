@@ -429,7 +429,7 @@ Flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `-debounce` | `200ms` | Quiet period after the last change before re-rendering. |
-| `-max-parallel` | `4` | How many apps may sync at the same time. |
+| `-max-parallel` | CPU cores | How many apps may build, render, and sync at the same time. `0` removes the limit. |
 | `-prune` | `true` | Delete tracked resources that you removed from the files. |
 | `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
 | `-v` | `false` | Verbose: also log every detected file change. |
@@ -448,7 +448,7 @@ ksync sync api-b
 
 Renders and applies once, then exits. Useful for scripts, or to converge the cluster before
 starting `watch`. Independent apps build, render, and apply **concurrently** (up to
-`-max-parallel`, default `4`); the `needs` DAG still holds a dependent app until the apps it
+`-max-parallel`, default the host's CPU-core count, `0` for no limit); the `needs` DAG still holds a dependent app until the apps it
 needs have finished — the same model `watch` uses, so a one-time sync is never slower than the
 loop's startup pass. Apps with `build` entries build their images first, so what gets applied
 always points at images that exist.
@@ -499,9 +499,11 @@ The plan and the pinned/committed Summary appear only for a multi-app run; a sin
 one line. In a pipe or CI the live block is dropped (no terminal to pin it to), but the plan,
 per-app lines, and final Summary still print.
 
-For a large stack (many apps), raising `-max-parallel` past the default `4` (e.g. `8`) shortens the
-run until it saturates on CPU — rendering is the bottleneck and each app's helm inflation is
-CPU-bound, so oversubscribing (more than your core count) starts to regress.
+For a large stack (many apps), the default already matches your CPU-core count. Rendering — each
+app's helm inflation — is CPU-bound and saturates there, so a purely render-bound run gains nothing
+from going higher. But apps also spend time building images (docker) and waiting for health, both
+mostly idle for the CPU; when those dominate, `-max-parallel 0` (no limit) or a value above your
+core count can still shorten the run.
 
 It takes the same `-timeout` (default `5m`), `-max-parallel`, and `-v` flags as `watch`. The timeout matters
 most here: a one-time sync waits for the app to become healthy, so without it a pod stuck in

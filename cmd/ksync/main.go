@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -186,7 +187,7 @@ func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
-	maxParallel := fs.Int("max-parallel", 4, "how many apps may build, render, and sync concurrently")
+	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
 	cfg, names, err := loadConfig(fs, args)
@@ -321,8 +322,13 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 // sorted (config.SortByNeeds). It returns the first error and, on any error,
 // cancels the derived context so apps not yet started are skipped.
 func runByNeeds(ctx context.Context, apps []config.App, maxParallel int, fn func(context.Context, config.App) error) error {
-	if maxParallel < 1 {
-		maxParallel = 1
+	if len(apps) == 0 {
+		return nil
+	}
+	// 0 (or negative) means no limit; a cap above the app count is the same as
+	// the count, so the semaphore never holds more slots than can ever be used.
+	if maxParallel < 1 || maxParallel > len(apps) {
+		maxParallel = len(apps)
 	}
 	done := make(map[string]chan struct{}, len(apps))
 	for _, a := range apps {
@@ -378,7 +384,7 @@ func runWatch(args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
 	debounce := fs.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
-	maxParallel := fs.Int("max-parallel", 4, "how many apps may sync concurrently")
+	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
