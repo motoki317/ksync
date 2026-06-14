@@ -95,7 +95,7 @@ func (a *Activity) Done(err error) {
 		_, _ = fmt.Fprint(a.w, "\r\x1b[K") // erase the spinner line
 		liveLine.Unlock()
 	}
-	elapsed := a.c.Dim("(" + formatDuration(a.now().Sub(a.start)) + ")")
+	elapsed := a.c.Dim("(" + Duration(a.now().Sub(a.start)) + ")")
 	if err != nil {
 		a.mu.Lock()
 		out := strings.TrimRight(a.buf.String(), "\n")
@@ -128,7 +128,7 @@ func (a *Activity) draw(frame rune) {
 	tail := a.lastLine
 	a.mu.Unlock()
 
-	elapsed := formatDuration(a.now().Sub(a.start))
+	elapsed := Duration(a.now().Sub(a.start))
 	meta := elapsed
 	if tail != "" {
 		meta = tail + "  " + elapsed
@@ -183,8 +183,10 @@ func truncateRunes(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
-// formatDuration renders a build duration compactly: "0.4s", "12s", "1m03s".
-func formatDuration(d time.Duration) string {
+// Duration renders an elapsed time compactly for human status lines: "0.4s",
+// "12s", "1m03s". Shared by the build/import activity lines and the per-app
+// sync status so durations read the same everywhere.
+func Duration(d time.Duration) string {
 	if d < time.Minute {
 		if d < 10*time.Second {
 			return fmt.Sprintf("%.1fs", d.Seconds())

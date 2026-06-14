@@ -41,15 +41,15 @@ func TestTruncateRunes(t *testing.T) {
 	}
 }
 
-func TestFormatDuration(t *testing.T) {
+func TestDuration(t *testing.T) {
 	cases := map[time.Duration]string{
 		400 * time.Millisecond: "0.4s",
 		12 * time.Second:       "12s",
 		63 * time.Second:       "1m03s",
 	}
 	for d, want := range cases {
-		if got := formatDuration(d); got != want {
-			t.Errorf("formatDuration(%v) = %q, want %q", d, got, want)
+		if got := Duration(d); got != want {
+			t.Errorf("Duration(%v) = %q, want %q", d, got, want)
 		}
 	}
 }
