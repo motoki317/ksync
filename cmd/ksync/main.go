@@ -186,6 +186,7 @@ func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
+	maxParallel := fs.Int("max-parallel", 4, "how many apps may build, render, and sync concurrently")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
 	cfg, names, err := loadConfig(fs, args)
@@ -216,46 +217,102 @@ func runSync(args []string) error {
 	defer cleanup()
 	r := render.New(renderOpts)
 	buildFn := makeBuildFunc(cfg, os.Stderr, out)
-	for _, app := range apps {
-		// Build before render so the applied manifests always reference
-		// images that exist in the local daemon. Batch by build group so a
-		// shared bake/compile runs once (App.BuildBatches over all entries).
-		all := make([]int, len(app.Build))
-		for i := range all {
-			all[i] = i
-		}
-		images := make([]render.Image, 0, len(app.Build))
-		for _, batch := range app.BuildBatches(all) {
-			builds := make([]config.Build, len(batch))
-			for k, j := range batch {
-				builds[k] = app.Build[j]
-			}
-			refs, err := buildFn(ctx, builds)
-			if err != nil {
-				return fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
-			}
-			for k, j := range batch {
-				images = append(images, render.Image{Name: app.Build[j].Image, NewTag: build.Tag(refs[k])})
-			}
-		}
-		res, err := r.Render(app.Path)
-		if err != nil {
-			return fmt.Errorf("app %s: %w", app.Name, err)
-		}
-		if len(images) > 0 {
-			if err := res.SetImages(images); err != nil {
-				return fmt.Errorf("app %s: %w", app.Name, err)
-			}
-		}
-		syncCtx, cancel := withTimeout(ctx, *timeout)
-		results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: *prune, Namespace: app.Namespace})
-		cancel()
-		if err != nil {
-			return fmt.Errorf("app %s: %w", app.Name, err)
-		}
-		printSummary(os.Stderr, out, app.Name, results)
+	// Independent apps build/render/sync concurrently; the needs DAG still
+	// serializes a dependent after the apps it needs (watch mode already does
+	// this — one-shot sync should not be slower than the loop's initial pass).
+	return runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
+		return syncOneApp(ctx, r, eng, buildFn, out, app, *prune, *timeout)
+	})
+}
+
+// syncOneApp builds (by group batch), renders, injects built image tags, and
+// applies one app, printing its result summary. Build precedes render so the
+// applied manifests always reference images that exist in the local daemon.
+func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, out ui.Colors, app config.App, prune bool, timeout time.Duration) error {
+	all := make([]int, len(app.Build))
+	for i := range all {
+		all[i] = i
 	}
+	images := make([]render.Image, 0, len(app.Build))
+	for _, batch := range app.BuildBatches(all) {
+		builds := make([]config.Build, len(batch))
+		for k, j := range batch {
+			builds[k] = app.Build[j]
+		}
+		refs, err := buildFn(ctx, builds)
+		if err != nil {
+			return fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
+		}
+		for k, j := range batch {
+			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: build.Tag(refs[k])})
+		}
+	}
+	res, err := r.Render(app.Path)
+	if err != nil {
+		return fmt.Errorf("app %s: %w", app.Name, err)
+	}
+	if len(images) > 0 {
+		if err := res.SetImages(images); err != nil {
+			return fmt.Errorf("app %s: %w", app.Name, err)
+		}
+	}
+	syncCtx, cancel := withTimeout(ctx, timeout)
+	defer cancel()
+	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace})
+	if err != nil {
+		return fmt.Errorf("app %s: %w", app.Name, err)
+	}
+	printSummary(os.Stderr, out, app.Name, results)
 	return nil
+}
+
+// runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
+// app only once every app it needs has finished. apps must be topologically
+// sorted (config.SortByNeeds). It returns the first error and, on any error,
+// cancels the derived context so apps not yet started are skipped.
+func runByNeeds(ctx context.Context, apps []config.App, maxParallel int, fn func(context.Context, config.App) error) error {
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+	done := make(map[string]chan struct{}, len(apps))
+	for _, a := range apps {
+		done[a.Name] = make(chan struct{})
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	for _, a := range apps {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(done[a.Name])
+			for _, dep := range a.Needs {
+				ch, ok := done[dep]
+				if !ok {
+					continue // need is outside this run's app set
+				}
+				select {
+				case <-ch:
+				case <-ctx.Done():
+					return
+				}
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			if err := fn(ctx, a); err != nil {
+				errOnce.Do(func() { firstErr = err; cancel() })
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // withTimeout bounds ctx by d, or returns it unchanged (with a no-op cancel)
@@ -306,11 +363,11 @@ func runWatch(args []string) error {
 	// The loop logs build/sync state itself; the per-app timeout keeps one
 	// stuck workload from holding a scheduler slot forever — on expiry the
 	// sync fails and the scheduler retries it with backoff.
-	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) error {
+	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) (loop.SyncStats, error) {
 		ctx, cancel := withTimeout(ctx, *timeout)
 		defer cancel()
-		_, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app]})
-		return err
+		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app]})
+		return syncStats(results), err
 	}
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
@@ -485,30 +542,42 @@ func runDestroy(args []string) error {
 // of resources applied/pruned, failures called out in red — and lists only the
 // resources that failed or ran as hooks. The full per-resource dump is noise on
 // a healthy sync (which is the common case); the line is what a developer scans.
-func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult) {
-	var b strings.Builder
-	var applied, pruned, failed int
+// syncStats reduces the engine's per-object results to the apply summary shared
+// by `ksync sync` (printSummary) and `ksync watch` (the loop's status line), so
+// both report applied/pruned/failed counts the same way.
+func syncStats(results []common.ResourceSyncResult) loop.SyncStats {
+	var s loop.SyncStats
 	for _, res := range results {
 		switch res.Status {
 		case common.ResultCodePruned:
-			pruned++
+			s.Pruned++
 		case common.ResultCodeSyncFailed:
-			failed++
-			fmt.Fprintf(&b, "  %s %s: %s\n", c.Red("✗"), res.ResourceKey.String(), res.Message)
+			s.Failed++
 		default:
-			applied++
+			s.Applied++
+		}
+	}
+	return s
+}
+
+func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult) {
+	var b strings.Builder
+	s := syncStats(results)
+	for _, res := range results {
+		if res.Status == common.ResultCodeSyncFailed {
+			fmt.Fprintf(&b, "  %s %s: %s\n", c.Red("✗"), res.ResourceKey.String(), res.Message)
 		}
 	}
 
-	parts := []string{fmt.Sprintf("%d applied", applied)}
-	if pruned > 0 {
-		parts = append(parts, fmt.Sprintf("%d pruned", pruned))
+	parts := []string{fmt.Sprintf("%d applied", s.Applied)}
+	if s.Pruned > 0 {
+		parts = append(parts, fmt.Sprintf("%d pruned", s.Pruned))
 	}
-	if failed > 0 {
-		parts = append(parts, c.Red(fmt.Sprintf("%d failed", failed)))
+	if s.Failed > 0 {
+		parts = append(parts, c.Red(fmt.Sprintf("%d failed", s.Failed)))
 	}
 	symbol := c.Green("✓")
-	if failed > 0 {
+	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
 	fmt.Fprintf(&b, "%s %s  %s\n", symbol, c.Bold(app), c.Dim(strings.Join(parts, ", ")))

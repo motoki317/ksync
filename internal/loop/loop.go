@@ -20,11 +20,19 @@ import (
 	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/render"
 	"github.com/motoki317/ksync/internal/schedule"
+	"github.com/motoki317/ksync/internal/ui"
 	"github.com/motoki317/ksync/internal/watch"
 )
 
-// SyncFunc applies one app's rendered objects to the cluster.
-type SyncFunc func(ctx context.Context, app string, objects []*unstructured.Unstructured) error
+// SyncStats summarizes one app's apply for the loop's status line: how many
+// objects the sync changed, pruned, or failed on. Applied counts only objects
+// that actually differed, so a no-op re-sync reports 0 — the developer sees at
+// a glance whether their edit changed anything.
+type SyncStats struct{ Applied, Pruned, Failed int }
+
+// SyncFunc applies one app's rendered objects to the cluster and reports how
+// many changed, were pruned, or failed.
+type SyncFunc func(ctx context.Context, app string, objects []*unstructured.Unstructured) (SyncStats, error)
 
 // BuildFunc produces the images of one build batch and returns their full
 // content-addressed refs in the same order. A batch is either a single
@@ -336,11 +344,23 @@ func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo
 			return r
 		}
 	}
-	if err := syncFn(ctx, app.Name, res.Objects); err != nil {
+	stats, err := syncFn(ctx, app.Name, res.Objects)
+	if err != nil {
 		log.Error(err, "sync failed", "app", app.Name)
 		return r
 	}
-	log.Info("synced", "app", app.Name, "objects", len(res.Objects), "took", time.Since(started).String())
+	// Concise, consistent with `ksync sync`'s summary: app, what actually
+	// changed (applied=0 on a no-op), and a human-rounded duration. pruned and
+	// failed are shown only when nonzero so the common line stays short.
+	kv := []any{"app", app.Name, "applied", stats.Applied}
+	if stats.Pruned > 0 {
+		kv = append(kv, "pruned", stats.Pruned)
+	}
+	if stats.Failed > 0 {
+		kv = append(kv, "failed", stats.Failed)
+	}
+	kv = append(kv, "took", ui.Duration(time.Since(started)))
+	log.Info("synced", kv...)
 	r.ok = true
 	return r
 }

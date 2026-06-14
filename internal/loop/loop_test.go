@@ -101,11 +101,11 @@ func TestRun_PassesRenderedObjectsToSync(t *testing.T) {
 	apps := []config.App{{Name: "app1", Path: filepath.Join(tmp, "app1")}}
 	var got []*unstructured.Unstructured
 	var mu sync.Mutex
-	syncFn := func(_ context.Context, _ string, objs []*unstructured.Unstructured) error {
+	syncFn := func(_ context.Context, _ string, objs []*unstructured.Unstructured) (SyncStats, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		got = objs
-		return nil
+		return SyncStats{}, nil
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -206,7 +206,7 @@ type objectSink struct {
 	images []string
 }
 
-func (s *objectSink) sync(_ context.Context, _ string, objs []*unstructured.Unstructured) error {
+func (s *objectSink) sync(_ context.Context, _ string, objs []*unstructured.Unstructured) (SyncStats, error) {
 	for _, obj := range objs {
 		if obj.GetKind() != "Deployment" {
 			continue
@@ -217,7 +217,7 @@ func (s *objectSink) sync(_ context.Context, _ string, objs []*unstructured.Unst
 		s.images = append(s.images, img)
 		s.mu.Unlock()
 	}
-	return nil
+	return SyncStats{}, nil
 }
 
 func (s *objectSink) synced() []string {
@@ -411,14 +411,14 @@ type recorder struct {
 	failFirst int // fail this many leading calls per app
 }
 
-func (r *recorder) sync(_ context.Context, app string, _ []*unstructured.Unstructured) error {
+func (r *recorder) sync(_ context.Context, app string, _ []*unstructured.Unstructured) (SyncStats, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls[app]++
 	if r.calls[app] <= r.failFirst {
-		return errors.New("induced failure")
+		return SyncStats{}, errors.New("induced failure")
 	}
-	return nil
+	return SyncStats{}, nil
 }
 
 func (r *recorder) count(app string) int {
