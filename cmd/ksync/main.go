@@ -220,15 +220,35 @@ func runSync(args []string) error {
 	// Independent apps build/render/sync concurrently; the needs DAG still
 	// serializes a dependent after the apps it needs (watch mode already does
 	// this — one-shot sync should not be slower than the loop's initial pass).
-	return runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
-		return syncOneApp(ctx, r, eng, buildFn, out, app, *prune, *timeout)
+	var mu sync.Mutex
+	var agg loop.SyncStats
+	var synced int
+	started := time.Now()
+	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
+		stats, err := syncOneApp(ctx, r, eng, buildFn, out, app, *prune, *timeout)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		synced++
+		agg.Applied += stats.Applied
+		agg.Pruned += stats.Pruned
+		agg.Degraded += stats.Degraded
+		mu.Unlock()
+		return nil
 	})
+	// One closing line for a multi-app run so the whole-stack result is legible
+	// without scanning every app line; a single-app run already says it all.
+	if len(apps) > 1 {
+		printRunSummary(os.Stderr, out, synced, agg, time.Since(started))
+	}
+	return err
 }
 
 // syncOneApp builds (by group batch), renders, injects built image tags, and
 // applies one app, printing its result summary. Build precedes render so the
 // applied manifests always reference images that exist in the local daemon.
-func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, out ui.Colors, app config.App, prune bool, timeout time.Duration) error {
+func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, out ui.Colors, app config.App, prune bool, timeout time.Duration) (loop.SyncStats, error) {
 	all := make([]int, len(app.Build))
 	for i := range all {
 		all[i] = i
@@ -241,7 +261,7 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 		}
 		refs, err := buildFn(ctx, builds)
 		if err != nil {
-			return fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
+			return loop.SyncStats{}, fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
 		}
 		for k, j := range batch {
 			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: build.Tag(refs[k])})
@@ -249,21 +269,24 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 	}
 	res, err := r.Render(app.Path)
 	if err != nil {
-		return fmt.Errorf("app %s: %w", app.Name, err)
+		return loop.SyncStats{}, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {
-			return fmt.Errorf("app %s: %w", app.Name, err)
+			return loop.SyncStats{}, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 	}
 	syncCtx, cancel := withTimeout(ctx, timeout)
 	defer cancel()
 	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace})
 	if err != nil {
-		return fmt.Errorf("app %s: %w", app.Name, err)
+		return loop.SyncStats{}, fmt.Errorf("app %s: %w", app.Name, err)
 	}
-	printSummary(os.Stderr, out, app.Name, results)
-	return nil
+	degraded := eng.AppDegraded(app.Name, app.Namespace, res.Objects)
+	printSummary(os.Stderr, out, app.Name, results, degraded)
+	stats := syncStats(results)
+	stats.Degraded = len(degraded)
+	return stats, nil
 }
 
 // runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
@@ -367,7 +390,11 @@ func runWatch(args []string) error {
 		ctx, cancel := withTimeout(ctx, *timeout)
 		defer cancel()
 		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app]})
-		return syncStats(results), err
+		stats := syncStats(results)
+		if err == nil {
+			stats.Degraded = len(eng.AppDegraded(app, nsByApp[app], objs))
+		}
+		return stats, err
 	}
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
@@ -533,7 +560,7 @@ func runDestroy(args []string) error {
 		if err != nil {
 			return fmt.Errorf("app %s: destroy: %w", app.Name, err)
 		}
-		printSummary(os.Stderr, out, app.Name, results)
+		printSummary(os.Stderr, out, app.Name, results, nil)
 	}
 	return nil
 }
@@ -560,13 +587,19 @@ func syncStats(results []common.ResourceSyncResult) loop.SyncStats {
 	return s
 }
 
-func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult) {
+func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string) {
 	var b strings.Builder
 	s := syncStats(results)
 	for _, res := range results {
 		if res.Status == common.ResultCodeSyncFailed {
 			fmt.Fprintf(&b, "  %s %s: %s\n", c.Red("✗"), res.ResourceKey.String(), res.Message)
 		}
+	}
+	// A resource applied cleanly but is broken at runtime (CrashLoop, failed
+	// Job): the sync succeeded, yet the developer needs to see it. Listed under
+	// the app line, distinct from a sync ✗.
+	for _, line := range degraded {
+		fmt.Fprintf(&b, "  %s %s\n", c.Yellow("⚠"), c.Dim(line))
 	}
 
 	parts := []string{fmt.Sprintf("%d applied", s.Applied)}
@@ -576,10 +609,29 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	if s.Failed > 0 {
 		parts = append(parts, c.Red(fmt.Sprintf("%d failed", s.Failed)))
 	}
+	if len(degraded) > 0 {
+		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", len(degraded))))
+	}
+	// ✓ applied & healthy · ⚠ applied but a resource is degraded · ✗ a sync task failed.
 	symbol := c.Green("✓")
+	if len(degraded) > 0 {
+		symbol = c.Yellow("⚠")
+	}
 	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
 	fmt.Fprintf(&b, "%s %s  %s\n", symbol, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
 	_, _ = io.WriteString(w, b.String())
+}
+
+// printRunSummary closes a multi-app sync with one line: how many apps synced,
+// how many carry degraded resources, and the wall-clock time. Counts of apps,
+// not objects — the per-app lines already carry object detail.
+func printRunSummary(w io.Writer, c ui.Colors, synced int, agg loop.SyncStats, took time.Duration) {
+	parts := []string{c.Dim(fmt.Sprintf("%d synced", synced))}
+	if agg.Degraded > 0 {
+		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", agg.Degraded)))
+	}
+	parts = append(parts, c.Dim(ui.Duration(took)))
+	_, _ = fmt.Fprintf(w, "%s\n", strings.Join(parts, c.Dim(" · ")))
 }

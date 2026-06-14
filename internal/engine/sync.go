@@ -189,6 +189,54 @@ func (e *Engine) unhealthyManaged(target []*unstructured.Unstructured, isManaged
 	return unhealthyLines(lives)
 }
 
+// AppDegraded returns one line per managed resource of app whose health is
+// Degraded — genuinely broken (CrashLoop, failed Job, Error pods), as opposed
+// to Progressing (a rollout still in flight) or Missing (an apply the cache has
+// not observed yet). Read from the warm cache, so it costs no API calls. It
+// lets a completed sync report "applied, but something is broken" WITHOUT
+// blocking on or false-flagging a transient rollout: a freshly applied healthy
+// edit is Progressing, not Degraded, so it is never reported here.
+func (e *Engine) AppDegraded(app, namespace string, objects []*unstructured.Unstructured) []string {
+	target := StampTracking(app, objects)
+	if namespace != "" {
+		fillDefaultNamespace(target, namespace, e.clusterCache.IsNamespaced)
+	}
+	isManaged := func(r *cache.Resource) bool {
+		info, ok := r.Info.(*resourceInfo)
+		return ok && info.app == app
+	}
+	lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
+	if err != nil {
+		return nil
+	}
+	return degradedLines(lives)
+}
+
+// degradedLines describes the live objects whose health is Degraded, one sorted
+// line each. Unlike unhealthyLines it deliberately ignores Progressing and
+// Missing: those are the normal post-apply states of a healthy rollout, and
+// flagging them would make every fresh edit look broken. The tradeoff is that a
+// wedged StatefulSet stays Progressing (StatefulSets carry no progress
+// deadline) and so is not reported here, whereas a wedged Deployment turns
+// Degraded via ProgressDeadlineExceeded and is — accepting a blind spot for
+// StatefulSets in exchange for never crying wolf on a healthy rollout.
+func degradedLines(lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
+	var lines []string
+	for key, obj := range lives {
+		h, err := health.GetResourceHealth(obj, nil)
+		if err != nil || h == nil || h.Status != health.HealthStatusDegraded {
+			continue
+		}
+		line := fmt.Sprintf("%s: Degraded", key.String())
+		if h.Message != "" {
+			line += " — " + strings.TrimSpace(h.Message)
+		}
+		lines = append(lines, line)
+	}
+	sort.Strings(lines)
+	return lines
+}
+
 // unhealthyLines describes the live objects that are worse than Healthy (or
 // Suspended, which is intentional), one sorted line each. Kinds without a
 // health check (ConfigMap, Service, …) report no health and are omitted — the

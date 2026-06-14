@@ -25,10 +25,12 @@ import (
 )
 
 // SyncStats summarizes one app's apply for the loop's status line: how many
-// objects the sync changed, pruned, or failed on. Applied counts only objects
-// that actually differed, so a no-op re-sync reports 0 — the developer sees at
-// a glance whether their edit changed anything.
-type SyncStats struct{ Applied, Pruned, Failed int }
+// objects the sync changed, pruned, or failed on, and how many of its live
+// resources are Degraded afterwards. Applied counts only objects that actually
+// differed, so a no-op re-sync reports 0 — the developer sees at a glance
+// whether their edit changed anything. Degraded is a post-sync health snapshot
+// (genuinely broken, not a rollout in flight); a healthy edit reports 0.
+type SyncStats struct{ Applied, Pruned, Failed, Degraded int }
 
 // SyncFunc applies one app's rendered objects to the cluster and reports how
 // many changed, were pruned, or failed.
@@ -358,6 +360,9 @@ func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo
 	}
 	if stats.Failed > 0 {
 		kv = append(kv, "failed", stats.Failed)
+	}
+	if stats.Degraded > 0 {
+		kv = append(kv, "degraded", stats.Degraded)
 	}
 	kv = append(kv, "took", ui.Duration(time.Since(started)))
 	log.Info("synced", kv...)
