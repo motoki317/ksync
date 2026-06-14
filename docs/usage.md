@@ -184,9 +184,10 @@ fast manifest loop stays fast.
 
 While a build (or image import) runs, ksync collapses the tool's output into a single live
 line — `⠹ build api-b  <latest output line>  12s` — and prints a `✓ build api-b (12s)` when it
-finishes. The full, verbose build log is shown **only if the command fails**, so a normal
-build stays quiet and a broken one gives you everything. (In a pipe or CI, the spinner is
-replaced by plain start/finish lines.)
+finishes. When several builds run at once (a whole-stack sync), each gets its own live line,
+stacked together; per-app sync summaries print above them as they complete. The full, verbose
+build log is shown **only if the command fails**, so a normal build stays quiet and a broken
+one gives you everything. (In a pipe or CI, the spinner is replaced by plain start/finish lines.)
 
 ### `.dockerignore` decides what triggers a rebuild
 
