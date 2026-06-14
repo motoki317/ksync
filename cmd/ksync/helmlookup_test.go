@@ -61,6 +61,42 @@ func TestHelmLookupWrapper_OtherSubcommandsPassThrough(t *testing.T) {
 	}
 }
 
+// With the cluster version and api-versions file set, template gets
+// --kube-version and one --api-versions per line — so version-gated chart
+// templates resolve against the real cluster even on helm v3.
+func TestHelmLookupWrapper_TemplateGetsCapabilityFlags(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "helm")
+	if err := os.WriteFile(wrapper, []byte(helmLookupWrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	apiFile := filepath.Join(dir, "api-versions")
+	if err := os.WriteFile(apiFile, []byte("policy/v1\npolicy/v1/PodDisruptionBudget\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(wrapper, "template", "chart")
+	cmd.Env = append(os.Environ(),
+		"KSYNC_HELM="+fakeHelm(t),
+		"KSYNC_KUBE_CONTEXT=dev-ctx",
+		"KSYNC_KUBE_VERSION=v1.30.2",
+		"KSYNC_API_VERSIONS="+apiFile,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("wrapper: %v", err)
+	}
+	got := strings.Join(strings.Fields(string(out)), " ")
+	for _, want := range []string{
+		"--kube-version v1.30.2",
+		"--api-versions policy/v1",
+		"--api-versions policy/v1/PodDisruptionBudget",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("template args %q missing %q", got, want)
+		}
+	}
+}
+
 func TestRenderOptions_OfflineUsesPlainHelm(t *testing.T) {
 	opts, cleanup, err := renderOptions("dev-ctx", true)
 	if err != nil {

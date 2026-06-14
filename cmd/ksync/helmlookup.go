@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
+	"github.com/motoki317/ksync/internal/engine"
 	"github.com/motoki317/ksync/internal/render"
 )
 
@@ -24,15 +26,29 @@ import (
 //     Helm's ownership labels. ksync's resources are SSA-managed under its own
 //     tracking label, not Helm's, so without this the server dry-run aborts with
 //     "cannot be imported into the current release" once an app is deployed.
+//   - --kube-version / --api-versions: the cluster's real Kubernetes version and
+//     API set, so version-gated templates (a PDB's
+//     `.Capabilities.APIVersions.Has "policy/v1/PodDisruptionBudget"`) resolve
+//     for the actual target. Helm v3 does NOT fill these from --dry-run=server —
+//     without them it leaves Capabilities at static defaults and a chart silently
+//     renders a removed apiVersion that fails to apply. The api-versions list is
+//     long, so it is read from a file (one per line) rather than baked into args.
 //
-// The real helm path and the context arrive via env vars, never interpolated
-// into the script, so a context name can carry any character without becoming
-// shell injection. ksync sets both in its own process; kustomize's exec
-// inherits them.
+// The real helm path, the context, the version, and the api-versions file all
+// arrive via env vars, never interpolated into the script, so any value can
+// carry any character without becoming shell injection. ksync sets them in its
+// own process; kustomize's exec inherits them.
 const helmLookupWrapper = `#!/bin/sh
 if [ "$1" = "template" ]; then
 	shift
-	exec "$KSYNC_HELM" template "$@" --dry-run=server --take-ownership --kube-context "$KSYNC_KUBE_CONTEXT"
+	set -- "$@" --dry-run=server --take-ownership --kube-context "$KSYNC_KUBE_CONTEXT"
+	[ -n "$KSYNC_KUBE_VERSION" ] && set -- "$@" --kube-version "$KSYNC_KUBE_VERSION"
+	if [ -n "$KSYNC_API_VERSIONS" ] && [ -f "$KSYNC_API_VERSIONS" ]; then
+		while IFS= read -r v; do
+			[ -n "$v" ] && set -- "$@" --api-versions "$v"
+		done < "$KSYNC_API_VERSIONS"
+	fi
+	exec "$KSYNC_HELM" template "$@"
 fi
 exec "$KSYNC_HELM" "$@"
 `
@@ -47,26 +63,44 @@ func setupHelmLookup(kubeContext string) (helmCommand string, cleanup func(), er
 	if err != nil {
 		return "", nil, fmt.Errorf("helm not found on PATH (needed to render charts against the cluster; use --offline-render to skip): %w", err)
 	}
+	// Discover the cluster's capabilities up front (once per command, not per
+	// render) so helm renders version-gated templates for the real target. Live
+	// render already requires cluster connectivity, so a discovery failure means
+	// the cluster is unreachable — surface it rather than render with wrong
+	// (static) capabilities.
+	apiVersions, kubeVersion, err := engine.DiscoverCapabilities(kubeContext)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading cluster capabilities (use --offline-render to skip live rendering): %w", err)
+	}
 	dir, err := os.MkdirTemp("", "ksync-helm-")
 	if err != nil {
 		return "", nil, err
 	}
+	cleanup = func() { _ = os.RemoveAll(dir) }
 	// Named "helm" so kustomize's own `helm version` probe and any log line read
 	// naturally; the basename is otherwise irrelevant.
 	wrapper := filepath.Join(dir, "helm")
 	if err := os.WriteFile(wrapper, []byte(helmLookupWrapper), 0o755); err != nil {
-		_ = os.RemoveAll(dir)
+		cleanup()
 		return "", nil, err
 	}
-	if err := os.Setenv("KSYNC_HELM", helmPath); err != nil {
-		_ = os.RemoveAll(dir)
+	apiVersionsFile := filepath.Join(dir, "api-versions")
+	if err := os.WriteFile(apiVersionsFile, []byte(strings.Join(apiVersions, "\n")), 0o644); err != nil {
+		cleanup()
 		return "", nil, err
 	}
-	if err := os.Setenv("KSYNC_KUBE_CONTEXT", kubeContext); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", nil, err
+	for k, v := range map[string]string{
+		"KSYNC_HELM":         helmPath,
+		"KSYNC_KUBE_CONTEXT": kubeContext,
+		"KSYNC_KUBE_VERSION": kubeVersion,
+		"KSYNC_API_VERSIONS": apiVersionsFile,
+	} {
+		if err := os.Setenv(k, v); err != nil {
+			cleanup()
+			return "", nil, err
+		}
 	}
-	return wrapper, func() { _ = os.RemoveAll(dir) }, nil
+	return wrapper, cleanup, nil
 }
 
 // renderOptions builds the renderer options for a command: live-cluster helm
