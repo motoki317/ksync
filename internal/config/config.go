@@ -96,6 +96,14 @@ type Build struct {
 	// Default: the whole context, minus .dockerignore exclusions — needed for
 	// monorepos where one shared context feeds many images.
 	Watch []string `json:"watch,omitempty"`
+	// WatchIgnore lists patterns (.dockerignore syntax, relative to Context)
+	// excluded from change detection but NOT from the build context. It is for
+	// build outputs staged inside the context — a host-compiled binary the
+	// Dockerfile COPYs — which docker must still receive yet must not re-trigger
+	// the build that wrote them. .dockerignore normally breaks that self-trigger
+	// loop, but it cannot here: dockerignoring the path would drop it from the
+	// COPY. Watching-only ignores close that gap.
+	WatchIgnore []string `json:"watchIgnore,omitempty"`
 	// Command replaces `docker build` for flows it cannot express (bake,
 	// host-side compilation, …). It runs via `sh -c` in the context directory
 	// and must leave the image tagged $KSYNC_IMAGE in the local docker daemon.

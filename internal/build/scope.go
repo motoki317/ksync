@@ -31,7 +31,10 @@ type Scope struct {
 // self-triggered rebuild loops (command builds writing artifacts into the
 // context) and per-directory watch descriptors on huge trees.
 // `<dockerfile>.dockerignore` takes precedence over `<context>/.dockerignore`
-// (BuildKit semantics).
+// (BuildKit semantics). b.WatchIgnore adds the same exclusion for change
+// detection alone, without removing the path from the context — for build
+// outputs the Dockerfile COPYs, which docker must see but which must not
+// re-trigger their own build.
 func WatchScope(b config.Build) (*Scope, error) {
 	s := &Scope{context: b.Context, exempt: map[string]bool{}}
 	if len(b.Watch) > 0 {
@@ -44,35 +47,53 @@ func WatchScope(b config.Build) (*Scope, error) {
 		s.exempt[b.Dockerfile] = true
 	}
 
-	ignoreFile := filepath.Join(b.Context, ".dockerignore")
-	if b.Dockerfile != "" {
-		if specific := b.Dockerfile + ".dockerignore"; fileExists(specific) {
-			ignoreFile = specific
-		}
-	}
 	// On ignore-file errors the scope is still returned usable, just without
 	// ignore rules — over-watching is the safe direction (extra rebuilds,
 	// never missed ones); the caller logs the error.
-	f, err := os.Open(ignoreFile)
+	patterns, err := dockerignorePatterns(s, b)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
-		}
 		return s, err
 	}
-	defer func() { _ = f.Close() }()
-	patterns, err := ignorefile.ReadAll(f)
-	if err != nil {
-		return s, err
+	// watchIgnore patterns come last so they win on conflict; they narrow
+	// watching only (the context is unchanged), closing the self-trigger loop
+	// for outputs that cannot be dockerignored without breaking the COPY.
+	patterns = append(patterns, b.WatchIgnore...)
+	if len(patterns) == 0 {
+		return s, nil
 	}
 	matcher, err := patternmatcher.New(patterns)
 	if err != nil {
 		return s, err
 	}
 	s.matcher = matcher
+	return s, nil
+}
+
+// dockerignorePatterns reads the .dockerignore that applies to b, registering
+// the ignore file itself as a watched, image-relevant root (docker re-reads it
+// every build). A missing file yields no patterns and no error.
+func dockerignorePatterns(s *Scope, b config.Build) ([]string, error) {
+	ignoreFile := filepath.Join(b.Context, ".dockerignore")
+	if b.Dockerfile != "" {
+		if specific := b.Dockerfile + ".dockerignore"; fileExists(specific) {
+			ignoreFile = specific
+		}
+	}
+	f, err := os.Open(ignoreFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	patterns, err := ignorefile.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
 	s.Roots = append(s.Roots, ignoreFile)
 	s.exempt[ignoreFile] = true
-	return s, nil
+	return patterns, nil
 }
 
 // Ignored reports whether a change at path cannot affect the image.

@@ -352,6 +352,39 @@ func TestWatchScope_DockerfileSpecificIgnoreFileWins(t *testing.T) {
 	}
 }
 
+// watchIgnore must exclude a path from change detection without it being in a
+// .dockerignore — the staged-build-output case (a host-compiled binary the
+// Dockerfile COPYs) that would otherwise self-trigger an endless rebuild loop.
+func TestWatchScope_WatchIgnoreExcludesStagedOutputs(t *testing.T) {
+	ctxDir := t.TempDir()
+	dockerfile := filepath.Join(ctxDir, "Dockerfile")
+	writeFile(t, dockerfile, "FROM scratch\n")
+	s, err := WatchScope(config.Build{
+		Image:       "api-b",
+		Context:     ctxDir,
+		Dockerfile:  dockerfile,
+		Watch:       []string{filepath.Join(ctxDir, "apps", "api-b")},
+		WatchIgnore: []string{"**/.zigbuild"},
+	})
+	if err != nil {
+		t.Fatalf("WatchScope: %v", err)
+	}
+	// The staged binary the Dockerfile COPYs: in the context, but its writes
+	// must not dirty the build.
+	staged := filepath.Join(ctxDir, "apps", "api-b", ".zigbuild", "arm64", "server")
+	if !s.Ignored(staged) {
+		t.Errorf("Ignored(%s) = false, want true (staged output must not re-trigger)", staged)
+	}
+	if !s.SkipDir(filepath.Join(ctxDir, "apps", "api-b", ".zigbuild")) {
+		t.Error("SkipDir(.zigbuild) = false, want true (prune the output dir)")
+	}
+	// Real source under the same watch root still dirties the build.
+	src := filepath.Join(ctxDir, "apps", "api-b", "src", "main.rs")
+	if s.Ignored(src) {
+		t.Errorf("Ignored(%s) = true, want false (source must still dirty)", src)
+	}
+}
+
 func TestWatchScope_ExplicitWatchPathsNarrowRoots(t *testing.T) {
 	ctxDir := t.TempDir()
 	srcDir := filepath.Join(ctxDir, "src")

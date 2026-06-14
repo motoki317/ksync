@@ -41,7 +41,7 @@ re-litigate only with new evidence):
 - `internal/config` — ksync.yaml model: app list, single explicit kubectl context (the safety
   model), optional top-level `imageLoad` command (separate-image-store clusters), per-app
   default namespace (ArgoCD destination.namespace parity), `needs` DAG, per-app `build` entries
-  (image/context + optional dockerfile/watch/command); `SortByNeeds`.
+  (image/context + optional dockerfile/watch/watchIgnore/command); `SortByNeeds`.
 - `internal/build` — source→image: docker build (or the `command` escape hatch producing
   `$KSYNC_IMAGE`), content-addressed dev tags `ksync-<12 hex of image ID>` (no persisted
   build state; `--provenance=false` keeps IDs deterministic), `.dockerignore`-scoped watch

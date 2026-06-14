@@ -147,6 +147,7 @@ That is all you need for the common case: a directory with a `Dockerfile` in it.
 | `context` | yes | The docker build context directory. Relative paths are resolved from the config file's directory. ksync watches it for changes. |
 | `dockerfile` | no | Path to the Dockerfile, relative to `context`. Default: `Dockerfile` in the context. |
 | `watch` | no | Only these paths (relative to `context`) trigger a rebuild. Useful in monorepos where one big context feeds many images. Default: the whole context. |
+| `watchIgnore` | no | Patterns (`.dockerignore` syntax, relative to `context`) excluded from rebuild triggering but **not** from the build context. For build outputs staged inside the context that the Dockerfile `COPY`s — docker must still see them, but their writes must not re-trigger the build. See "Staged build outputs". |
 | `command` | no | Replaces `docker build` with your own build command (see below). |
 | `group` | no | Build this image as part of a `buildGroups` entry of this name — one bulk command builds it together with the group's other dirty images. Mutually exclusive with `command`/`dockerfile`. See "Build groups". |
 
@@ -198,6 +199,24 @@ watching. Keep your `.dockerignore` honest (exclude `target/`, `node_modules/`, 
 output) and you get correct rebuild triggers for free — including for build commands that
 write artifacts back into the context, which would otherwise rebuild forever.
 `<dockerfile>.dockerignore` takes precedence over `<context>/.dockerignore`, like BuildKit.
+
+### Staged build outputs (`watchIgnore`)
+
+`.dockerignore` breaks the rebuild-forever loop only for outputs the image does **not** need.
+Some flows stage a build output *inside* the context because the Dockerfile `COPY`s it — a
+host-compiled binary placed in `apps/<svc>/.zigbuild/` for a thin Dockerfile, say. That path
+cannot be `.dockerignore`d (docker would drop it from the `COPY`), yet writing it must not
+re-trigger the build that produced it. List such paths in `watchIgnore`: they stay in the
+build context but are excluded from change detection.
+
+```yaml
+build:
+  - image: example.com/team-a/api-b
+    context: .
+    watch: [apps/api-b, lib]
+    group: native
+    watchIgnore: ["**/.zigbuild"] # staged binaries the thin Dockerfile COPYs
+```
 
 ### Custom build commands
 
