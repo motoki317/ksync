@@ -244,7 +244,7 @@ func runSync(args []string) error {
 		})
 	}
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
-		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, app, *prune, *timeout, *maxParallel)
+		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, app, *prune, *timeout, *maxParallel, os.Stderr, out)
 		if err != nil {
 			return err
 		}
@@ -280,7 +280,7 @@ func runSync(args []string) error {
 // degraded resources. Build precedes render so the applied manifests always
 // reference images that exist in the local daemon. The caller prints the
 // summary line — after tallying — so the live footer's count tracks the ✓ lines.
-func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, app config.App, prune bool, timeout time.Duration, maxParallel int) ([]common.ResourceSyncResult, []string, error) {
+func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, app config.App, prune bool, timeout time.Duration, maxParallel int, w io.Writer, c ui.Colors) ([]common.ResourceSyncResult, []string, error) {
 	all := make([]int, len(app.Build))
 	for i := range all {
 		all[i] = i
@@ -306,13 +306,43 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 			return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 	}
+	onWait, stopWait := waitLine(w, c, app.Name)
+	defer stopWait()
 	syncCtx, cancel := withTimeout(ctx, timeout)
 	defer cancel()
-	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace})
+	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace, OnWait: onWait})
 	if err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	return results, eng.AppDegraded(app.Name, app.Namespace, res.Objects), nil
+}
+
+// waitLine builds the post-apply health-gate progress line for one app: an
+// OnWait callback that lazily starts a single live "waiting for health" spinner
+// on the first poll the gate is still waiting (so an already-healthy sync shows
+// nothing) and updates the not-ready count, plus the stop closure that removes
+// it once the app's Sync returns — leaving the ship-emoji apply line as the sole
+// record. The spinner is TTY-only (inert on a pipe), so redirected output is
+// unaffected.
+func waitLine(w io.Writer, c ui.Colors, app string) (onWait func([]string), stop func()) {
+	var mu sync.Mutex
+	var wait *ui.Waiting
+	onWait = func(pending []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if wait == nil {
+			wait = ui.StartWaiting(w, c, fmt.Sprintf("%s %s  %s", iconSync, c.Bold(app), c.Dim("waiting for health")))
+		}
+		wait.Status(fmt.Sprintf("%d not ready", len(pending)))
+	}
+	stop = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if wait != nil {
+			wait.Stop()
+		}
+	}
+	return onWait, stop
 }
 
 // runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
@@ -421,7 +451,9 @@ func runWatch(args []string) error {
 	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) (loop.SyncStats, error) {
 		ctx, cancel := withTimeout(ctx, *timeout)
 		defer cancel()
-		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app]})
+		onWait, stopWait := waitLine(os.Stderr, out, app)
+		defer stopWait()
+		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], OnWait: onWait})
 		stats := syncStats(results)
 		if err == nil {
 			stats.Degraded = len(eng.AppDegraded(app, nsByApp[app], objs))
