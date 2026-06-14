@@ -5,7 +5,6 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -37,7 +36,6 @@ func New(opts Options) logr.Logger {
 		clock = time.Now
 	}
 	return logr.New(&Sink{
-		mu:        &sync.Mutex{},
 		w:         w,
 		colors:    NewColors(w),
 		verbosity: opts.Verbosity,
@@ -54,7 +52,6 @@ func New(opts Options) logr.Logger {
 // message. WithName/WithValues are honored so engine sub-loggers keep their
 // context.
 type Sink struct {
-	mu        *sync.Mutex // pointer: shared across WithName/WithValues copies so writes stay line-atomic
 	w         io.Writer
 	colors    Colors
 	verbosity int
@@ -104,9 +101,10 @@ func (s *Sink) write(symbol, msg string, kv []any, isError bool) {
 	}
 	b.WriteByte('\n')
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, _ = io.WriteString(s.w, b.String())
+	// Through liveTerm so a status line erases any in-flight build spinner before
+	// printing, and so all sinks (and the command-layer summaries) serialize on
+	// one lock — keeping every record line-atomic without a per-sink mutex.
+	liveTerm.line(s.w, b.String())
 }
 
 // formatPairs renders the merged WithName/WithValues context and the call's

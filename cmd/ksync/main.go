@@ -621,7 +621,9 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 		symbol = c.Red("✗")
 	}
 	fmt.Fprintf(&b, "%s %s  %s\n", symbol, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
-	_, _ = io.WriteString(w, b.String())
+	// Through ui.WriteLine so the line erases any in-flight build spinner before
+	// printing — apps sync concurrently, so a summary can land mid-spinner.
+	ui.WriteLine(w, b.String())
 }
 
 // printRunSummary closes a multi-app sync with one line: how many apps synced,
@@ -633,5 +635,5 @@ func printRunSummary(w io.Writer, c ui.Colors, synced int, agg loop.SyncStats, t
 		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", agg.Degraded)))
 	}
 	parts = append(parts, c.Dim(ui.Duration(took)))
-	_, _ = fmt.Fprintf(w, "%s\n", strings.Join(parts, c.Dim(" · ")))
+	ui.WriteLine(w, strings.Join(parts, c.Dim(" · "))+"\n")
 }

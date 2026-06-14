@@ -69,7 +69,9 @@ func startActivity(w io.Writer, c Colors, label string, now func() time.Time) *A
 		go a.animate()
 		return a
 	}
-	_, _ = fmt.Fprintf(w, "%s %s%s\n", c.Cyan("•"), label, c.Dim(" …"))
+	// Non-live (piped, or another Activity owns the spinner): a plain start line,
+	// routed through term so it erases that other spinner before printing.
+	liveTerm.line(w, fmt.Sprintf("%s %s%s\n", c.Cyan("•"), label, c.Dim(" …")))
 	return a
 }
 
@@ -89,24 +91,31 @@ func (a *Activity) Write(p []byte) (int, error) {
 // summary with the elapsed time, and — only on failure — the full captured
 // output so the developer can see what went wrong.
 func (a *Activity) Done(err error) {
-	if a.live {
-		close(a.stop)
-		<-a.stopped
-		_, _ = fmt.Fprint(a.w, "\r\x1b[K") // erase the spinner line
-		liveLine.Unlock()
-	}
 	elapsed := a.c.Dim("(" + Duration(a.now().Sub(a.start)) + ")")
+	var b strings.Builder
 	if err != nil {
 		a.mu.Lock()
 		out := strings.TrimRight(a.buf.String(), "\n")
 		a.mu.Unlock()
 		if out != "" {
-			_, _ = fmt.Fprintf(a.w, "%s\n%s\n", a.c.Dim("─── "+a.label+" output ───"), out)
+			fmt.Fprintf(&b, "%s\n%s\n", a.c.Dim("─── "+a.label+" output ───"), out)
 		}
-		_, _ = fmt.Fprintf(a.w, "%s %s  %s\n", a.c.Red("✗"), a.label, elapsed)
+		fmt.Fprintf(&b, "%s %s  %s\n", a.c.Red("✗"), a.label, elapsed)
+	} else {
+		fmt.Fprintf(&b, "%s %s  %s\n", a.c.Green("✓"), a.label, elapsed)
+	}
+	// Stop animating before printing so no frame lands after the done line, then
+	// emit through liveTerm: it erases the frozen spinner frame and writes the
+	// summary as one atomic line. Release the live-line lock only afterwards, so
+	// a queued Activity cannot start drawing into our half-written output.
+	if a.live {
+		close(a.stop)
+		<-a.stopped
+		liveTerm.line(a.w, b.String())
+		liveLine.Unlock()
 		return
 	}
-	_, _ = fmt.Fprintf(a.w, "%s %s  %s\n", a.c.Green("✓"), a.label, elapsed)
+	liveTerm.line(a.w, b.String())
 }
 
 func (a *Activity) animate() {
@@ -139,7 +148,9 @@ func (a *Activity) draw(frame rune) {
 	if room := a.cols() - len([]rune(prefix)); room > 0 {
 		meta = truncateRunes(meta, room)
 	}
-	_, _ = fmt.Fprintf(a.w, "\r\x1b[K%s %s  %s", a.c.Cyan(string(frame)), a.c.Bold(a.label), a.c.Dim(meta))
+	// liveTerm.spinnerFrame prepends the erase sequence and records the line as dirty
+	// so a concurrent status line clears it before printing.
+	liveTerm.spinnerFrame(a.w, fmt.Sprintf("%s %s  %s", a.c.Cyan(string(frame)), a.c.Bold(a.label), a.c.Dim(meta)))
 }
 
 func (a *Activity) cols() int {
