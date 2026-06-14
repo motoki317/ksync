@@ -15,7 +15,10 @@ import (
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/hook"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -36,6 +39,11 @@ type SyncOptions struct {
 	// parity): gitops-engine stamps it on target objects that set none, and
 	// when non-empty the namespace itself is created on sync if missing.
 	Namespace string
+	// OnWait, when set, is called once per poll while the post-apply health gate
+	// is still waiting, with the resources not yet Healthy. It drives a live
+	// "waiting for health" progress line; it is never called once the app has
+	// converged (an already-healthy sync returns without ever invoking it).
+	OnWait func(pending []string)
 }
 
 // Sync makes the cluster state of one app match the given rendered resources,
@@ -53,6 +61,16 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 	// late fill (gitops-engine also stamps at task creation) would mismatch.
 	if opts.Namespace != "" {
 		fillDefaultNamespace(target, opts.Namespace, e.clusterCache.IsNamespaced)
+	}
+
+	// Create any namespace this app's resources target but does not own — a
+	// multi-namespace app (e.g. workflow RBAC fanned out across app namespaces)
+	// would otherwise fail to apply on a fresh cluster, since gitops-engine's
+	// namespace modifier only creates the app's own destination namespace. These
+	// are created bare and untracked, so prune never removes them and the app
+	// that does own one later adopts it unchanged.
+	if err := e.ensureReferencedNamespaces(ctx, target, opts.Namespace); err != nil {
+		return nil, fmt.Errorf("preparing namespaces for %q: %w", app, err)
 	}
 
 	// Drive the sync operation ourselves rather than via engine.GitOpsEngine.Sync.
@@ -127,7 +145,10 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 			if phase == common.OperationError || phase == common.OperationFailed {
 				return results, syncFailedError(app, phase, message, results)
 			}
-			return results, failedResultsError(results)
+			if err := failedResultsError(results); err != nil {
+				return results, err
+			}
+			break
 		}
 
 		select {
@@ -136,6 +157,30 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 			// (ErrImagePull, CrashLoop) holds the operation here until the
 			// deadline; name the resource the sync is stuck on.
 			return results, e.timeoutError(app, target, isManaged)
+		case <-time.After(operationRefresh):
+		}
+	}
+
+	// The apply succeeded, but gitops-engine marks the operation Succeeded the
+	// moment the FINAL wave is applied — for an app with no sync waves or hooks
+	// it explicitly does not wait for those resources to become Healthy ("a sync
+	// equates to simply an asynchronous kubectl apply", sync_context.go). Hooks
+	// and health-gated waves were already awaited in the loop above; gate the
+	// rest here so a completed Sync means applied AND healthy. That is what makes
+	// a `needs` edge meaningful — a dependent must not start until what it needs
+	// is actually serving — and what lets a still-converging app show as in
+	// progress instead of a premature success.
+	for {
+		pending := e.pendingHealth(target, isManaged)
+		if len(pending) == 0 {
+			return results, nil
+		}
+		if opts.OnWait != nil {
+			opts.OnWait(pending)
+		}
+		select {
+		case <-ctx.Done():
+			return results, notHealthyError(app, pending)
 		case <-time.After(operationRefresh):
 		}
 	}
@@ -170,11 +215,70 @@ func failedResultsError(results []common.ResourceSyncResult) error {
 // sync was waiting on. Health is read from the warm cache (full manifests are
 // cached for managed resources), so this costs no extra API calls.
 func (e *Engine) timeoutError(app string, target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) error {
-	stuck := e.unhealthyManaged(target, isManaged)
-	if len(stuck) == 0 {
+	return notHealthyError(app, e.unhealthyManaged(target, isManaged))
+}
+
+// notHealthyError frames a deadline-exceeded sync, listing what was still not
+// healthy (or a bare message when nothing specific could be named).
+func notHealthyError(app string, lines []string) error {
+	if len(lines) == 0 {
 		return fmt.Errorf("sync of %q timed out before converging", app)
 	}
-	return fmt.Errorf("sync of %q timed out; still not healthy:\n  %s", app, strings.Join(stuck, "\n  "))
+	return fmt.Errorf("sync of %q timed out; still not healthy:\n  %s", app, strings.Join(lines, "\n  "))
+}
+
+// pendingHealth returns one line per non-hook target resource that has not yet
+// reached Healthy/Suspended — either the cache has not observed it (just
+// applied) or its health is still Progressing/Degraded/Missing. Empty means the
+// app has converged. Read from the warm cache, so it costs no API calls.
+//
+// It keys on the TARGET set (not the live set unhealthyLines walks) so a
+// resource the cache has not caught up to yet counts as pending, not as a
+// premature success. Hooks are excluded: a hook Job with a delete policy is
+// removed once it runs, so it is legitimately absent and must never hold the
+// gate open. Kinds without a health check (ConfigMap, Service, CRD, custom
+// resources, …) are ready as soon as they exist.
+func (e *Engine) pendingHealth(target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) []string {
+	lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
+	if err != nil {
+		// A transient read failure must not be read as convergence; report it so
+		// the gate keeps waiting.
+		return []string{fmt.Sprintf("reading live state: %v", err)}
+	}
+	return pendingLines(target, lives)
+}
+
+// pendingLines is the pure core of pendingHealth: given the target set and the
+// live objects keyed by resource key, return one line per non-hook target that
+// has not reached Healthy/Suspended. Split out so the gate rule — target-keyed,
+// hook-excluded, presence-required — is unit-testable without a cluster cache.
+func pendingLines(target []*unstructured.Unstructured, lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
+	var pending []string
+	for _, t := range target {
+		if hook.IsHook(t) {
+			continue
+		}
+		key := kube.GetResourceKey(t)
+		live := lives[key]
+		if live == nil {
+			pending = append(pending, key.String()+": not yet created")
+			continue
+		}
+		h, err := health.GetResourceHealth(live, nil)
+		if err != nil || h == nil {
+			continue
+		}
+		if h.Status == health.HealthStatusHealthy || h.Status == health.HealthStatusSuspended {
+			continue
+		}
+		line := fmt.Sprintf("%s: %s", key.String(), h.Status)
+		if h.Message != "" {
+			line += " — " + strings.TrimSpace(h.Message)
+		}
+		pending = append(pending, line)
+	}
+	sort.Strings(pending)
+	return pending
 }
 
 // unhealthyManaged returns one line per managed live resource whose health is
@@ -296,6 +400,33 @@ func alignedLiveObjs(target []*unstructured.Unstructured, lives map[kube.Resourc
 // metadata).
 func createNamespaceIfMissing(_, live *unstructured.Unstructured) (bool, error) {
 	return live == nil, nil
+}
+
+// ensureReferencedNamespaces creates every distinct namespace the target
+// resources live in, except the app's own (own, handled by gitops-engine's
+// namespace modifier) and the cluster scope (""). It exists for multi-namespace
+// apps — e.g. argo-workflows fans workflow RBAC out across the app namespaces —
+// which gitops-engine would otherwise fail to apply on a fresh cluster, since it
+// only auto-creates the single destination namespace. Namespaces are created
+// bare (no tracking label), so they are never pruned and the app that owns one
+// adopts it unchanged on its own sync. Already-exists is the steady state and is
+// not an error. No-op (zero API calls) for the common single-namespace app.
+func (e *Engine) ensureReferencedNamespaces(ctx context.Context, target []*unstructured.Unstructured, own string) error {
+	seen := map[string]bool{own: true, "": true}
+	for _, t := range target {
+		ns := t.GetNamespace()
+		if seen[ns] {
+			continue
+		}
+		seen[ns] = true
+		_, err := e.kclient.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: ns},
+		}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("creating namespace %q: %w", ns, err)
+		}
+	}
+	return nil
 }
 
 // StampTracking returns copies of objs labeled as belonging to app. Copies,

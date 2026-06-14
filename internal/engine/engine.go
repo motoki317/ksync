@@ -15,6 +15,7 @@ import (
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/tracing"
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
@@ -43,6 +44,10 @@ type Engine struct {
 	// convenience wrapper — see Sync for why that wrapper deadlocks on hooks.
 	cfg     *rest.Config
 	kubectl kube.Kubectl
+	// kclient creates namespaces an app's resources reference but does not own
+	// (cross-namespace resources); gitops-engine's namespace modifier only
+	// creates the app's own destination namespace.
+	kclient kubernetes.Interface
 	log     logr.Logger
 }
 
@@ -73,6 +78,10 @@ func New(kubeContext string, log logr.Logger) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("starting gitops engine: %w", err)
 	}
+	kclient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building kubernetes client: %w", err)
+	}
 	return &Engine{
 		clusterCache: clusterCache,
 		stop:         stop,
@@ -80,6 +89,7 @@ func New(kubeContext string, log logr.Logger) (*Engine, error) {
 		// The same kubectl engine.NewEngine builds by default (ctl.go), recreated
 		// here because that one is not reachable through the GitOpsEngine surface.
 		kubectl: &kube.KubectlCmd{Log: log, Tracer: tracing.NopTracer{}},
+		kclient: kclient,
 		log:     log,
 	}, nil
 }
