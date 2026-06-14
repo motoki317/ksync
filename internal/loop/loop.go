@@ -53,6 +53,10 @@ type Options struct {
 	Render      render.Options
 	Build       BuildFunc // required when any app declares builds
 	Log         logr.Logger
+	// Report renders one app's completed sync. The loop calls it on success so
+	// the watch output matches `ksync sync`'s ship-emoji apply line rather than
+	// a plain log record; when nil, the loop logs a structured "synced" line.
+	Report func(app string, stats SyncStats, took time.Duration)
 	// Resync, when a value is received, marks every app dirty — the manual
 	// "redeploy everything now" the watch command wires to keyboard input.
 	// A nil channel simply never fires.
@@ -191,6 +195,15 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		sched.MarkDirty(a.Name, now)
 	}
 
+	rn := &runner{
+		renderer:    renderer,
+		buildFn:     opts.Build,
+		syncFn:      syncFn,
+		report:      opts.Report,
+		maxParallel: opts.MaxParallel,
+		log:         log,
+	}
+
 	results := make(chan result)
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -215,7 +228,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				r := runApp(ctx, renderer, app, todo, tags, opts.Build, syncFn, log)
+				r := rn.run(ctx, app, todo, tags)
 				select {
 				case results <- r:
 				case <-ctx.Done():
@@ -302,38 +315,39 @@ func unbuilt(todo []int, built map[int]string) []int {
 	return failed
 }
 
-// runApp is one scheduled run of one app: build the dirty entries, render,
-// inject the known dev tags, sync. A build failure aborts before render —
-// syncing manifests whose images were never built would deploy whatever tag
-// the manifests pin, which is exactly not the local source.
-func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo []int, tags map[int]string, buildFn BuildFunc, syncFn SyncFunc, log logr.Logger) result {
+// runner holds the per-run collaborators so one scheduled app run does not
+// thread half a dozen parameters; the loop builds it once and reuses it.
+type runner struct {
+	renderer    *render.Renderer
+	buildFn     BuildFunc
+	syncFn      SyncFunc
+	report      func(app string, stats SyncStats, took time.Duration)
+	maxParallel int
+	log         logr.Logger
+}
+
+// run is one scheduled run of one app: build the dirty entries, render, inject
+// the known dev tags, sync. A build failure aborts before render — syncing
+// manifests whose images were never built would deploy whatever tag the
+// manifests pin, which is exactly not the local source.
+func (rn *runner) run(ctx context.Context, app config.App, todo []int, tags map[int]string) result {
 	started := time.Now()
 	r := result{app: app.Name, built: map[int]string{}}
-	for _, batch := range app.BuildBatches(todo) {
-		builds := make([]config.Build, len(batch))
-		for k, j := range batch {
-			builds[k] = app.Build[j]
-		}
-		// Build progress and failures are reported by the injected BuildFunc
-		// (ui.Activity): a single live line, full log only on failure. Logging
-		// build start/end here too would duplicate that.
-		refs, err := buildFn(ctx, app.Name, builds)
-		if err != nil {
-			// Re-dirty everything not yet built this run: the failed batch and
-			// any later batches. Successful earlier batches keep their tags.
-			r.failed = unbuilt(todo, r.built)
-			return r
-		}
-		for k, j := range batch {
-			tag := build.Tag(refs[k])
-			r.built[j] = tag
-			tags[j] = tag
-		}
+	built, err := BuildAll(ctx, app, todo, rn.buildFn, rn.maxParallel)
+	// Successful batches keep their tags even on a partial failure; only the
+	// rest re-dirty (a failed sync later must not re-trigger a good build).
+	for j, tag := range built {
+		r.built[j] = tag
+		tags[j] = tag
+	}
+	if err != nil {
+		r.failed = unbuilt(todo, r.built)
+		return r
 	}
 
-	res, err := renderer.Render(app.Path)
+	res, err := rn.renderer.Render(app.Path)
 	if err != nil {
-		log.Error(err, "render failed", "app", app.Name)
+		rn.log.Error(err, "render failed", "app", app.Name)
 		return r
 	}
 	if len(tags) > 0 {
@@ -344,19 +358,30 @@ func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo
 			}
 		}
 		if err := res.SetImages(images); err != nil {
-			log.Error(err, "injecting built image tags failed", "app", app.Name)
+			rn.log.Error(err, "injecting built image tags failed", "app", app.Name)
 			return r
 		}
 	}
-	stats, err := syncFn(ctx, app.Name, res.Objects)
+	stats, err := rn.syncFn(ctx, app.Name, res.Objects)
 	if err != nil {
-		log.Error(err, "sync failed", "app", app.Name)
+		rn.log.Error(err, "sync failed", "app", app.Name)
 		return r
 	}
-	// Concise, consistent with `ksync sync`'s summary: app, what actually
-	// changed (applied=0 on a no-op), and a human-rounded duration. pruned and
-	// failed are shown only when nonzero so the common line stays short.
-	kv := []any{"app", app.Name, "applied", stats.Applied}
+	rn.reportSync(app.Name, stats, time.Since(started))
+	r.ok = true
+	return r
+}
+
+// reportSync emits one app's completed-sync line: the injected ship-emoji
+// renderer when set (matching `ksync sync`'s apply line), else a structured
+// log record. applied=0 on a no-op; pruned/failed/degraded show only when
+// nonzero so the common line stays short.
+func (rn *runner) reportSync(app string, stats SyncStats, took time.Duration) {
+	if rn.report != nil {
+		rn.report(app, stats, took)
+		return
+	}
+	kv := []any{"app", app, "applied", stats.Applied}
 	if stats.Pruned > 0 {
 		kv = append(kv, "pruned", stats.Pruned)
 	}
@@ -366,10 +391,65 @@ func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo
 	if stats.Degraded > 0 {
 		kv = append(kv, "degraded", stats.Degraded)
 	}
-	kv = append(kv, "took", ui.Duration(time.Since(started)))
-	log.Info("synced", kv...)
-	r.ok = true
-	return r
+	kv = append(kv, "took", ui.Duration(took))
+	rn.log.Info("synced", kv...)
+}
+
+// BuildAll builds every batch of app's dirty entries (todo), up to maxParallel
+// batches at once (<=0 means no limit), and returns each built entry's dev tag.
+// A batch — one bulk group command or one ungrouped entry — is independent of
+// the others, so they build concurrently: a single multi-image app's builds no
+// longer run one at a time, which is the bulk of its change→applied latency.
+// On the first batch failure it cancels the rest and returns the tags built so
+// far plus that error, so the caller re-dirties only what did not build. Build
+// progress and failures are surfaced by the injected BuildFunc (ui.Activity:
+// one live line per batch, full log only on failure).
+func BuildAll(ctx context.Context, app config.App, todo []int, buildFn BuildFunc, maxParallel int) (map[int]string, error) {
+	batches := app.BuildBatches(todo)
+	built := make(map[int]string, len(todo))
+	if len(batches) == 0 {
+		return built, nil
+	}
+	var sem chan struct{}
+	if maxParallel > 0 {
+		sem = make(chan struct{}, maxParallel)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	for _, batch := range batches {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				defer func() { <-sem }()
+			}
+			builds := make([]config.Build, len(batch))
+			for k, j := range batch {
+				builds[k] = app.Build[j]
+			}
+			refs, err := buildFn(ctx, app.Name, builds)
+			if err != nil {
+				errOnce.Do(func() { firstErr = err; cancel() })
+				return
+			}
+			mu.Lock()
+			for k, j := range batch {
+				built[j] = build.Tag(refs[k])
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return built, firstErr
 }
 
 // keySep joins app name and build-entry index into one mapping key; NUL can

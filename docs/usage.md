@@ -448,15 +448,23 @@ Flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `-debounce` | `200ms` | Quiet period after the last change before re-rendering. |
-| `-max-parallel` | CPU cores | How many apps may build, render, and sync at the same time. `0` removes the limit. |
+| `-max-parallel` | CPU cores | How many apps may build, render, and sync at once — and, within one app, how many of its independent images may build at once. `0` removes the limit. |
 | `-prune` | `true` | Delete tracked resources that you removed from the files. |
 | `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
 | `-v` | `false` | Verbose: also log every detected file change. |
 
-Each sync logs one line — `synced  app=api-b applied=2 took=0.9s`. `applied` is what actually
-changed (so a no-op edit reads `applied=0`); `pruned`, `failed`, and `degraded` are added only when
-nonzero. `degraded=N` is the same post-sync health check `ksync sync` shows (see below): your edit
-applied, but `N` of the app's resources are broken at runtime.
+Each sync prints the same one-line, ship-emoji summary `ksync sync` does — `✓ 🚢 api-b  2 applied,
+0.9s` — led by the 🚢 apply icon, with the `✓`/`⚠`/`✗` status symbol (applied & healthy / applied
+but a resource is degraded / a sync task failed) and the per-sync time. `applied` is what actually
+changed (a no-op edit reads `0 applied`); `pruned`, `failed`, and `degraded` show only when nonzero
+(`degraded` is the post-sync health check described under `ksync sync` below).
+
+A whole-stack `watch` frames its **startup convergence** exactly like a `sync` run — a titled
+**Plan**, a live **Summary** footer pinned to the bottom while the apps come up, and the committed
+Summary block once every app has synced once (see the `ksync sync` example below) — then settles
+into the streaming loop, where each change prints just its build/apply lines. A stuck app keeps the
+footer open rather than committing a false "done". A single-app `watch` (e.g. `watch duo`) skips the
+framing and streams the one line, like a single-app sync.
 
 ### `ksync sync` — one-time sync
 
@@ -470,7 +478,9 @@ starting `watch`. Independent apps build, render, and apply **concurrently** (up
 `-max-parallel`, default the host's CPU-core count, `0` for no limit); the `needs` DAG still holds a dependent app until the apps it
 needs have finished — the same model `watch` uses, so a one-time sync is never slower than the
 loop's startup pass. Apps with `build` entries build their images first, so what gets applied
-always points at images that exist.
+always points at images that exist — and an app's own independent images (its ungrouped entries and
+each build group) build concurrently too, also up to `-max-parallel`, so a multi-image app is not
+bottlenecked on building one at a time.
 
 Each app prints a one-line summary, led by the 🚢 apply icon (so it reads distinctly from a 🔨
 build line). The status symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠`

@@ -244,7 +244,7 @@ func runSync(args []string) error {
 		})
 	}
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
-		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, app, *prune, *timeout)
+		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, app, *prune, *timeout, *maxParallel)
 		if err != nil {
 			return err
 		}
@@ -280,23 +280,21 @@ func runSync(args []string) error {
 // degraded resources. Build precedes render so the applied manifests always
 // reference images that exist in the local daemon. The caller prints the
 // summary line — after tallying — so the live footer's count tracks the ✓ lines.
-func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, app config.App, prune bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
+func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, app config.App, prune bool, timeout time.Duration, maxParallel int) ([]common.ResourceSyncResult, []string, error) {
 	all := make([]int, len(app.Build))
 	for i := range all {
 		all[i] = i
 	}
-	images := make([]render.Image, 0, len(app.Build))
-	for _, batch := range app.BuildBatches(all) {
-		builds := make([]config.Build, len(batch))
-		for k, j := range batch {
-			builds[k] = app.Build[j]
-		}
-		refs, err := buildFn(ctx, app.Name, builds)
-		if err != nil {
-			return nil, nil, fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
-		}
-		for k, j := range batch {
-			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: build.Tag(refs[k])})
+	// Independent build batches run concurrently (up to maxParallel), the same
+	// fan-out the watch loop uses — a multi-image app's builds are not serialized.
+	built, err := loop.BuildAll(ctx, app, all, buildFn, maxParallel)
+	if err != nil {
+		return nil, nil, fmt.Errorf("app %s: build failed: %w", app.Name, err)
+	}
+	images := make([]render.Image, 0, len(built))
+	for j := range app.Build {
+		if tag, ok := built[j]; ok {
+			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: tag})
 		}
 	}
 	res, err := r.Render(app.Path)
@@ -636,6 +634,7 @@ func syncStats(results []common.ResourceSyncResult) loop.SyncStats {
 func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string) {
 	var b strings.Builder
 	s := syncStats(results)
+	s.Degraded = len(degraded)
 	for _, res := range results {
 		if res.Status == common.ResultCodeSyncFailed {
 			fmt.Fprintf(&b, "  %s %s: %s\n", c.Red("✗"), res.ResourceKey.String(), res.Message)
@@ -647,7 +646,20 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	for _, line := range degraded {
 		fmt.Fprintf(&b, "  %s %s\n", c.Yellow("⚠"), c.Dim(line))
 	}
+	// took=0: a one-shot sync leaves timing to the Summary block's Duration row.
+	fmt.Fprintf(&b, "%s\n", appSyncLine(c, app, s, 0))
+	// Through ui.WriteLine so the line erases any in-flight build spinner before
+	// printing — apps sync concurrently, so a summary can land mid-spinner.
+	ui.WriteLine(w, b.String())
+}
 
+// appSyncLine renders one app's completed-sync status line in the ship-emoji
+// style shared by `ksync sync` and the watch loop: a health symbol (✓ applied &
+// healthy · ⚠ applied but a resource is degraded · ✗ a sync task failed), the
+// 🚢 apply icon (distinct from a 🔨 build line), the app name, and a dim summary
+// of what changed. took, when > 0, is appended — the watch loop shows per-sync
+// timing; one-shot sync leaves it 0.
+func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration) string {
 	parts := []string{fmt.Sprintf("%d applied", s.Applied)}
 	if s.Pruned > 0 {
 		parts = append(parts, fmt.Sprintf("%d pruned", s.Pruned))
@@ -655,22 +667,20 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	if s.Failed > 0 {
 		parts = append(parts, c.Red(fmt.Sprintf("%d failed", s.Failed)))
 	}
-	if len(degraded) > 0 {
-		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", len(degraded))))
+	if s.Degraded > 0 {
+		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", s.Degraded)))
 	}
-	// ✓ applied & healthy · ⚠ applied but a resource is degraded · ✗ a sync task failed.
+	if took > 0 {
+		parts = append(parts, ui.Duration(took))
+	}
 	symbol := c.Green("✓")
-	if len(degraded) > 0 {
+	if s.Degraded > 0 {
 		symbol = c.Yellow("⚠")
 	}
 	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
-	// The 🚢 icon marks this as an apply line, distinct from a 🔨 build line.
-	fmt.Fprintf(&b, "%s %s %s  %s\n", symbol, iconSync, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
-	// Through ui.WriteLine so the line erases any in-flight build spinner before
-	// printing — apps sync concurrently, so a summary can land mid-spinner.
-	ui.WriteLine(w, b.String())
+	return fmt.Sprintf("%s %s %s  %s", symbol, iconSync, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
 }
 
 // printPlan opens a whole-stack sync with a titled overview: how many apps, the

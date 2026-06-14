@@ -363,6 +363,149 @@ func TestRun_BuildGroupBatchesDirtyMembers(t *testing.T) {
 	}
 }
 
+// concBuilder reports the peak number of build calls in flight at once. Each
+// call blocks at a barrier until `want` calls are concurrent (proving the
+// batches build in parallel) or a short timeout elapses (so a sequential
+// regression still returns, having only ever reached a peak of 1).
+type concBuilder struct {
+	want     int
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+	n        int
+	gate     chan struct{}
+}
+
+func newConcBuilder(want int) *concBuilder {
+	return &concBuilder{want: want, gate: make(chan struct{})}
+}
+
+func (c *concBuilder) build(ctx context.Context, _ string, builds []config.Build) ([]string, error) {
+	c.mu.Lock()
+	c.inFlight++
+	if c.inFlight > c.peak {
+		c.peak = c.inFlight
+	}
+	if c.inFlight >= c.want {
+		select {
+		case <-c.gate:
+		default:
+			close(c.gate)
+		}
+	}
+	c.mu.Unlock()
+
+	select {
+	case <-c.gate:
+	case <-time.After(time.Second):
+	case <-ctx.Done():
+	}
+
+	c.mu.Lock()
+	c.inFlight--
+	c.n++
+	n := c.n
+	c.mu.Unlock()
+	refs := make([]string, len(builds))
+	for i, b := range builds {
+		refs[i] = fmt.Sprintf("%s:ksync-%012d", b.Image, n)
+	}
+	return refs, nil
+}
+
+func (c *concBuilder) peakConcurrency() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peak
+}
+
+// multiBuildApp writes an app with n ungrouped build entries (n independent
+// batches), each image deployed by its own manifest.
+func multiBuildApp(t *testing.T, base string, n int) config.App {
+	t.Helper()
+	src := filepath.Join(base, "src")
+	writeFile(t, filepath.Join(src, "main.go"), "package main\n")
+	names := []string{"api-b", "api-c", "api-d", "api-e", "api-f"}
+	var resources []string
+	var builds []config.Build
+	for i := 0; i < n; i++ {
+		img := names[i]
+		writeFile(t, filepath.Join(base, "app1", img+".yaml"), oneDeploymentYAML(img))
+		resources = append(resources, "  - "+img+".yaml")
+		builds = append(builds, config.Build{Image: img, Context: src})
+	}
+	writeFile(t, filepath.Join(base, "app1", "kustomization.yaml"), "resources:\n"+strings.Join(resources, "\n")+"\n")
+	return config.App{Name: "app1", Path: filepath.Join(base, "app1"), Build: builds}
+}
+
+func oneDeploymentYAML(img string) string {
+	return fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[1]s
+spec:
+  selector:
+    matchLabels: {app: %[1]s}
+  template:
+    metadata:
+      labels: {app: %[1]s}
+    spec:
+      containers:
+        - name: api
+          image: %[1]s:main
+`, img)
+}
+
+func TestRun_BuildsIndependentBatchesConcurrently(t *testing.T) {
+	tmp := t.TempDir()
+	app := multiBuildApp(t, tmp, 3)
+	builder := newConcBuilder(3)
+	sink := &objectSink{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, MaxParallel: 4, Build: builder.build})
+	}()
+
+	// All three batches must be building at once; sequential builds would peak
+	// at one. (The barrier releases as soon as the third call arrives.)
+	waitFor(t, func() bool { return len(sink.synced()) == 3 })
+	if got := builder.peakConcurrency(); got < 3 {
+		t.Errorf("peak concurrent builds = %d, want 3 (independent batches must build in parallel)", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// TestRun_BuildConcurrencyRespectsMaxParallel proves the per-app cap holds: with
+// MaxParallel=2 and three batches, at most two build at once.
+func TestRun_BuildConcurrencyRespectsMaxParallel(t *testing.T) {
+	tmp := t.TempDir()
+	app := multiBuildApp(t, tmp, 3)
+	// want=2: the barrier releases at two concurrent builds, so the third runs
+	// after one frees a slot — peak must never exceed the cap.
+	builder := newConcBuilder(2)
+	sink := &objectSink{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, MaxParallel: 2, Build: builder.build})
+	}()
+
+	waitFor(t, func() bool { return len(sink.synced()) == 3 })
+	if got := builder.peakConcurrency(); got > 2 {
+		t.Errorf("peak concurrent builds = %d, want <= 2 (MaxParallel cap)", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestRun_DockerignoredChangeDoesNotRebuild(t *testing.T) {
 	tmp := t.TempDir()
 	app := buildApp(t, tmp)
