@@ -39,8 +39,10 @@ type SyncFunc func(ctx context.Context, app string, objects []*unstructured.Unst
 // BuildFunc produces the images of one build batch and returns their full
 // content-addressed refs in the same order. A batch is either a single
 // ungrouped entry or all the dirty members of one build group (built by one
-// bulk command); the loop forms the batches via App.BuildBatches.
-type BuildFunc func(ctx context.Context, builds []config.Build) ([]string, error)
+// bulk command); the loop forms the batches via App.BuildBatches. app is the
+// owning app's name — a group can be built per-app (each app owns a subset of
+// its images), so it is what distinguishes the two apps' progress lines.
+type BuildFunc func(ctx context.Context, app string, builds []config.Build) ([]string, error)
 
 // Options tune the loop; zero values get sensible watch-mode defaults.
 type Options struct {
@@ -315,7 +317,7 @@ func runApp(ctx context.Context, renderer *render.Renderer, app config.App, todo
 		// Build progress and failures are reported by the injected BuildFunc
 		// (ui.Activity): a single live line, full log only on failure. Logging
 		// build start/end here too would duplicate that.
-		refs, err := buildFn(ctx, builds)
+		refs, err := buildFn(ctx, app.Name, builds)
 		if err != nil {
 			// Re-dirty everything not yet built this run: the failed batch and
 			// any later batches. Successful earlier batches keep their tags.

@@ -158,16 +158,18 @@ spec:
 
 type fakeBuilder struct {
 	mu     sync.Mutex
-	count  int // total images built (sum over batches)
-	calls  int // buildFn invocations (batches)
-	maxLen int // largest batch seen
-	fail   int // fail this many leading images
+	count  int      // total images built (sum over batches)
+	calls  int      // buildFn invocations (batches)
+	maxLen int      // largest batch seen
+	fail   int      // fail this many leading images
+	apps   []string // owning app name per invocation, in call order
 }
 
-func (f *fakeBuilder) build(_ context.Context, builds []config.Build) ([]string, error) {
+func (f *fakeBuilder) build(_ context.Context, app string, builds []config.Build) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	f.apps = append(f.apps, app)
 	if len(builds) > f.maxLen {
 		f.maxLen = len(builds)
 	}
@@ -240,6 +242,14 @@ func TestRun_BuildsOnStartupAndInjectsTheTag(t *testing.T) {
 	waitFor(t, func() bool { return len(sink.synced()) == 1 })
 	if got := sink.synced()[0]; got != "api-b:ksync-000000000001" {
 		t.Errorf("synced image = %q, want the injected dev tag", got)
+	}
+	// The owning app name reaches the build func — it is what disambiguates a
+	// group built per-app in the progress label ("build <group> (<app>)").
+	builder.mu.Lock()
+	gotApp := builder.apps[0]
+	builder.mu.Unlock()
+	if gotApp != "app1" {
+		t.Errorf("build func got app %q, want %q", gotApp, "app1")
 	}
 
 	// A manifest-only change re-syncs with the remembered tag, no rebuild.

@@ -259,7 +259,7 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 		for k, j := range batch {
 			builds[k] = app.Build[j]
 		}
-		refs, err := buildFn(ctx, builds)
+		refs, err := buildFn(ctx, app.Name, builds)
 		if err != nil {
 			return loop.SyncStats{}, fmt.Errorf("app %s: building %s: %w", app.Name, builds[0].Image, err)
 		}
@@ -448,16 +448,20 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 	// so re-importing it is pure waste — and on k3d/kind that waste is seconds.
 	var mu sync.Mutex
 	imported := map[string]bool{}
-	return func(ctx context.Context, builds []config.Build) ([]string, error) {
+	return func(ctx context.Context, app string, builds []config.Build) ([]string, error) {
 		if len(builds) == 0 {
 			return nil, nil
 		}
 		var refs []string
 		// A batch is either one ungrouped entry or all the dirty members of one
 		// group; builds[0].Group tells which, since the loop never mixes them.
+		// A group is built per-app (each app owns a subset of its images), so two
+		// apps both build e.g. "rust-services"; the app suffix keeps their
+		// progress lines distinct. An ungrouped label is the image name, already
+		// unique, so it needs no suffix.
 		label := imageName(builds[0].Image)
 		if group := builds[0].Group; group != "" {
-			label = group
+			label = group + " (" + app + ")"
 			act := ui.StartActivity(w, colors, "build "+label)
 			builder := &build.Builder{Output: act}
 			r, err := builder.BuildGroup(ctx, groupCmd[group], builds)
