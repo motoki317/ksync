@@ -439,8 +439,11 @@ ksync sync api-b
 ```
 
 Renders and applies once, then exits. Useful for scripts, or to converge the cluster before
-starting `watch`. Apps are synced in dependency order (`needs` first). Apps with `build`
-entries build their images first, so what gets applied always points at images that exist.
+starting `watch`. Independent apps build, render, and apply **concurrently** (up to
+`-max-parallel`, default `4`); the `needs` DAG still holds a dependent app until the apps it
+needs have finished — the same model `watch` uses, so a one-time sync is never slower than the
+loop's startup pass. Apps with `build` entries build their images first, so what gets applied
+always points at images that exist.
 
 Each app prints a one-line summary; only failures are listed in detail:
 
@@ -448,7 +451,7 @@ Each app prints a one-line summary; only failures are listed in detail:
 ✓ api-b  3 applied, 1 pruned
 ```
 
-It takes the same `-timeout` (default `5m`) and `-v` flags as `watch`. The timeout matters
+It takes the same `-timeout` (default `5m`), `-max-parallel`, and `-v` flags as `watch`. The timeout matters
 most here: a one-time sync waits for the app to become healthy, so without it a pod stuck in
 `ErrImagePull` would hang `ksync sync` forever. On timeout the sync fails and names the
 resources that never became healthy, so you know where to look.
