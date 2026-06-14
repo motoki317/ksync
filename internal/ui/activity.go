@@ -13,12 +13,6 @@ import (
 	"golang.org/x/term"
 )
 
-// liveLine serializes the single in-place spinner line: only one Activity may
-// own the terminal's current line at a time. Concurrent builds (watch mode,
-// multiple apps) that cannot take it fall back to plain start/done lines, so
-// their output never clobbers the spinner.
-var liveLine sync.Mutex
-
 // spinnerFrames is the braille spinner cycle, matching what tools like nix and
 // buildkit use for a compact "working" indicator.
 var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -31,28 +25,26 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\r`)
 // docker build, an image import). It is the io.Writer the command's combined
 // output is wired to: instead of streaming every line, it shows a single
 // updating line — spinner, label, the latest output line, elapsed — and keeps
-// the full output buffered, printing it only if the command fails.
+// the full output buffered, printing it only if the command fails. Concurrent
+// activities each get their own line; liveTerm renders them as one block (see
+// console.go), so several builds animate at once instead of one blocking the
+// rest.
 type Activity struct {
 	w     io.Writer
 	c     Colors
 	label string
 	now   func() time.Time
 	start time.Time
-	live  bool // owns the in-place spinner line
-	fd    int
+	track *track // non-nil when animating on a terminal; nil on the plain path
 
-	mu       sync.Mutex
-	buf      bytes.Buffer
-	lastLine string
-
-	stop    chan struct{}
-	stopped chan struct{}
+	mu  sync.Mutex
+	buf bytes.Buffer
 }
 
 // StartActivity begins reporting progress for label (e.g. "build ns-auth-dev").
-// When w is an interactive terminal and no other Activity holds the live line,
-// it animates a single in-place line; otherwise it prints a plain start line
-// and a matching done line, so piped/redirected/concurrent output stays sane.
+// On an interactive terminal it adds an animated line to liveTerm's live block;
+// otherwise it prints a plain start line (and a matching done line), so
+// piped/redirected output stays sane.
 func StartActivity(w io.Writer, c Colors, label string) *Activity {
 	return startActivity(w, c, label, time.Now)
 }
@@ -61,33 +53,39 @@ func startActivity(w io.Writer, c Colors, label string, now func() time.Time) *A
 	a := &Activity{w: w, c: c, label: label, now: now, start: now()}
 	f, ok := w.(*os.File)
 	isTTY := ok && c.Enabled() && term.IsTerminal(int(f.Fd()))
-	if isTTY && liveLine.TryLock() {
-		a.live = true
-		a.fd = int(f.Fd())
-		a.stop = make(chan struct{})
-		a.stopped = make(chan struct{})
-		go a.animate()
+	if isTTY {
+		fd := int(f.Fd())
+		a.track = &track{
+			label:  label,
+			colors: c,
+			start:  a.start,
+			now:    now,
+			cols:   func() int { return cols(fd) },
+		}
+		liveTerm.addTrack(w, a.track)
 		return a
 	}
-	// Non-live (piped, or another Activity owns the spinner): a plain start line,
-	// routed through term so it erases that other spinner before printing.
+	// Non-interactive: a plain start line, through liveTerm so it interleaves
+	// correctly with any other plain output.
 	liveTerm.line(w, fmt.Sprintf("%s %s%s\n", c.Cyan("•"), label, c.Dim(" …")))
 	return a
 }
 
-// Write captures the command's output and remembers its latest non-empty line
-// for the live display. It never blocks the command and never errors.
+// Write captures the command's output and feeds its latest non-empty line to
+// the live line. It never blocks the command and never errors.
 func (a *Activity) Write(p []byte) (int, error) {
 	a.mu.Lock()
 	a.buf.Write(p)
-	if line := lastNonEmptyLine(p); line != "" {
-		a.lastLine = sanitizeLine(line)
-	}
 	a.mu.Unlock()
+	if a.track != nil {
+		if line := lastNonEmptyLine(p); line != "" {
+			a.track.setTail(sanitizeLine(line))
+		}
+	}
 	return len(p), nil
 }
 
-// Done finishes the activity: it stops the spinner, prints a one-line ✓/✗
+// Done finishes the activity: it removes the live line, prints a one-line ✓/✗
 // summary with the elapsed time, and — only on failure — the full captured
 // output so the developer can see what went wrong.
 func (a *Activity) Done(err error) {
@@ -104,57 +102,16 @@ func (a *Activity) Done(err error) {
 	} else {
 		fmt.Fprintf(&b, "%s %s  %s\n", a.c.Green("✓"), a.label, elapsed)
 	}
-	// Stop animating before printing so no frame lands after the done line, then
-	// emit through liveTerm: it erases the frozen spinner frame and writes the
-	// summary as one atomic line. Release the live-line lock only afterwards, so
-	// a queued Activity cannot start drawing into our half-written output.
-	if a.live {
-		close(a.stop)
-		<-a.stopped
-		liveTerm.line(a.w, b.String())
-		liveLine.Unlock()
+	if a.track != nil {
+		liveTerm.finishTrack(a.track, b.String())
 		return
 	}
 	liveTerm.line(a.w, b.String())
 }
 
-func (a *Activity) animate() {
-	defer close(a.stopped)
-	t := time.NewTicker(100 * time.Millisecond)
-	defer t.Stop()
-	for i := 0; ; i++ {
-		select {
-		case <-a.stop:
-			return
-		case <-t.C:
-			a.draw(spinnerFrames[i%len(spinnerFrames)])
-		}
-	}
-}
-
-func (a *Activity) draw(frame rune) {
-	a.mu.Lock()
-	tail := a.lastLine
-	a.mu.Unlock()
-
-	elapsed := Duration(a.now().Sub(a.start))
-	meta := elapsed
-	if tail != "" {
-		meta = tail + "  " + elapsed
-	}
-	// Only the meta tail is truncated; the spinner+label prefix is short and
-	// always shown. Width math uses plain rune counts (no color codes yet).
-	prefix := string(frame) + " " + a.label + "  "
-	if room := a.cols() - len([]rune(prefix)); room > 0 {
-		meta = truncateRunes(meta, room)
-	}
-	// liveTerm.spinnerFrame prepends the erase sequence and records the line as dirty
-	// so a concurrent status line clears it before printing.
-	liveTerm.spinnerFrame(a.w, fmt.Sprintf("%s %s  %s", a.c.Cyan(string(frame)), a.c.Bold(a.label), a.c.Dim(meta)))
-}
-
-func (a *Activity) cols() int {
-	if w, _, err := term.GetSize(a.fd); err == nil && w > 0 {
+// cols reports the terminal width for fd, or 80 if it cannot be determined.
+func cols(fd int) int {
+	if w, _, err := term.GetSize(fd); err == nil && w > 0 {
 		return w
 	}
 	return 80
