@@ -106,6 +106,23 @@ func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, []string, erro
 	return cfg, names, nil
 }
 
+// resolveContext picks the kubectl context a run targets — the explicit
+// --context override, else the kubeconfig's current-context — and enforces
+// ksync.yaml's allowedContexts. This is the safety gate: a current-context
+// pointing at a cluster the config does not list is refused, not used.
+func resolveContext(cfg *config.Config, override string) (string, error) {
+	current, err := engine.CurrentContext()
+	if err != nil {
+		return "", err
+	}
+	return cfg.SelectContext(override, current)
+}
+
+// contextFlag registers the shared --context flag on a subcommand's flag set.
+func contextFlag(fs *flag.FlagSet) *string {
+	return fs.String("context", "", "kubectl context to target; must be listed in allowedContexts (default: current-context)")
+}
+
 // parseInterspersed parses fs allowing flags and positional args (app names) in
 // any order — `sync app -timeout 5m` works as well as `sync -timeout 5m app`.
 // Go's flag package stops at the first positional, which surprises developers
@@ -129,6 +146,7 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 func runRender(args []string) error {
 	fs := flag.NewFlagSet("render", flag.ContinueOnError)
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -137,7 +155,11 @@ func runRender(args []string) error {
 	if err != nil {
 		return err
 	}
-	renderOpts, cleanup, err := renderOptions(cfg.Context, *offline)
+	kubeContext, err := resolveContext(cfg, *kctx)
+	if err != nil {
+		return err
+	}
+	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
 		return err
 	}
@@ -190,6 +212,7 @@ func runSync(args []string) error {
 	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -199,33 +222,37 @@ func runSync(args []string) error {
 		return err
 	}
 	apps = config.SortByNeeds(apps)
+	kubeContext, err := resolveContext(cfg, *kctx)
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	_, engineLog := setupLogging(*verbose)
-	eng, err := engine.New(cfg.Context, engineLog)
+	eng, err := engine.New(kubeContext, engineLog)
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
 
 	out := ui.NewColors(os.Stderr)
-	renderOpts, cleanup, err := renderOptions(cfg.Context, *offline)
+	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 	r := render.New(renderOpts)
 	prog := newProgress(os.Stderr, out, apps)
-	buildFn := makeBuildFunc(cfg, prog)
+	buildFn := makeBuildFunc(cfg, prog, kubeContext)
 	// A whole-stack run gets a plan up front, the summary block pinned live to
 	// the bottom (updating as apps finish), and the same block committed on
 	// completion; a single-app run already says it all in its one line.
 	multi := len(apps) > 1
 	nameW := nameColWidth(apps)
 	if multi {
-		printPlan(os.Stderr, out, apps, cfg.Context)
+		printPlan(os.Stderr, out, apps, kubeContext)
 	}
 	// Independent apps build/render/sync concurrently; the needs DAG still
 	// serializes a dependent after the apps it needs (watch mode already does
@@ -407,6 +434,7 @@ func runWatch(args []string) error {
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -415,17 +443,21 @@ func runWatch(args []string) error {
 	if err != nil {
 		return err
 	}
+	kubeContext, err := resolveContext(cfg, *kctx)
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	log, engineLog := setupLogging(*verbose)
-	renderOpts, cleanup, err := renderOptions(cfg.Context, *offline)
+	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	eng, err := engine.New(cfg.Context, engineLog)
+	eng, err := engine.New(kubeContext, engineLog)
 	if err != nil {
 		return err
 	}
@@ -459,13 +491,13 @@ func runWatch(args []string) error {
 	// Summary footer, then the committed Summary once every app has synced once
 	// — after which incremental syncs just stream. Stop the footer on exit so a
 	// Ctrl-C mid-convergence never leaves it pinned.
-	reporter := startWatchReporter(os.Stderr, out, prog, apps, cfg.Context)
+	reporter := startWatchReporter(os.Stderr, out, prog, apps, kubeContext)
 	defer reporter.stop()
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
 		Render:      renderOpts,
-		Build:       makeBuildFunc(cfg, prog),
+		Build:       makeBuildFunc(cfg, prog, kubeContext),
 		Log:         log,
 		Report:      reporter.report,
 		// A build/render failure (or a failed sync) ends the run without a Report;
@@ -646,7 +678,7 @@ func (p *progress) finish(app, summary string) {
 // pipeline; the verbose command log is shown only when the command fails. The
 // load step is a no-op unless the config sets imageLoad (daemon-shared clusters
 // need nothing).
-func makeBuildFunc(cfg *config.Config, prog *progress) loop.BuildFunc {
+func makeBuildFunc(cfg *config.Config, prog *progress, kubeContext string) loop.BuildFunc {
 	groupCmd := make(map[string]string, len(cfg.BuildGroups))
 	for _, g := range cfg.BuildGroups {
 		groupCmd[g.Name] = g.Command
@@ -663,7 +695,7 @@ func makeBuildFunc(cfg *config.Config, prog *progress) loop.BuildFunc {
 	// unless the config marks the command concurrency-safe (allowParallel) —
 	// k3d image import, the unsafe default case, races on a shared tools node +
 	// tarball and silently drops images (see build.Loader).
-	loader := &build.Loader{Command: cfg.ImageLoad.Command, Parallel: cfg.ImageLoad.Parallel()}
+	loader := &build.Loader{Command: cfg.ImageLoad.Command, Parallel: cfg.ImageLoad.Parallel(), KubeContext: kubeContext}
 	return func(ctx context.Context, app string, builds []config.Build) ([]string, error) {
 		if len(builds) == 0 {
 			return nil, nil
@@ -682,10 +714,10 @@ func makeBuildFunc(cfg *config.Config, prog *progress) loop.BuildFunc {
 		var refs []string
 		var err error
 		if group := builds[0].Group; group != "" {
-			refs, err = (&build.Builder{Output: stage}).BuildGroup(ctx, groupCmd[group], builds)
+			refs, err = (&build.Builder{Output: stage, KubeContext: kubeContext}).BuildGroup(ctx, groupCmd[group], builds)
 		} else {
 			var ref string
-			ref, err = (&build.Builder{Output: stage}).Build(ctx, builds[0])
+			ref, err = (&build.Builder{Output: stage, KubeContext: kubeContext}).Build(ctx, builds[0])
 			refs = []string{ref}
 		}
 		stage.Done(err)
@@ -736,11 +768,16 @@ func runDestroy(args []string) error {
 	fs := flag.NewFlagSet("destroy", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "confirm deleting every tracked resource of the selected apps")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app's resources to delete (0 = no limit)")
+	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
 	}
 	apps, err := cfg.Select(names)
+	if err != nil {
+		return err
+	}
+	kubeContext, err := resolveContext(cfg, *kctx)
 	if err != nil {
 		return err
 	}
@@ -759,7 +796,7 @@ func runDestroy(args []string) error {
 	defer stop()
 
 	_, engineLog := setupLogging(false)
-	eng, err := engine.New(cfg.Context, engineLog)
+	eng, err := engine.New(kubeContext, engineLog)
 	if err != nil {
 		return err
 	}

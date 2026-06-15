@@ -38,8 +38,10 @@ re-litigate only with new evidence):
 
 - `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / destroy`
   implemented; `diff` still a stub).
-- `internal/config` — ksync.yaml model: app list, single explicit kubectl context (the safety
-  model), optional top-level `imageLoad` (`command` + `allowParallel`, for separate-image-store
+- `internal/config` — ksync.yaml model: app list, `allowedContexts` allowlist (the safety model —
+  the run targets the current-context or `--context`, but it must be a member; `SelectContext`
+  enforces this, so one config can serve several interchangeable dev clusters yet never act on an
+  unlisted one), optional top-level `imageLoad` (`command` + `allowParallel`, for separate-image-store
   clusters; `allowParallel` defaults true, set false for non-concurrency-safe loaders like
   `k3d image import`), per-app default namespace (ArgoCD destination.namespace parity), `needs`
   DAG, per-app `build` entries (image/context + optional dockerfile/watch/watchIgnore/command);

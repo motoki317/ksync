@@ -8,8 +8,11 @@ import (
 )
 
 // RESTConfig builds a client config for exactly the named kubectl context.
-// There is deliberately no empty-means-current-context convenience: the
-// explicit name in ksync.yaml is the whole context-safety model.
+// There is deliberately no empty-means-current-context convenience here: the
+// caller resolves the context (current-context or --context) and validates it
+// against ksync.yaml's allowedContexts before reaching this point, so an empty
+// name is a programming error, not a fall-through to whatever happens to be
+// current.
 func RESTConfig(kubeContext string) (*rest.Config, error) {
 	if kubeContext == "" {
 		return nil, errors.New("kube context must be explicitly named (ksync never uses the current-context)")
@@ -29,4 +32,19 @@ func RESTConfig(kubeContext string) (*rest.Config, error) {
 	cfg.QPS = 50
 	cfg.Burst = 100
 	return cfg, nil
+}
+
+// CurrentContext returns the kubeconfig's current-context (empty if none is
+// set). ksync uses it as the default target, then enforces ksync.yaml's
+// allowedContexts — so reading current-context here is a convenience for
+// selection, never a license to act on it unchecked.
+func CurrentContext() (string, error) {
+	raw, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	).RawConfig()
+	if err != nil {
+		return "", err
+	}
+	return raw.CurrentContext, nil
 }

@@ -9,7 +9,7 @@ import (
 
 func TestParse_MinimalConfig(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
 `
@@ -17,8 +17,8 @@ apps:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if cfg.Context != "docker-desktop" {
-		t.Errorf("Context = %q, want docker-desktop", cfg.Context)
+	if len(cfg.AllowedContexts) != 1 || cfg.AllowedContexts[0] != "docker-desktop" {
+		t.Errorf("AllowedContexts = %v, want [docker-desktop]", cfg.AllowedContexts)
 	}
 	if len(cfg.Apps) != 1 {
 		t.Fatalf("len(Apps) = %d, want 1", len(cfg.Apps))
@@ -32,9 +32,42 @@ apps:
 	}
 }
 
+func TestSelectContext(t *testing.T) {
+	cfg := &Config{AllowedContexts: []string{"docker-desktop", "k3d-dev"}}
+	cases := []struct {
+		name              string
+		override, current string
+		want              string
+		wantErr           string
+	}{
+		{name: "current in allowlist", current: "k3d-dev", want: "k3d-dev"},
+		{name: "override wins over current", override: "docker-desktop", current: "k3d-dev", want: "docker-desktop"},
+		{name: "override not allowed", override: "prod-cluster", current: "k3d-dev", wantErr: `--context "prod-cluster" is not in allowedContexts`},
+		{name: "current not allowed", current: "prod-cluster", wantErr: `current kubectl context "prod-cluster" is not in allowedContexts`},
+		{name: "nothing selected", wantErr: "no kubectl context selected"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := cfg.SelectContext(c.override, c.current)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SelectContext: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("SelectContext = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestParse_ImageLoadField(t *testing.T) {
 	yml := `
-context: k3d-dev
+allowedContexts: [k3d-dev]
 imageLoad:
   command: k3d image import --cluster dev $KSYNC_IMAGE
   allowParallel: false
@@ -58,7 +91,7 @@ apps:
 // importers opt out with allowParallel: false.
 func TestParse_ImageLoadDefaultsParallel(t *testing.T) {
 	yml := `
-context: k3d-dev
+allowedContexts: [k3d-dev]
 imageLoad:
   command: 'for i in $KSYNC_IMAGES; do docker push "$i"; done'
 apps:
@@ -75,7 +108,7 @@ apps:
 
 func TestParse_ExplicitNameAndNeeds(t *testing.T) {
 	yml := `
-context: k3d-local
+allowedContexts: [k3d-local]
 apps:
   - name: db
     path: apps/postgres
@@ -97,7 +130,7 @@ apps:
 
 func TestParse_NamespaceField(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     namespace: team-a
@@ -117,7 +150,7 @@ apps:
 
 func TestParse_BuildEntryWithEveryField(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -147,7 +180,7 @@ apps:
 
 func TestParse_BuildDefaultsDockerfile(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -165,7 +198,7 @@ apps:
 
 func TestParse_BuildCommandLeavesDockerfileEmpty(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -184,7 +217,7 @@ apps:
 
 func TestParse_BuildGroup(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 buildGroups:
   - name: go-components
     command: docker buildx bake $KSYNC_IMAGES
@@ -271,7 +304,7 @@ func equalBatches(a, b [][]int) bool {
 
 func TestParse_BuildImageWithRegistryPortIsValid(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -291,7 +324,7 @@ func TestParse_BuildValidationErrors(t *testing.T) {
 	}{
 		{
 			name: "build without image",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -301,7 +334,7 @@ apps:
 		},
 		{
 			name: "image with tag",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -312,7 +345,7 @@ apps:
 		},
 		{
 			name: "image with digest",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -323,7 +356,7 @@ apps:
 		},
 		{
 			name: "build without context",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -333,7 +366,7 @@ apps:
 		},
 		{
 			name: "command and dockerfile together",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -346,7 +379,7 @@ apps:
 		},
 		{
 			name: "duplicate image within an app",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -359,7 +392,7 @@ apps:
 		},
 		{
 			name: "duplicate image across apps",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -374,7 +407,7 @@ apps:
 		},
 		{
 			name: "grouped build references unknown group",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -386,7 +419,7 @@ apps:
 		},
 		{
 			name: "grouped build also sets command",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 buildGroups:
   - name: g
     command: bake
@@ -402,7 +435,7 @@ apps:
 		},
 		{
 			name: "build group without command",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 buildGroups:
   - name: g
 apps:
@@ -416,7 +449,7 @@ apps:
 		},
 		{
 			name: "duplicate build group name",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 buildGroups:
   - name: g
     command: bake
@@ -433,7 +466,7 @@ apps:
 		},
 		{
 			name: "build group with no members",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 buildGroups:
   - name: g
     command: bake
@@ -447,7 +480,7 @@ apps:
 		},
 		{
 			name: "build group mixes contexts",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 buildGroups:
   - name: g
     command: bake
@@ -481,7 +514,7 @@ apps:
 
 func TestParse_AbsolutePathKeptAsIs(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: /elsewhere/apps/shop
 `
@@ -496,7 +529,7 @@ apps:
 
 func TestParse_RejectsUnknownFields(t *testing.T) {
 	yml := `
-context: docker-desktop
+allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     need: [db]
@@ -514,23 +547,28 @@ func TestParse_ValidationErrors(t *testing.T) {
 		wantErr []string // substrings that must all appear in the error
 	}{
 		{
-			name:    "missing context",
+			name:    "missing allowedContexts",
 			yml:     "apps:\n  - path: apps/api-b\n",
-			wantErr: []string{"context is required"},
+			wantErr: []string{"allowedContexts must list at least one"},
+		},
+		{
+			name:    "empty allowedContexts entry",
+			yml:     "allowedContexts: [\"\"]\napps:\n  - path: apps/api-b\n",
+			wantErr: []string{"allowedContexts[0]", "empty context name"},
 		},
 		{
 			name:    "no apps",
-			yml:     "context: docker-desktop\n",
+			yml:     "allowedContexts: [docker-desktop]\n",
 			wantErr: []string{"at least one app"},
 		},
 		{
 			name:    "app without path",
-			yml:     "context: docker-desktop\napps:\n  - name: api-b\n",
+			yml:     "allowedContexts: [docker-desktop]\napps:\n  - name: api-b\n",
 			wantErr: []string{"apps[0]", "path is required"},
 		},
 		{
 			name: "invalid namespace",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     namespace: Not_A_Namespace
@@ -539,7 +577,7 @@ apps:
 		},
 		{
 			name: "duplicate explicit names",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - name: api-b
     path: apps/one
@@ -550,7 +588,7 @@ apps:
 		},
 		{
 			name: "duplicate defaulted names",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: team-a/api-b
   - path: team-b/api-b
@@ -559,7 +597,7 @@ apps:
 		},
 		{
 			name: "duplicate paths after cleaning",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - name: one
     path: apps/api-b
@@ -570,7 +608,7 @@ apps:
 		},
 		{
 			name: "name not a valid label value",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - name: -api
     path: apps/api-b
@@ -579,7 +617,7 @@ apps:
 		},
 		{
 			name: "needs references unknown app",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     needs: [ghost]
@@ -588,7 +626,7 @@ apps:
 		},
 		{
 			name: "needs lists the same app twice",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/db
   - path: apps/api-b
@@ -598,7 +636,7 @@ apps:
 		},
 		{
 			name: "self dependency",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     needs: [api-b]
@@ -607,7 +645,7 @@ apps:
 		},
 		{
 			name: "dependency cycle",
-			yml: `context: docker-desktop
+			yml: `allowedContexts: [docker-desktop]
 apps:
   - path: apps/a
     needs: [b]
@@ -645,7 +683,7 @@ apps:
 	if err == nil {
 		t.Fatal("Parse succeeded, want validation errors")
 	}
-	for _, want := range []string{"context is required", "path is required", `unknown app "ghost"`} {
+	for _, want := range []string{"allowedContexts must list at least one", "path is required", `unknown app "ghost"`} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q; all validation errors must be reported at once", err, want)
 		}
@@ -658,7 +696,7 @@ func TestLoad_ResolvesPathsRelativeToConfigFile(t *testing.T) {
 	mustMkdirAll(t, appDir)
 	mustWriteFile(t, filepath.Join(appDir, "kustomization.yaml"), "resources: []\n")
 	cfgPath := filepath.Join(dir, "ksync.yaml")
-	mustWriteFile(t, cfgPath, "context: docker-desktop\napps:\n  - path: apps/api-b\n")
+	mustWriteFile(t, cfgPath, "allowedContexts: [docker-desktop]\napps:\n  - path: apps/api-b\n")
 
 	cfg, err := Load(cfgPath)
 	if err != nil {
@@ -673,7 +711,7 @@ func TestLoad_RejectsAppDirWithoutKustomization(t *testing.T) {
 	dir := t.TempDir()
 	mustMkdirAll(t, filepath.Join(dir, "apps", "api-b"))
 	cfgPath := filepath.Join(dir, "ksync.yaml")
-	mustWriteFile(t, cfgPath, "context: docker-desktop\napps:\n  - path: apps/api-b\n")
+	mustWriteFile(t, cfgPath, "allowedContexts: [docker-desktop]\napps:\n  - path: apps/api-b\n")
 
 	_, err := Load(cfgPath)
 	if err == nil {
@@ -693,7 +731,7 @@ func TestLoad_AcceptsAnyRecognizedKustomizationFileName(t *testing.T) {
 			mustMkdirAll(t, appDir)
 			mustWriteFile(t, filepath.Join(appDir, name), "resources: []\n")
 			cfgPath := filepath.Join(dir, "ksync.yaml")
-			mustWriteFile(t, cfgPath, "context: docker-desktop\napps:\n  - path: apps/api-b\n")
+			mustWriteFile(t, cfgPath, "allowedContexts: [docker-desktop]\napps:\n  - path: apps/api-b\n")
 
 			if _, err := Load(cfgPath); err != nil {
 				t.Fatalf("Load: %v", err)
@@ -705,7 +743,7 @@ func TestLoad_AcceptsAnyRecognizedKustomizationFileName(t *testing.T) {
 func TestLoad_RelativeConfigPathYieldsAbsolutePaths(t *testing.T) {
 	dir := t.TempDir()
 	writeApp(t, dir, "apps/api-b")
-	mustWriteFile(t, filepath.Join(dir, "ksync.yaml"), "context: docker-desktop\napps:\n  - path: apps/api-b\n")
+	mustWriteFile(t, filepath.Join(dir, "ksync.yaml"), "allowedContexts: [docker-desktop]\napps:\n  - path: apps/api-b\n")
 	t.Chdir(dir)
 
 	cfg, err := Load("ksync.yaml")
@@ -721,7 +759,7 @@ func TestLoad_RejectsMissingBuildContextDir(t *testing.T) {
 	dir := t.TempDir()
 	writeApp(t, dir, "apps/api-b")
 	cfgPath := filepath.Join(dir, "ksync.yaml")
-	mustWriteFile(t, cfgPath, `context: docker-desktop
+	mustWriteFile(t, cfgPath, `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -739,7 +777,7 @@ func TestLoad_RejectsMissingDockerfile(t *testing.T) {
 	writeApp(t, dir, "apps/api-b")
 	mustMkdirAll(t, filepath.Join(dir, "src", "api-b"))
 	cfgPath := filepath.Join(dir, "ksync.yaml")
-	mustWriteFile(t, cfgPath, `context: docker-desktop
+	mustWriteFile(t, cfgPath, `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:
@@ -757,7 +795,7 @@ func TestLoad_CommandBuildNeedsNoDockerfile(t *testing.T) {
 	writeApp(t, dir, "apps/api-b")
 	mustMkdirAll(t, filepath.Join(dir, "src", "api-b"))
 	cfgPath := filepath.Join(dir, "ksync.yaml")
-	mustWriteFile(t, cfgPath, `context: docker-desktop
+	mustWriteFile(t, cfgPath, `allowedContexts: [docker-desktop]
 apps:
   - path: apps/api-b
     build:

@@ -38,6 +38,11 @@ type Loader struct {
 	// command that is not concurrency-safe against one cluster (k3d image
 	// import); set it for one that is (registry push).
 	Parallel bool
+	// KubeContext is the selected kubectl context, exported to the command as
+	// $KSYNC_CONTEXT so one imageLoad can branch per target — a no-op for a
+	// daemon-shared cluster, an import/push for a separate-store one. Empty
+	// leaves it unset.
+	KubeContext string
 	// Exec defaults to running real processes.
 	Exec ExecFunc
 
@@ -72,10 +77,10 @@ func (l *Loader) Load(ctx context.Context, out io.Writer, refs []string) error {
 	}
 	// Run in ksync's working directory: load commands target the cluster, not a
 	// build context, so there is no meaningful directory to enter.
-	env := []string{
-		"KSYNC_IMAGE=" + refs[0],
-		"KSYNC_IMAGES=" + strings.Join(refs, "\n"),
-	}
+	env := withContext(l.KubeContext,
+		"KSYNC_IMAGE="+refs[0],
+		"KSYNC_IMAGES="+strings.Join(refs, "\n"),
+	)
 	if err := execFn(ctx, "", env, []string{"sh", "-c", l.Command}, out, out); err != nil {
 		return fmt.Errorf("loading %s into the cluster: %w", strings.Join(refs, ", "), err)
 	}

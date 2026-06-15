@@ -65,10 +65,15 @@ directory. You can choose another file with `-f path/to/file.yaml`.
 A full example:
 
 ```yaml
-# The kubectl context ksync is allowed to use. Required.
-# ksync ONLY ever talks to this context. It never uses your current kubectl
-# context, so it can never touch the wrong cluster by accident.
-context: docker-desktop
+# The kubectl contexts ksync is allowed to use. Required, at least one.
+# ksync targets your current kubectl context (or `--context <name>`), but it
+# MUST be one of these — anything else is refused. So one config can serve
+# several interchangeable dev clusters (here Docker Desktop and a local k3d)
+# while never touching the wrong cluster by accident. To switch targets, either
+# `kubectl config use-context …` or pass `ksync sync --context …`.
+allowedContexts:
+  - docker-desktop
+  - k3d-dev
 
 # Optional. Only for clusters whose image store is separate from your docker
 # daemon (k3d, kind, a remote cluster). command runs once per build batch with
@@ -100,7 +105,7 @@ The fields, one by one:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `context` | yes | The only kubectl context ksync will use. |
+| `allowedContexts` | yes | The kubectl contexts ksync may target (≥1). The run uses the current-context or `--context`; it must be listed here, else it is refused. |
 | `imageLoad.command` | no | Shell command that makes freshly built images visible to the cluster (k3d/kind/remote). Runs once per build batch with `$KSYNC_IMAGES` set (and `$KSYNC_IMAGE` to the first). See "Making built images visible". |
 | `imageLoad.allowParallel` | no | Whether load commands may run concurrently (default `true`). Set `false` for a command that is not concurrency-safe against one cluster — notably `k3d image import`. See "Making built images visible". |
 | `buildGroups` | no | Named bulk-build commands several `build` entries can share, so one `docker buildx bake`/compile produces many images. See "Build groups". |
@@ -372,6 +377,24 @@ imageLoad:
 Use `$KSYNC_IMAGES` (plural) so a build group's images import together; `$KSYNC_IMAGE` (the
 first ref) still works for the single-image case. `$KSYNC_IMAGES` is newline-separated, so an
 unquoted use word-splits into one argument per image.
+
+**One config, several clusters — `$KSYNC_CONTEXT`.** When `allowedContexts` lists more than one
+cluster, the load step must do different things per target: nothing for a shared-daemon Docker
+Desktop, an import for a separate-store cluster. ksync exports the **selected** context as
+`$KSYNC_CONTEXT` to the `imageLoad` command (and to build commands), so one config branches on it
+instead of needing a per-cluster file:
+
+```yaml
+allowedContexts: [docker-desktop, k3d-dev]
+imageLoad:
+  allowParallel: false
+  command: |
+    [ "$KSYNC_CONTEXT" = "docker-desktop" ] && exit 0   # shared daemon — nothing to do
+    k3d image import --cluster dev $KSYNC_IMAGES         # separate store — import
+```
+
+Now `ksync sync` (current context `docker-desktop`) skips the import, and `ksync sync --context
+k3d-dev` runs it — same config, same images.
 
 ksync stays out of the way here on purpose: it has no built-in idea of "k3d" or "kind", so the
 `command` above is exactly what runs — and any other tool or transport works the same way without
@@ -683,9 +706,11 @@ If your charts rely on hooks behaving exactly like `helm install`, check this li
 
 ## Safety model
 
-- ksync talks only to the context named in `ksync.yaml`. There is no flag to override it, and
-  the current kubectl context is never used. A config file checked into a repo can therefore
-  never point a teammate's ksync at the wrong cluster.
+- ksync talks only to a context listed in `ksync.yaml`'s `allowedContexts`. It targets your
+  current kubectl context (or `--context <name>`), but refuses to run if that context is not in
+  the allowlist — so a config checked into a repo can never point a teammate's ksync at an
+  unlisted cluster (production, a colleague's cluster), even if their current-context happens to
+  select it. The allowlist is what lets one config serve several interchangeable dev clusters.
 - Prune and destroy only touch resources labeled with `ksync.dev/app`.
 - `destroy` requires `-yes`.
 

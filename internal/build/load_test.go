@@ -37,6 +37,24 @@ func TestLoader_RunsCommandWithRef(t *testing.T) {
 	}
 }
 
+// The selected kubectl context is exported as $KSYNC_CONTEXT so one imageLoad
+// command can branch per target (no-op for a shared daemon, import for a
+// separate store).
+func TestLoader_ExportsKubeContext(t *testing.T) {
+	var calls []call
+	exec := func(_ context.Context, dir string, env []string, argv []string, _, _ io.Writer) error {
+		calls = append(calls, call{dir: dir, env: env, argv: argv})
+		return nil
+	}
+	l := &Loader{Command: "true", KubeContext: "k3d-dev", Exec: exec}
+	if err := l.Load(context.Background(), io.Discard, []string{"img:ksync-1"}); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := "KSYNC_CONTEXT=k3d-dev"; !slices.Contains(calls[0].env, want) {
+		t.Errorf("env = %v, missing %q", calls[0].env, want)
+	}
+}
+
 // A batch of refs loads in one invocation with $KSYNC_IMAGES newline-separated,
 // so an unquoted use word-splits into one argument per image.
 func TestLoader_BulkSetsImagesEnv(t *testing.T) {

@@ -28,6 +28,10 @@ type Builder struct {
 	// Output receives build progress; defaults to os.Stderr (docker itself
 	// reports progress on stderr).
 	Output io.Writer
+	// KubeContext is the selected kubectl context, exported to command builds as
+	// $KSYNC_CONTEXT so one config can branch per target cluster (e.g. choose a
+	// platform). Empty leaves it unset.
+	KubeContext string
 }
 
 // tempTag is where command builds must leave their result ($KSYNC_IMAGE); the
@@ -58,7 +62,7 @@ func (bd *Builder) Build(ctx context.Context, b config.Build) (string, error) {
 			return "", fmt.Errorf("building %s: %w", b.Image, err)
 		}
 	} else {
-		env := []string{"KSYNC_IMAGE=" + tmpRef}
+		env := withContext(bd.KubeContext, "KSYNC_IMAGE="+tmpRef)
 		if err := execFn(ctx, b.Context, env, []string{"sh", "-c", b.Command}, out, out); err != nil {
 			return "", fmt.Errorf("build command for %s: %w", b.Image, err)
 		}
@@ -96,7 +100,7 @@ func (bd *Builder) BuildGroup(ctx context.Context, command string, builds []conf
 	for i, b := range builds {
 		tmpRefs[i] = b.Image + ":" + tempTag
 	}
-	env := []string{"KSYNC_IMAGES=" + strings.Join(tmpRefs, "\n")}
+	env := withContext(bd.KubeContext, "KSYNC_IMAGES="+strings.Join(tmpRefs, "\n"))
 	if err := execFn(ctx, dir, env, []string{"sh", "-c", command}, out, out); err != nil {
 		return nil, fmt.Errorf("build group command: %w", err)
 	}
@@ -140,6 +144,16 @@ func contentTag(ctx context.Context, execFn ExecFunc, dir, image, tmpRef string,
 		return "", fmt.Errorf("tagging %s: %w", ref, err)
 	}
 	return ref, nil
+}
+
+// withContext appends KSYNC_CONTEXT=<kubeContext> to base when a context is
+// set, so build/group/load commands all expose the selected cluster the same
+// way they expose KSYNC_IMAGE(S). Empty context leaves the env untouched.
+func withContext(kubeContext string, base ...string) []string {
+	if kubeContext == "" {
+		return base
+	}
+	return append(base, "KSYNC_CONTEXT="+kubeContext)
 }
 
 // Tag extracts the tag part of a ref Build returned — what callers feed to

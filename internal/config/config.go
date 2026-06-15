@@ -18,10 +18,14 @@ import (
 
 // Config is the validated content of a ksync.yaml.
 type Config struct {
-	// Context is the kubectl context ksync targets. It is the only context
-	// ksync will ever use — there is deliberately no fallback to the ambient
-	// current-context, so a config can never accidentally point at production.
-	Context string `json:"context"`
+	// AllowedContexts is the allowlist of kubectl contexts ksync may target. The
+	// context actually used is the current-context (or an explicit --context),
+	// but it MUST be a member of this list — there is deliberately no implicit
+	// fallback to an arbitrary current-context, so a config can never act on a
+	// cluster it does not name. The allowlist is what lets one ksync.yaml serve
+	// several interchangeable dev clusters (e.g. a shared-daemon Docker Desktop
+	// and a separate-store local k3s) while still refusing production.
+	AllowedContexts []string `json:"allowedContexts"`
 	// ImageLoad makes freshly built images visible to a cluster whose image
 	// store is separate from the local docker daemon (k3d, kind, a remote
 	// registry). Omit it for daemon-shared clusters (Docker Desktop).
@@ -216,8 +220,13 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	}
 
 	var errs []error
-	if cfg.Context == "" {
-		errs = append(errs, errors.New("context is required"))
+	if len(cfg.AllowedContexts) == 0 {
+		errs = append(errs, errors.New("allowedContexts must list at least one kubectl context"))
+	}
+	for i, c := range cfg.AllowedContexts {
+		if strings.TrimSpace(c) == "" {
+			errs = append(errs, fmt.Errorf("allowedContexts[%d]: empty context name", i))
+		}
 	}
 	if len(cfg.Apps) == 0 {
 		errs = append(errs, errors.New("at least one app is required"))
@@ -370,6 +379,30 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 
 // Select returns the apps with the given names in request order, or all apps
 // in declaration order when names is empty.
+// SelectContext resolves which kubectl context a run targets and enforces the
+// allowlist. override is the explicit --context flag ("" if unset); current is
+// the kubeconfig's current-context ("" if none). The override wins; otherwise
+// the current-context is used. The result must be a member of AllowedContexts,
+// or an error naming the allowed set is returned — this is the whole safety
+// model, so a stray current-context pointing at production is refused rather
+// than silently used.
+func (c *Config) SelectContext(override, current string) (string, error) {
+	target, source := override, "--context"
+	if target == "" {
+		target, source = current, "current kubectl context"
+	}
+	allowed := strings.Join(c.AllowedContexts, ", ")
+	if target == "" {
+		return "", fmt.Errorf("no kubectl context selected: set a current-context or pass --context (allowed: %s)", allowed)
+	}
+	for _, a := range c.AllowedContexts {
+		if a == target {
+			return target, nil
+		}
+	}
+	return "", fmt.Errorf("%s %q is not in allowedContexts (%s)", source, target, allowed)
+}
+
 func (c *Config) Select(names []string) ([]App, error) {
 	if len(names) == 0 {
 		return c.Apps, nil
