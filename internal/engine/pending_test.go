@@ -66,6 +66,59 @@ func TestPendingLines_ExcludesHooks(t *testing.T) {
 	}
 }
 
+// A failed hook (a PostSync Job that hit its backoff limit) must re-run on the
+// next sync even though its source no longer diffs — otherwise it lingers
+// failed forever and a `needs` edge gated on it is never satisfied. A succeeded
+// hook, an absent (delete-policy-removed) one, and a degraded *non*-hook must
+// NOT trigger a re-run: the first two are the idempotent fast path, the last is
+// handled by the health gate, not the hook machinery.
+func TestHasDegradedHook(t *testing.T) {
+	degradedHook := hookPod("shop", "migrate", "Failed")        // Failed pod → Degraded
+	healthyHook := hookPod("shop", "migrate-ok", "Succeeded")   // Succeeded → Healthy
+	degradedPlain := podObj("api-b", "crashloop", "Failed", "") // Degraded but not a hook
+
+	key := func(o *unstructured.Unstructured) kube.ResourceKey { return kube.GetResourceKey(o) }
+
+	cases := []struct {
+		name   string
+		target []*unstructured.Unstructured
+		live   map[kube.ResourceKey]*unstructured.Unstructured
+		want   bool
+	}{
+		{
+			name:   "degraded hook present",
+			target: []*unstructured.Unstructured{degradedHook},
+			live:   map[kube.ResourceKey]*unstructured.Unstructured{key(degradedHook): degradedHook},
+			want:   true,
+		},
+		{
+			name:   "succeeded hook present",
+			target: []*unstructured.Unstructured{healthyHook},
+			live:   map[kube.ResourceKey]*unstructured.Unstructured{key(healthyHook): healthyHook},
+			want:   false,
+		},
+		{
+			name:   "hook absent (deleted after running)",
+			target: []*unstructured.Unstructured{degradedHook},
+			live:   map[kube.ResourceKey]*unstructured.Unstructured{},
+			want:   false,
+		},
+		{
+			name:   "degraded non-hook is not a hook re-run trigger",
+			target: []*unstructured.Unstructured{degradedPlain},
+			live:   map[kube.ResourceKey]*unstructured.Unstructured{key(degradedPlain): degradedPlain},
+			want:   false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasDegradedHook(c.target, c.live); got != c.want {
+				t.Errorf("hasDegradedHook = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 // Convergence: every non-hook target present and Healthy → no pending lines, so
 // the gate returns and the sync completes.
 func TestPendingLines_EmptyWhenAllHealthy(t *testing.T) {

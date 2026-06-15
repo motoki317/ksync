@@ -79,7 +79,10 @@ re-litigate only with new evidence):
   reference, the latter bare/untracked so prune never touches it; ADR
   20260614-ensure-referenced-namespaces). After apply, a **health gate** blocks until every
   non-hook resource is Healthy (or `--timeout`), so a completed `Sync` means deployed-and-healthy
-  and a `needs` edge waits for the dependency to actually serve (ADR 20260614-sync-health-gate).
+  and a `needs` edge waits for the dependency to actually serve (ADR 20260614-sync-health-gate). A
+  no-diff sync skips hooks, **except** a currently-Degraded hook (re-run so a transiently-failed
+  PostSync Job self-heals) or `--force` (re-run every hook, ArgoCD manual-sync parity; ADR
+  20260616-hook-rerun-on-failure).
 - `internal/loop` — the watch-mode event loop tying the above together; cluster and docker
   sides injected as SyncFunc/BuildFunc so it tests without either. Builds run per dirty
   (app, entry) before render; manifest-only edits never invoke docker.

@@ -39,6 +39,13 @@ type SyncOptions struct {
 	// parity): gitops-engine stamps it on target objects that set none, and
 	// when non-empty the namespace itself is created on sync if missing.
 	Namespace string
+	// Force re-runs hooks even when the rendered manifests are unchanged. A
+	// no-diff sync normally skips hooks (matching gitops-engine), so a PostSync
+	// Job that already ran is not re-run; Force overrides that, re-running every
+	// hook the way ArgoCD's manual sync does — the escape hatch for re-applying a
+	// release whose source did not change. A failed hook is re-run regardless of
+	// this flag (see the skipHooks decision in Sync).
+	Force bool
 	// OnWait, when set, is called once per poll while the post-apply health gate
 	// is still waiting, with the resources not yet Healthy. It drives a live
 	// "waiting for health" progress line; it is never called once the app has
@@ -96,6 +103,18 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 	// latter is what makes the wait correct: once a hook is created its source
 	// diff goes quiet, and re-deciding skipHooks per iteration would drop the
 	// still-running hook and report success early.
+	//
+	// Two cases override the "no diff → skip" rule and re-run hooks even when the
+	// manifests are unchanged:
+	//   - Force: the operator asked for an unconditional re-run (ArgoCD's manual
+	//     sync semantics) — re-apply a release whose source did not change.
+	//   - a hook is currently Degraded: a PostSync Job that failed (a transient
+	//     502, a backoff-limit hit) would otherwise linger failed forever, since
+	//     its source no longer diffs. Re-running it (BeforeHookCreation deletes
+	//     the stale Job and recreates it) retries the failure, which is what makes
+	//     a `needs` edge trustworthy — a dependency's hook must actually succeed,
+	//     not just have run once. A *succeeded* hook still diffs quiet and is not
+	//     re-run, so the idempotent no-op fast path is unchanged.
 	skipHooks := false
 	firstReconcile := true
 	for {
@@ -109,7 +128,7 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 			return results, fmt.Errorf("diffing %q: %w", app, err)
 		}
 		if firstReconcile {
-			skipHooks = !diffRes.Modified
+			skipHooks = !opts.Force && !diffRes.Modified && !hasDegradedHook(target, live)
 			firstReconcile = false
 		}
 
@@ -279,6 +298,35 @@ func pendingLines(target []*unstructured.Unstructured, lives map[kube.ResourceKe
 	}
 	sort.Strings(pending)
 	return pending
+}
+
+// hasDegradedHook reports whether any hook in the target set has a live object
+// that is currently Degraded — a PostSync Job that failed or hit its backoff
+// limit. It is what lets Sync re-run a failed hook on an otherwise no-diff sync:
+// the hook's own source stops diffing once it exists, so without this a failure
+// would never retry. Keyed by the target hook's resource key against the live
+// map (the same GetManagedLiveObjs result the diff uses), so it costs no extra
+// API calls. A hook that is absent (deleted by its delete policy) or
+// Healthy/Progressing is not degraded and does not trigger a re-run — only a
+// genuinely-broken one does, keeping the idempotent no-op fast path intact.
+func hasDegradedHook(target []*unstructured.Unstructured, live map[kube.ResourceKey]*unstructured.Unstructured) bool {
+	for _, t := range target {
+		if !hook.IsHook(t) {
+			continue
+		}
+		obj := live[kube.GetResourceKey(t)]
+		if obj == nil {
+			continue
+		}
+		h, err := health.GetResourceHealth(obj, nil)
+		if err != nil || h == nil {
+			continue
+		}
+		if h.Status == health.HealthStatusDegraded {
+			return true
+		}
+	}
+	return false
 }
 
 // unhealthyManaged returns one line per managed live resource whose health is

@@ -208,6 +208,7 @@ func setupLogging(verbose bool) (app, engineLog logr.Logger) {
 func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
+	force := fs.Bool("force", false, "re-run hooks even when manifests are unchanged (re-applies PostSync Jobs; a failed hook is retried regardless)")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
 	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
@@ -277,7 +278,7 @@ func runSync(args []string) error {
 		// end-to-end span the watch loop reports on its 🚢 line. Captured per
 		// invocation since apps run concurrently.
 		start := time.Now()
-		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, prog, app, *prune, *timeout, *maxParallel)
+		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, prog, app, *prune, *force, *timeout, *maxParallel)
 		if err != nil {
 			prog.finish(app.Name, "") // remove the live group; the error is returned and printed at the top level
 			return err
@@ -316,7 +317,7 @@ func runSync(args []string) error {
 // reference images that exist in the local daemon. The build/import rows and the
 // deploy row land in the app's pipeline; the caller commits it after tallying so
 // the live footer's count tracks the committed lines.
-func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, prog *progress, app config.App, prune bool, timeout time.Duration, maxParallel int) ([]common.ResourceSyncResult, []string, error) {
+func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, prog *progress, app config.App, prune, force bool, timeout time.Duration, maxParallel int) ([]common.ResourceSyncResult, []string, error) {
 	all := make([]int, len(app.Build))
 	for i := range all {
 		all[i] = i
@@ -346,7 +347,7 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 	deploy.Start()
 	syncCtx, cancel := withTimeout(ctx, timeout)
 	defer cancel()
-	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace, OnWait: deployWait(deploy)})
+	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Force: force, Namespace: app.Namespace, OnWait: deployWait(deploy)})
 	deploy.Done(err)
 	if err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)

@@ -558,6 +558,20 @@ crash-looping on a missing external prerequisite) blocks until `-timeout` and th
 resources still not healthy — so a broken deploy surfaces instead of passing as `✓ applied`. An
 already-healthy re-sync returns immediately (the wait finds nothing pending).
 
+**Hooks and re-running them.** A no-change sync skips hooks, so a PostSync Job that already ran is
+not re-run — the fast path stays a quick `0 applied`. Two cases override that: a hook whose Job is
+currently **failed** (Degraded — it hit its backoff limit) is re-run on the next sync, so a
+transient failure (an upstream blip while a provisioning Job ran) self-heals rather than leaving a
+dependent stuck on a side-effect that never happened; and `--force` re-runs **every** hook even
+when nothing changed (ArgoCD's manual-sync semantics). Use `--force` to re-apply a release whose
+source did not change, or to recover a hook that failed and whose Job has since been cleaned up
+(absent, so the automatic failed-hook re-run cannot see it):
+
+```bash
+ksync sync --force            # re-run all hooks for the synced apps, diff or no diff
+ksync sync --force sistema    # …scoped to one app and what it needs
+```
+
 If an app's resources reference namespaces it does not own (a chart that fans RBAC out across other
 apps' namespaces, say), ksync creates those namespaces if missing — bare and untracked, so prune
 never touches them and the app that owns one adopts it on its own sync. The common single-namespace
@@ -621,7 +635,8 @@ from going higher. But apps also spend time building images (docker) and waiting
 mostly idle for the CPU; when those dominate, `-max-parallel 0` (no limit) or a value above your
 core count can still shorten the run.
 
-It takes the same `-timeout` (default `5m`), `-max-parallel`, and `-v` flags as `watch`. The timeout matters
+It takes the same `-timeout` (default `5m`), `-max-parallel`, and `-v` flags as `watch`, plus
+`--force` (re-run hooks even with no diff, above). The timeout matters
 most here: a one-time sync waits for the app to become healthy, so without it a pod stuck in
 `ErrImagePull` would hang `ksync sync` forever. On timeout the sync fails and names the
 resources that never became healthy, so you know where to look.
