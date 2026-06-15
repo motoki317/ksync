@@ -33,7 +33,7 @@ apps:
 }
 
 func TestSelectContext(t *testing.T) {
-	cfg := &Config{AllowedContexts: []string{"docker-desktop", "k3d-dev"}}
+	cfg := &Config{AllowedContexts: []string{"docker-desktop", "k3d-dev", "k3s-*"}}
 	cases := []struct {
 		name              string
 		override, current string
@@ -42,6 +42,9 @@ func TestSelectContext(t *testing.T) {
 	}{
 		{name: "current in allowlist", current: "k3d-dev", want: "k3d-dev"},
 		{name: "override wins over current", override: "docker-desktop", current: "k3d-dev", want: "docker-desktop"},
+		{name: "glob matches current", current: "k3s-feature-a", want: "k3s-feature-a"},
+		{name: "glob matches override", override: "k3s-feature-b", current: "k3d-dev", want: "k3s-feature-b"},
+		{name: "glob is anchored, no partial match", current: "prod-k3s-x", wantErr: `current kubectl context "prod-k3s-x" is not in allowedContexts`},
 		{name: "override not allowed", override: "prod-cluster", current: "k3d-dev", wantErr: `--context "prod-cluster" is not in allowedContexts`},
 		{name: "current not allowed", current: "prod-cluster", wantErr: `current kubectl context "prod-cluster" is not in allowedContexts`},
 		{name: "nothing selected", wantErr: "no kubectl context selected"},
@@ -555,6 +558,11 @@ func TestParse_ValidationErrors(t *testing.T) {
 			name:    "empty allowedContexts entry",
 			yml:     "allowedContexts: [\"\"]\napps:\n  - path: apps/api-b\n",
 			wantErr: []string{"allowedContexts[0]", "empty context name"},
+		},
+		{
+			name:    "malformed glob in allowedContexts",
+			yml:     "allowedContexts: [\"k3s-[\"]\napps:\n  - path: apps/api-b\n",
+			wantErr: []string{"allowedContexts[0]", "invalid glob pattern"},
 		},
 		{
 			name:    "no apps",

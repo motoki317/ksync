@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -20,11 +21,18 @@ import (
 type Config struct {
 	// AllowedContexts is the allowlist of kubectl contexts ksync may target. The
 	// context actually used is the current-context (or an explicit --context),
-	// but it MUST be a member of this list — there is deliberately no implicit
+	// but it MUST match an entry here — there is deliberately no implicit
 	// fallback to an arbitrary current-context, so a config can never act on a
 	// cluster it does not name. The allowlist is what lets one ksync.yaml serve
 	// several interchangeable dev clusters (e.g. a shared-daemon Docker Desktop
 	// and a separate-store local k3s) while still refusing production.
+	//
+	// Each entry is a shell-style glob (path.Match: `*`, `?`, `[…]`); a name with
+	// no metacharacters matches exactly. A glob lets one entry cover a family of
+	// clusters whose context names are not known up front — per-worktree/per-branch
+	// microVMs named `k3s-feature-a`, `k3s-feature-b`, … all matched by `k3s-*`.
+	// Globs only widen the allowlist, so keep them tight: `*` matches every
+	// context, which defeats the safety gate.
 	AllowedContexts []string `json:"allowedContexts"`
 	// ImageLoad makes freshly built images visible to a cluster whose image
 	// store is separate from the local docker daemon (k3d, kind, a remote
@@ -226,6 +234,10 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	for i, c := range cfg.AllowedContexts {
 		if strings.TrimSpace(c) == "" {
 			errs = append(errs, fmt.Errorf("allowedContexts[%d]: empty context name", i))
+			continue
+		}
+		if _, err := path.Match(c, ""); err != nil {
+			errs = append(errs, fmt.Errorf("allowedContexts[%d] (%q): invalid glob pattern: %v", i, c, err))
 		}
 	}
 	if len(cfg.Apps) == 0 {
@@ -382,10 +394,10 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 // SelectContext resolves which kubectl context a run targets and enforces the
 // allowlist. override is the explicit --context flag ("" if unset); current is
 // the kubeconfig's current-context ("" if none). The override wins; otherwise
-// the current-context is used. The result must be a member of AllowedContexts,
-// or an error naming the allowed set is returned — this is the whole safety
-// model, so a stray current-context pointing at production is refused rather
-// than silently used.
+// the current-context is used. The result must match an AllowedContexts entry
+// (each a shell-style glob), or an error naming the allowed set is returned —
+// this is the whole safety model, so a stray current-context pointing at
+// production is refused rather than silently used.
 func (c *Config) SelectContext(override, current string) (string, error) {
 	target, source := override, "--context"
 	if target == "" {
@@ -395,8 +407,10 @@ func (c *Config) SelectContext(override, current string) (string, error) {
 	if target == "" {
 		return "", fmt.Errorf("no kubectl context selected: set a current-context or pass --context (allowed: %s)", allowed)
 	}
-	for _, a := range c.AllowedContexts {
-		if a == target {
+	for _, pat := range c.AllowedContexts {
+		// Patterns are validated at parse time; a malformed one here (a Config
+		// built directly, bypassing Parse) just fails to match, never errors the run.
+		if ok, _ := path.Match(pat, target); ok {
 			return target, nil
 		}
 	}

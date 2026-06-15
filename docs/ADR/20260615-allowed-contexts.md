@@ -35,6 +35,15 @@ resolve the *actual* target at run time.
   **`$KSYNC_CONTEXT`**, joining `$KSYNC_IMAGE(S)`. This is what lets one `imageLoad` branch per
   target — a no-op for a shared-daemon cluster, an import/push for a separate-store one — without
   ksync carrying any per-cluster knowledge.
+- Each `allowedContexts` entry is a **shell-style glob** (`path.Match`: `*`, `?`, `[…]`); a name
+  with no metacharacters matches exactly, so this is backward-compatible with literal lists. A glob
+  lets one entry cover a family of clusters whose context names are not known up front — the
+  motivating case is **per-worktree/per-branch microVMs** (`k3s-feature-a`, `k3s-feature-b`, …),
+  several of which run at once, each with a distinct context name, all matched by `k3s-*` without
+  editing the config per branch. Patterns are validated at parse time (a malformed glob is a config
+  error, not a silent non-match). Globs only ever *widen* the allowlist, never narrow it, so the
+  safety property is preserved exactly as long as patterns stay tight; `*` matches everything and
+  defeats the gate, which is on the user (same as listing production explicitly would be).
 
 ## Consequences
 
@@ -48,8 +57,9 @@ resolve the *actual* target at run time.
 
 ## Impact
 
-- `internal/config`: `Context string` → `AllowedContexts []string`; new `SelectContext`; validation
-  requires ≥1 non-empty entry.
+- `internal/config`: `Context string` → `AllowedContexts []string`; new `SelectContext`
+  (glob-matches each entry via `path.Match`); validation requires ≥1 non-empty entry and rejects a
+  malformed glob.
 - `internal/engine`: new `CurrentContext()`; `RESTConfig`'s "never current-context" comment updated
   (the caller now resolves and validates the context before calling).
 - `internal/build`: `Builder`/`Loader` gain `KubeContext`, exported as `$KSYNC_CONTEXT`.

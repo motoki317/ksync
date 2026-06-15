@@ -67,13 +67,20 @@ A full example:
 ```yaml
 # The kubectl contexts ksync is allowed to use. Required, at least one.
 # ksync targets your current kubectl context (or `--context <name>`), but it
-# MUST be one of these — anything else is refused. So one config can serve
+# MUST match one of these — anything else is refused. So one config can serve
 # several interchangeable dev clusters (here Docker Desktop and a local k3d)
 # while never touching the wrong cluster by accident. To switch targets, either
 # `kubectl config use-context …` or pass `ksync sync --context …`.
+#
+# Each entry is a shell-style glob (`*`, `?`, `[…]`); a plain name matches
+# exactly. A glob covers a family of clusters whose names you don't know up
+# front — e.g. per-worktree microVMs `k3s-feature-a`, `k3s-feature-b`, … all
+# matched by `k3s-*`. Globs only widen the allowlist, so keep them tight: `*`
+# would match every context and defeat the safety gate.
 allowedContexts:
   - docker-desktop
   - k3d-dev
+  # - k3s-*                      # any per-worktree microVM context
 
 # Optional. Only for clusters whose image store is separate from your docker
 # daemon (k3d, kind, a remote cluster). command runs once per build batch with
@@ -105,7 +112,7 @@ The fields, one by one:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `allowedContexts` | yes | The kubectl contexts ksync may target (≥1). The run uses the current-context or `--context`; it must be listed here, else it is refused. |
+| `allowedContexts` | yes | The kubectl contexts ksync may target (≥1). The run uses the current-context or `--context`; it must match an entry here (each a shell-style glob, e.g. `k3s-*`), else it is refused. |
 | `imageLoad.command` | no | Shell command that makes freshly built images visible to the cluster (k3d/kind/remote). Runs once per build batch with `$KSYNC_IMAGES` set (and `$KSYNC_IMAGE` to the first). See "Making built images visible". |
 | `imageLoad.allowParallel` | no | Whether load commands may run concurrently (default `true`). Set `false` for a command that is not concurrency-safe against one cluster — notably `k3d image import`. See "Making built images visible". |
 | `buildGroups` | no | Named bulk-build commands several `build` entries can share, so one `docker buildx bake`/compile produces many images. See "Build groups". |
@@ -706,11 +713,13 @@ If your charts rely on hooks behaving exactly like `helm install`, check this li
 
 ## Safety model
 
-- ksync talks only to a context listed in `ksync.yaml`'s `allowedContexts`. It targets your
-  current kubectl context (or `--context <name>`), but refuses to run if that context is not in
-  the allowlist — so a config checked into a repo can never point a teammate's ksync at an
+- ksync talks only to a context matching `ksync.yaml`'s `allowedContexts`. It targets your
+  current kubectl context (or `--context <name>`), but refuses to run if that context matches no
+  allowlist entry — so a config checked into a repo can never point a teammate's ksync at an
   unlisted cluster (production, a colleague's cluster), even if their current-context happens to
   select it. The allowlist is what lets one config serve several interchangeable dev clusters.
+  Entries are shell-style globs (`k3s-*`), which only ever widen the set — keep them tight, since
+  `*` matches every context and so disables this gate.
 - Prune and destroy only touch resources labeled with `ksync.dev/app`.
 - `destroy` requires `-yes`.
 
