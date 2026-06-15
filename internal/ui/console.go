@@ -7,19 +7,18 @@ import (
 	"time"
 )
 
-// liveTerm coordinates all of ksync's human-facing terminal output. Builds and
-// imports run concurrently, so several may be in flight at once; each gets its
-// own animated progress line, and liveTerm renders them together as a block of
-// live lines pinned to the bottom of the terminal. Any ordinary status line (a
-// log record, a per-app summary) is printed *above* that block: liveTerm erases
-// the block, writes the line, then repaints the block below it. One ticker
-// drives the animation for every track. One process-wide instance is enough —
-// all of ksync's human output goes to one terminal (stderr).
+// liveTerm coordinates all of ksync's human-facing terminal output. Apps sync
+// concurrently, so several per-app progress groups (pipelines) may be in flight
+// at once; liveTerm renders them together as a block of live lines pinned to the
+// bottom of the terminal. Any ordinary status line (a committed app summary) is
+// printed *above* that block: liveTerm erases the block, writes the line, then
+// repaints the block below it. One ticker drives the animation for every item.
+// One process-wide instance is enough — all of ksync's human output goes to one
+// terminal (stderr).
 //
-// This is what keeps concurrent builds legible: without it, only one build
-// could own an in-place spinner and the rest sat as static "stuck" lines, and a
-// summary written straight to stderr mid-spinner produced runs like
-// "⠋ build rust-services  0.1s✓ attachment-store  0 applied".
+// This is what keeps concurrent work legible: without it, a summary written
+// straight to stderr mid-spinner produced runs like
+// "⠋ ns-system  0.1s✓ alloy  0 applied".
 //
 // (Named liveTerm, not term, because golang.org/x/term already owns that name.)
 var liveTerm = &console{}
@@ -38,23 +37,33 @@ const cursorUp = "\x1b[1A"
 // absorbs both so a line can never wrap.
 const liveMargin = 2
 
+// blockItem is one unit of the live block: it renders to one or more complete
+// lines for the given spinner frame (not width-limited — the console clamps each
+// line when painting). A pipeline (a per-app progress group) is the only
+// implementation; modeling the block as a list of items keeps the erase/redraw
+// machinery independent of what is being shown.
+type blockItem interface {
+	lines(frame rune) []string
+}
+
 type console struct {
 	mu     sync.Mutex
 	w      io.Writer       // the terminal the live block renders to; set on first use
 	cols   func() int      // terminal width source, bound alongside w
-	tracks []*track        // active build/import lines, top-to-bottom in start order
-	footer func() []string // optional pinned block (the live run summary), rendered below the tracks
+	rows   func() int      // terminal height source, bound alongside w
+	items  []blockItem     // active progress groups, top-to-bottom in start order
+	footer func() []string // optional pinned block (the live run summary), rendered below the items
 	shown  int             // how many block lines are currently on screen
 	frame  int             // spinner frame index, advanced by the ticker
 	ticker *time.Ticker
 	stop   chan struct{}
 }
 
-// attach binds the output stream and its width source the first time the block
-// is used; later tracks/footers on the same terminal reuse them. Caller holds mu.
-func (c *console) attach(w io.Writer, cols func() int) {
+// attach binds the output stream and its size sources the first time the block
+// is used; later items/footers on the same terminal reuse them. Caller holds mu.
+func (c *console) attach(w io.Writer, cols, rows func() int) {
 	if c.w == nil {
-		c.w, c.cols = w, cols
+		c.w, c.cols, c.rows = w, cols, rows
 	}
 }
 
@@ -73,74 +82,49 @@ func (c *console) budget() int {
 	return w - liveMargin
 }
 
-// blockEmpty reports whether nothing is being rendered (no tracks, no footer);
-// the ticker runs exactly while the block is non-empty. Caller holds mu.
-func (c *console) blockEmpty() bool { return len(c.tracks) == 0 && c.footer == nil }
-
-// track is one live progress line, owned by an Activity. Its tail (the latest
-// line of the command's output) is updated as the command runs; liveTerm's
-// ticker reads it and repaints. The line is composed in full here; the console
-// clamps it to the terminal width when painting (see drawBlock), so a track need
-// not know the width.
-type track struct {
-	label  string
-	colors Colors
-	start  time.Time
-	now    func() time.Time
-
-	mu   sync.Mutex
-	tail string
-}
-
-func (t *track) setTail(s string) {
-	t.mu.Lock()
-	t.tail = s
-	t.mu.Unlock()
-}
-
-// render is the track's full single-line content for the given spinner frame.
-// It is not width-limited here; drawBlock clamps it (tail first, since it is
-// rightmost) so the label stays visible until the terminal is very narrow.
-func (t *track) render(frame rune) string {
-	t.mu.Lock()
-	tail := t.tail
-	t.mu.Unlock()
-
-	// The running elapsed gets the same threshold color as the finished line, so
-	// a stage that is taking a while warms from green toward red as you watch it.
-	// The tail (latest output line) stays dim — it is context, not the headline.
-	meta := Elapsed(t.colors, t.now().Sub(t.start))
-	if tail != "" {
-		meta = t.colors.Dim(tail) + "  " + meta
+// rowBudget is the most lines the block may occupy: one short of the terminal
+// height, so a committed line printed above it never scrolls the top row out of
+// view mid-erase. Without a height source (tests, non-terminals) there is no cap
+// — a very tall default — preserving the simple "paint everything" behavior.
+func (c *console) rowBudget() int {
+	if c.rows == nil {
+		return 1 << 30
 	}
-	return fmt.Sprintf("%s %s  %s", t.colors.Cyan(string(frame)), t.colors.Bold(t.label), meta)
+	if n := c.rows(); n > 1 {
+		return n - 1
+	}
+	return 1
 }
 
-// addTrack registers a live line and (re)paints the block. The first track to
-// arrive fixes the output stream and width source and starts the animation
-// ticker.
-func (c *console) addTrack(w io.Writer, cols func() int, t *track) {
+// blockEmpty reports whether nothing is being rendered (no items, no footer);
+// the ticker runs exactly while the block is non-empty. Caller holds mu.
+func (c *console) blockEmpty() bool { return len(c.items) == 0 && c.footer == nil }
+
+// addItem registers a live progress group and (re)paints the block. The first
+// item to arrive fixes the output stream and size sources and starts the
+// animation ticker.
+func (c *console) addItem(w io.Writer, cols, rows func() int, it blockItem) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.attach(w, cols)
+	c.attach(w, cols, rows)
 	c.eraseBlock()
-	c.tracks = append(c.tracks, t)
+	c.items = append(c.items, it)
 	c.drawBlock()
 	c.ensureTicker()
 }
 
-// finishTrack removes a live line, printing its done summary above whatever
-// tracks remain. The ticker stops once the last track is gone.
-func (c *console) finishTrack(t *track, doneLine string) {
+// finishItem removes a live group, printing its committed summary above whatever
+// items remain. The ticker stops once the last item and the footer are gone.
+func (c *console) finishItem(it blockItem, doneLine string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.eraseBlock()
 	if doneLine != "" {
 		_, _ = io.WriteString(c.w, doneLine)
 	}
-	for i, x := range c.tracks {
-		if x == t {
-			c.tracks = append(c.tracks[:i], c.tracks[i+1:]...)
+	for i, x := range c.items {
+		if x == it {
+			c.items = append(c.items[:i], c.items[i+1:]...)
 			break
 		}
 	}
@@ -150,15 +134,28 @@ func (c *console) finishTrack(t *track, doneLine string) {
 	}
 }
 
-// setFooter pins render's lines below the build tracks (the live run summary),
-// re-rendered on every tick. It keeps the block (and the ticker) alive on its
-// own, so the summary stays visible — and updating — after the last build
-// finishes. render is called from the ticker goroutine, so it must be safe to
-// call concurrently with the caller's own state updates.
-func (c *console) setFooter(w io.Writer, cols func() int, render func() []string) {
+// refresh repaints the block in place — used when a group's structure changes
+// (a stage added, a stage state transition) between animation ticks so the
+// change shows immediately. A no-op when nothing is on screen.
+func (c *console) refresh() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.attach(w, cols)
+	if c.shown == 0 && c.blockEmpty() {
+		return
+	}
+	c.eraseBlock()
+	c.drawBlock()
+}
+
+// setFooter pins render's lines below the items (the live run summary),
+// re-rendered on every tick. It keeps the block (and the ticker) alive on its
+// own, so the summary stays visible — and updating — after the last group
+// finishes. render is called from the ticker goroutine, so it must be safe to
+// call concurrently with the caller's own state updates.
+func (c *console) setFooter(w io.Writer, cols, rows func() int, render func() []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.attach(w, cols, rows)
 	c.eraseBlock()
 	c.footer = render
 	c.drawBlock()
@@ -207,18 +204,20 @@ func (c *console) eraseBlock() {
 	c.shown = 0
 }
 
-// drawBlock paints the active tracks top-to-bottom, leaving the cursor at the
-// end of the last line (no trailing newline, so the block stays in place).
-// Caller holds mu and has just erased any prior block.
+// drawBlock paints the active items top-to-bottom followed by the footer,
+// leaving the cursor at the end of the last line (no trailing newline, so the
+// block stays in place). Caller holds mu and has just erased any prior block.
 func (c *console) drawBlock() {
 	frame := spinnerFrames[c.frame%len(spinnerFrames)]
-	lines := make([]string, 0, len(c.tracks)+1)
-	for _, t := range c.tracks {
-		lines = append(lines, t.render(frame))
+	var itemLines []string
+	for _, it := range c.items {
+		itemLines = append(itemLines, it.lines(frame)...)
 	}
+	var footerLines []string
 	if c.footer != nil {
-		lines = append(lines, c.footer()...)
+		footerLines = c.footer()
 	}
+	lines := clampRows(itemLines, footerLines, c.rowBudget())
 	budget := c.budget()
 	for i, s := range lines {
 		if i > 0 {
@@ -227,6 +226,32 @@ func (c *console) drawBlock() {
 		_, _ = io.WriteString(c.w, clampANSI(s, budget))
 	}
 	c.shown = len(lines)
+}
+
+// clampRows bounds the block to maxRows total lines. The footer (the run
+// summary) is always kept; only the item lines are trimmed, with a dim marker
+// standing in for what was dropped — so many concurrent groups can never grow
+// the block past the screen and break the cursor-up erase math.
+func clampRows(itemLines, footerLines []string, maxRows int) []string {
+	total := len(itemLines) + len(footerLines)
+	if total <= maxRows {
+		return append(itemLines, footerLines...)
+	}
+	// Reserve the footer plus one row for the elision marker; show as many of the
+	// leading item lines as the rest allows (possibly none).
+	keep := maxRows - len(footerLines) - 1
+	if keep < 0 {
+		keep = 0
+	}
+	if keep > len(itemLines) {
+		keep = len(itemLines)
+	}
+	dropped := len(itemLines) - keep
+	out := make([]string, 0, keep+1+len(footerLines))
+	out = append(out, itemLines[:keep]...)
+	out = append(out, fmt.Sprintf("    … %d more", dropped))
+	out = append(out, footerLines...)
+	return out
 }
 
 func (c *console) ensureTicker() {
@@ -265,7 +290,7 @@ func (c *console) animate(tk *time.Ticker, stop chan struct{}) {
 }
 
 // WriteLine writes one complete line to w (newline included), coordinated with
-// any in-flight build/import progress so status lines print cleanly above the
-// live block. The command layer uses it for the per-app and run-summary lines
-// it prints while builds may be animating.
+// any in-flight progress so status lines print cleanly above the live block.
+// The command layer uses it for the plan and run-summary lines it prints while
+// pipelines may be animating.
 func WriteLine(w io.Writer, s string) { liveTerm.line(w, s) }

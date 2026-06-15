@@ -186,14 +186,30 @@ non-`latest` tags). Images ksync does not build are never touched.
 Manifest-only edits never run docker: the last built tag is remembered and re-used, so the
 fast manifest loop stays fast.
 
-While a build (or image import) runs, ksync collapses the tool's output into a single live
-line — `⠹ 🔨 api-b  <latest output line>  12s` — and prints a `✓ 🔨 api-b (12s)` when it
-finishes. A leading icon marks the stage so build, image-load, and apply lines never blur
-together: **🔨 build**, **📦 image-load**, **🚢 apply**. When several builds run at once (a
-whole-stack sync), each gets its own live line, stacked together; per-app apply summaries print
-above them as they complete. The full, verbose build log is shown **only if the command fails**,
-so a normal build stays quiet and a broken one gives you everything. (In a pipe or CI, the
-spinner is replaced by plain start/finish lines.)
+While a build or image-load runs, ksync collapses the tool's output into a single live line — its
+latest output line plus elapsed — and shows the full, verbose log **only if the command fails**, so
+a normal build stays quiet and a broken one gives you everything.
+
+Each app's work is grouped under its name as a small live **pipeline**, with every stage named so
+the icon is never the only signal:
+
+```text
+⠹ duo
+    ✓ 🔨 Build   rust-core             1.7s
+    ✓ 🔨 Build   rust-web              1.8s
+    ⠹ 🔨 Build   rust-services (5)     2.3s
+    ⠼ 📦 Import  rust-core             6.0s
+    ○ 🚢 Deploy
+```
+
+The stages run **🔨 Build** → **📦 Import** → **🚢 Deploy** (a group's build shows its member
+count). A stage not yet reached is a dim pending row (`○`), so you can see the deploy waiting while
+the builds run. An app with **no** builds is just its deploy, shown as a single collapsed line
+(`⠼ 🚢 Deploy redis  waiting for health`). Apps sync concurrently, so several pipelines animate at
+once; when one finishes it commits its one-line summary to the scrollback and the rest stay pinned
+(the block is capped to the terminal height, eliding extra groups with a `… N more` line). In a
+pipe or CI there is no live block: each build/import prints a plain finish line and each app its
+one-line summary.
 
 ### `.dockerignore` decides what triggers a rebuild
 
@@ -473,8 +489,8 @@ Flags:
 | `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
 | `-v` | `false` | Verbose: also log every detected file change. |
 
-Each sync prints the same one-line, ship-emoji summary `ksync sync` does — `✓ 🚢 api-b  2 applied,
-0.9s` — led by the 🚢 apply icon, with the `✓`/`⚠`/`✗` status symbol (applied & healthy / applied
+Each sync prints the same one-line summary `ksync sync` does — `✓ 🚢 Deploy api-b  2 applied  0.9s`
+— led by the **🚢 Deploy** stage, with the `✓`/`⚠`/`✗` status symbol (applied & healthy / applied
 but a resource is degraded / a sync task failed) and the per-sync time. `applied` is what actually
 changed (a no-op edit reads `0 applied`); `pruned`, `failed`, and `degraded` show only when nonzero
 (`degraded` is the post-sync health check described under `ksync sync` below).
@@ -506,8 +522,8 @@ An app **finishes only once its resources are Healthy**, not merely applied: aft
 waits for every workload to reach Ready (Deployments rolled out, StatefulSets up, Jobs complete),
 up to `-timeout`. This is what makes `needs` meaningful — a dependent does not start against a
 database whose pod is still pulling its image; it waits until that database is actually serving.
-While an app is in this wait it shows a live `🚢 <app>  waiting for health` line (on a terminal),
-then resolves to its apply line once Ready. An app that cannot become Healthy (e.g. a workload
+While an app is in this wait its **🚢 Deploy** row reads `waiting for health  N not ready` (on a
+terminal), then resolves to its one-line apply summary once Ready. An app that cannot become Healthy (e.g. a workload
 crash-looping on a missing external prerequisite) blocks until `-timeout` and then fails, naming the
 resources still not healthy — so a broken deploy surfaces instead of passing as `✓ applied`. An
 already-healthy re-sync returns immediately (the wait finds nothing pending).
@@ -517,14 +533,16 @@ apps' namespaces, say), ksync creates those namespaces if missing — bare and u
 never touches them and the app that owns one adopts it on its own sync. The common single-namespace
 app is unaffected.
 
-Each app prints a one-line summary, led by the 🚢 apply icon (so it reads distinctly from a 🔨
-build line). The status symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠`
-applied but a resource is broken at runtime, `✗` a sync task failed:
+Each app prints a one-line summary, led by the **🚢 Deploy** stage (so it reads distinctly from a
+🔨 Build line). The status symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠`
+applied but a resource is broken at runtime, `✗` a sync task failed. In a whole-stack run the app
+name is padded to the widest so the `applied` (and, when the counts read alike, the duration)
+column lines up across the apps:
 
 ```text
-✓ 🚢 api-b  3 applied, 1 pruned
+✓ 🚢 Deploy api-b  3 applied, 1 pruned
   ⚠ apps/Deployment/shop/web: Degraded — progress deadline exceeded
-⚠ 🚢 shop  0 applied, 1 degraded
+⚠ 🚢 Deploy shop   0 applied, 1 degraded
 ```
 
 The `⚠` is a post-sync health snapshot: a resource that applied cleanly but is **Degraded** (a
@@ -544,8 +562,12 @@ Plan
   16 apps → docker-desktop
   postgres redis traefik … duo sistema
 
-✓ 🔨 rust-services (duo)  (4.6s)    ← build (🔨) and apply (🚢) lines stream above
-✓ 🚢 duo  0 applied                   the pinned, live-updating block:
+✓ 🚢 Deploy redis     0 applied  0.4s   ← finished apps commit one line to the scrollback,
+✓ 🚢 Deploy postgres  0 applied  0.6s     the name padded so the columns line up
+
+⠹ duo                              ← in-flight apps show their live pipeline,
+    ⠹ 🔨 Build   rust-services (3)  2.3s    grouped under the pinned, updating block:
+    ○ 🚢 Deploy
 
 Summary
       Apps  12/16 synced

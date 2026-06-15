@@ -217,11 +217,13 @@ func runSync(args []string) error {
 	}
 	defer cleanup()
 	r := render.New(renderOpts)
-	buildFn := makeBuildFunc(cfg, os.Stderr, out)
+	prog := newProgress(os.Stderr, out, apps)
+	buildFn := makeBuildFunc(cfg, prog)
 	// A whole-stack run gets a plan up front, the summary block pinned live to
 	// the bottom (updating as apps finish), and the same block committed on
 	// completion; a single-app run already says it all in its one line.
 	multi := len(apps) > 1
+	nameW := nameColWidth(apps)
 	if multi {
 		printPlan(os.Stderr, out, apps, cfg.Context)
 	}
@@ -248,8 +250,9 @@ func runSync(args []string) error {
 		// end-to-end span the watch loop reports on its 🚢 line. Captured per
 		// invocation since apps run concurrently.
 		start := time.Now()
-		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, app, *prune, *timeout, *maxParallel, os.Stderr, out)
+		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, prog, app, *prune, *timeout, *maxParallel)
 		if err != nil {
+			prog.finish(app.Name, "") // remove the live group; the error is returned and printed at the top level
 			return err
 		}
 		took := time.Since(start)
@@ -265,9 +268,9 @@ func runSync(args []string) error {
 			degradedApps = append(degradedApps, app.Name)
 		}
 		mu.Unlock()
-		// Print after tallying so the ✓ line and the footer's bumped count land
-		// together (printSummary repaints the footer as it writes the line).
-		printSummary(os.Stderr, out, app.Name, results, degraded, took)
+		// Commit after tallying so the ✓ line and the footer's bumped count land
+		// together (Finish repaints the footer as it writes the line).
+		prog.finish(app.Name, summaryBlock(out, app.Name, results, degraded, took, nameW))
 		return nil
 	})
 	footer.Stop()
@@ -283,9 +286,10 @@ func runSync(args []string) error {
 // syncOneApp builds (by group batch), renders, injects built image tags, and
 // applies one app, returning the per-resource sync results and the names of any
 // degraded resources. Build precedes render so the applied manifests always
-// reference images that exist in the local daemon. The caller prints the
-// summary line — after tallying — so the live footer's count tracks the ✓ lines.
-func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, app config.App, prune bool, timeout time.Duration, maxParallel int, w io.Writer, c ui.Colors) ([]common.ResourceSyncResult, []string, error) {
+// reference images that exist in the local daemon. The build/import rows and the
+// deploy row land in the app's pipeline; the caller commits it after tallying so
+// the live footer's count tracks the committed lines.
+func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, prog *progress, app config.App, prune bool, timeout time.Duration, maxParallel int) ([]common.ResourceSyncResult, []string, error) {
 	all := make([]int, len(app.Build))
 	for i := range all {
 		all[i] = i
@@ -311,43 +315,25 @@ func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, bui
 			return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 	}
-	onWait, stopWait := waitLine(w, c, app.Name)
-	defer stopWait()
+	deploy := prog.pipeline(app.Name).Deploy()
+	deploy.Start()
 	syncCtx, cancel := withTimeout(ctx, timeout)
 	defer cancel()
-	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace, OnWait: onWait})
+	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Namespace: app.Namespace, OnWait: deployWait(deploy)})
+	deploy.Done(err)
 	if err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	return results, eng.AppDegraded(app.Name, app.Namespace, res.Objects), nil
 }
 
-// waitLine builds the post-apply health-gate progress line for one app: an
-// OnWait callback that lazily starts a single live "waiting for health" spinner
-// on the first poll the gate is still waiting (so an already-healthy sync shows
-// nothing) and updates the not-ready count, plus the stop closure that removes
-// it once the app's Sync returns — leaving the ship-emoji apply line as the sole
-// record. The spinner is TTY-only (inert on a pipe), so redirected output is
-// unaffected.
-func waitLine(w io.Writer, c ui.Colors, app string) (onWait func([]string), stop func()) {
-	var mu sync.Mutex
-	var wait *ui.Waiting
-	onWait = func(pending []string) {
-		mu.Lock()
-		defer mu.Unlock()
-		if wait == nil {
-			wait = ui.StartWaiting(w, c, fmt.Sprintf("%s %s  %s", iconSync, c.Bold(app), c.Dim("waiting for health")))
-		}
-		wait.Status(fmt.Sprintf("%d not ready", len(pending)))
+// deployWait reports the health gate's progress on the app's deploy row: each
+// poll that is still waiting updates the not-ready count. An already-healthy
+// sync never calls back, so the row simply finishes with its elapsed time.
+func deployWait(deploy *ui.Stage) func([]string) {
+	return func(pending []string) {
+		deploy.SetTail(fmt.Sprintf("waiting for health  %d not ready", len(pending)))
 	}
-	stop = func() {
-		mu.Lock()
-		defer mu.Unlock()
-		if wait != nil {
-			wait.Stop()
-		}
-	}
-	return onWait, stop
 }
 
 // runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
@@ -450,15 +436,19 @@ func runWatch(args []string) error {
 	for _, a := range apps {
 		nsByApp[a.Name] = a.Namespace
 	}
+	prog := newProgress(os.Stderr, out, apps)
 	// The loop logs build/sync state itself; the per-app timeout keeps one
 	// stuck workload from holding a scheduler slot forever — on expiry the
-	// sync fails and the scheduler retries it with backoff.
+	// sync fails and the scheduler retries it with backoff. The deploy row of the
+	// app's pipeline shows the health-gate wait; on success the Report hook
+	// commits the group, on failure the OnError hook removes it.
 	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) (loop.SyncStats, error) {
 		ctx, cancel := withTimeout(ctx, *timeout)
 		defer cancel()
-		onWait, stopWait := waitLine(os.Stderr, out, app)
-		defer stopWait()
-		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], OnWait: onWait})
+		deploy := prog.pipeline(app).Deploy()
+		deploy.Start()
+		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], OnWait: deployWait(deploy)})
+		deploy.Done(err)
 		stats := syncStats(results)
 		if err == nil {
 			stats.Degraded = len(eng.AppDegraded(app, nsByApp[app], objs))
@@ -469,16 +459,19 @@ func runWatch(args []string) error {
 	// Summary footer, then the committed Summary once every app has synced once
 	// — after which incremental syncs just stream. Stop the footer on exit so a
 	// Ctrl-C mid-convergence never leaves it pinned.
-	reporter := startWatchReporter(os.Stderr, out, apps, cfg.Context)
+	reporter := startWatchReporter(os.Stderr, out, prog, apps, cfg.Context)
 	defer reporter.stop()
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
 		Render:      renderOpts,
-		Build:       makeBuildFunc(cfg, os.Stderr, out),
+		Build:       makeBuildFunc(cfg, prog),
 		Log:         log,
 		Report:      reporter.report,
-		Resync:      resyncOnEnter(ctx, log),
+		// A build/render failure (or a failed sync) ends the run without a Report;
+		// remove the live group so a retry starts fresh rather than stacking rows.
+		OnError: func(app string, _ error) { prog.finish(app, "") },
+		Resync:  resyncOnEnter(ctx, log),
 	})
 }
 
@@ -516,7 +509,9 @@ func resyncOnEnter(ctx context.Context, log logr.Logger) <-chan struct{} {
 type watchReporter struct {
 	w       io.Writer
 	out     ui.Colors
+	prog    *progress
 	total   int
+	nameW   int
 	started time.Time
 
 	mu           sync.Mutex
@@ -529,8 +524,8 @@ type watchReporter struct {
 
 // startWatchReporter prints the Plan and pins the live Summary footer for a
 // multi-app watch; a single-app watch gets an inert reporter (no Plan/footer).
-func startWatchReporter(w io.Writer, out ui.Colors, apps []config.App, kubeContext string) *watchReporter {
-	r := &watchReporter{w: w, out: out, total: len(apps), started: time.Now(), seen: make(map[string]bool, len(apps))}
+func startWatchReporter(w io.Writer, out ui.Colors, prog *progress, apps []config.App, kubeContext string) *watchReporter {
+	r := &watchReporter{w: w, out: out, prog: prog, total: len(apps), nameW: nameColWidth(apps), started: time.Now(), seen: make(map[string]bool, len(apps))}
 	if r.total <= 1 {
 		return r
 	}
@@ -543,11 +538,12 @@ func startWatchReporter(w io.Writer, out ui.Colors, apps []config.App, kubeConte
 	return r
 }
 
-// report renders one completed app sync (the loop's Report hook) as the shared
-// ship-emoji apply line, and on the run that completes the initial convergence
-// commits the Summary block and removes the footer.
+// report commits one completed app sync (the loop's Report hook): it Finishes
+// the app's pipeline with the shared ship-emoji apply line, and on the run that
+// completes the initial convergence commits the Summary block and removes the
+// footer.
 func (r *watchReporter) report(app string, stats loop.SyncStats, took time.Duration) {
-	line := appSyncLine(r.out, app, stats, took)
+	line := appSyncLine(r.out, app, stats, took, r.nameW)
 	done := false
 	r.mu.Lock()
 	// Tally each app's FIRST sync only, so the Summary reflects one convergence
@@ -570,7 +566,7 @@ func (r *watchReporter) report(app string, stats loop.SyncStats, took time.Durat
 	}
 	r.mu.Unlock()
 
-	ui.WriteLine(r.w, line+"\n")
+	r.prog.finish(app, line+"\n")
 
 	if done {
 		r.footer.Stop()
@@ -586,21 +582,71 @@ func (r *watchReporter) report(app string, stats loop.SyncStats, took time.Durat
 // arrives mid-convergence — without it the footer stays pinned.
 func (r *watchReporter) stop() { r.footer.Stop() }
 
-// Stage icons distinguish the kinds of progress/result lines at a glance — a
-// build vs an image-load vs an apply all otherwise lead with the same ✓. They
-// front each line's label (after the status symbol).
-const (
-	iconBuild  = "🔨" // docker build / bake
-	iconImport = "📦" // imageLoad into the cluster store
-	iconSync   = "🚢" // apply / ship to the cluster
-)
+// progress coordinates the per-app pipelines (ui.Pipeline) that group an app's
+// build, import, and deploy stages under one header. One pipeline per app run:
+// the build hook attaches the build/import rows, the deploy attaches its row,
+// and the orchestrator commits the group with the app's summary line. Keyed by
+// app name — an app never runs concurrently with itself (one-shot sync runs each
+// app's fn once; the watch scheduler serializes per app) — so the key names
+// exactly one live pipeline.
+type progress struct {
+	w      io.Writer
+	colors ui.Colors
+	expand map[string]bool // app -> has builds: show the full tree, never collapse
+
+	mu    sync.Mutex
+	pipes map[string]*ui.Pipeline
+}
+
+func newProgress(w io.Writer, colors ui.Colors, apps []config.App) *progress {
+	expand := make(map[string]bool, len(apps))
+	for _, a := range apps {
+		expand[a.Name] = len(a.Build) > 0
+	}
+	return &progress{w: w, colors: colors, expand: expand, pipes: make(map[string]*ui.Pipeline)}
+}
+
+// pipeline returns the app's live pipeline, creating it (with a pending Deploy
+// row, so the deploy shows as upcoming work while builds run) on first use this
+// run. The build hook and the deploy share the one returned per app.
+func (p *progress) pipeline(app string) *ui.Pipeline {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pipe := p.pipes[app]
+	if pipe == nil {
+		pipe = ui.StartPipeline(p.w, p.colors, app, p.expand[app])
+		pipe.Deploy() // pending; rendered beneath the builds
+		p.pipes[app] = pipe
+	}
+	return pipe
+}
+
+// finish commits the app's pipeline (summary printed in place of the live group,
+// or the group removed silently when summary is empty — a failed run whose error
+// surfaces elsewhere) and clears it so the next run starts fresh.
+func (p *progress) finish(app, summary string) {
+	p.mu.Lock()
+	pipe := p.pipes[app]
+	delete(p.pipes, app)
+	p.mu.Unlock()
+	if pipe != nil {
+		pipe.Finish(summary)
+		return
+	}
+	// No live group for this app (a path that opened none); still surface the
+	// summary above any other live block so a committed line is never lost.
+	if summary != "" {
+		ui.WriteLine(p.w, summary)
+	}
+}
 
 // makeBuildFunc composes building an image with loading it into the cluster, so
-// the same path serves one-shot sync and the watch loop. The load step is a
-// no-op unless the config sets imageLoad (daemon-shared clusters need nothing).
-// Each external command's output is collapsed into a single live progress line
-// (ui.Activity); the verbose build log is shown only when the command fails.
-func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.BuildFunc {
+// the same path serves one-shot sync and the watch loop. Each build batch adds a
+// Build row (and, when the resulting image is fresh, an Import row) to its app's
+// pipeline; the verbose command log is shown only when the command fails. The
+// load step is a no-op unless the config sets imageLoad (daemon-shared clusters
+// need nothing).
+func makeBuildFunc(cfg *config.Config, prog *progress) loop.BuildFunc {
 	groupCmd := make(map[string]string, len(cfg.BuildGroups))
 	for _, g := range cfg.BuildGroups {
 		groupCmd[g.Name] = g.Command
@@ -622,33 +668,29 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 		if len(builds) == 0 {
 			return nil, nil
 		}
-		var refs []string
+		pipe := prog.pipeline(app)
 		// A batch is either one ungrouped entry or all the dirty members of one
-		// group; builds[0].Group tells which, since the loop never mixes them.
-		// A group is built per-app (each app owns a subset of its images), so two
-		// apps both build e.g. "rust-services"; the app suffix keeps their
-		// progress lines distinct. An ungrouped label is the image name, already
-		// unique, so it needs no suffix.
+		// group; builds[0].Group tells which, since the loop never mixes them. The
+		// app heads the group, so an ungrouped label is just the image name and a
+		// group's label is the group name plus its member count (how many images
+		// this one bake produces).
 		label := imageName(builds[0].Image)
 		if group := builds[0].Group; group != "" {
-			label = group + " (" + app + ")"
-			act := ui.StartActivity(w, colors, iconBuild+" "+label)
-			builder := &build.Builder{Output: act}
-			r, err := builder.BuildGroup(ctx, groupCmd[group], builds)
-			act.Done(err)
-			if err != nil {
-				return nil, err
-			}
-			refs = r
+			label = fmt.Sprintf("%s (%d)", group, len(builds))
+		}
+		stage := pipe.Build(label)
+		var refs []string
+		var err error
+		if group := builds[0].Group; group != "" {
+			refs, err = (&build.Builder{Output: stage}).BuildGroup(ctx, groupCmd[group], builds)
 		} else {
-			act := ui.StartActivity(w, colors, iconBuild+" "+label)
-			builder := &build.Builder{Output: act}
-			ref, err := builder.Build(ctx, builds[0])
-			act.Done(err)
-			if err != nil {
-				return nil, err
-			}
+			var ref string
+			ref, err = (&build.Builder{Output: stage}).Build(ctx, builds[0])
 			refs = []string{ref}
+		}
+		stage.Done(err)
+		if err != nil {
+			return nil, err
 		}
 		if cfg.ImageLoad.Command != "" {
 			mu.Lock()
@@ -660,9 +702,9 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 			}
 			mu.Unlock()
 			if len(fresh) > 0 {
-				act := ui.StartActivity(w, colors, iconImport+" "+label)
-				err := loader.Load(ctx, act, fresh)
-				act.Done(err)
+				stage := pipe.Import(label)
+				err := loader.Load(ctx, stage, fresh)
+				stage.Done(err)
 				if err != nil {
 					return nil, err
 				}
@@ -724,6 +766,7 @@ func runDestroy(args []string) error {
 	defer eng.Close()
 
 	out := ui.NewColors(os.Stderr)
+	nameW := nameColWidth(apps)
 	for _, app := range apps {
 		// Destroy is a sync to an empty target set: prune removes everything
 		// the tracking label scopes to this app, and nothing else.
@@ -734,7 +777,7 @@ func runDestroy(args []string) error {
 		if err != nil {
 			return fmt.Errorf("app %s: destroy: %w", app.Name, err)
 		}
-		printSummary(os.Stderr, out, app.Name, results, nil, time.Since(start))
+		printSummary(os.Stderr, out, app.Name, results, nil, time.Since(start), nameW)
 	}
 	return nil
 }
@@ -761,7 +804,11 @@ func syncStats(results []common.ResourceSyncResult) loop.SyncStats {
 	return s
 }
 
-func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string, took time.Duration) {
+// summaryBlock renders one app's committed sync block: the ship-emoji apply
+// line, preceded by a line per failed resource (✗) and per degraded one (⚠). It
+// is what a pipeline commits to scrollback in place of its live group, and what
+// destroy prints directly.
+func summaryBlock(c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string, took time.Duration, nameW int) string {
 	var b strings.Builder
 	s := syncStats(results)
 	s.Degraded = len(degraded)
@@ -776,19 +823,26 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	for _, line := range degraded {
 		fmt.Fprintf(&b, "  %s %s\n", c.Yellow("⚠"), c.Dim(line))
 	}
-	fmt.Fprintf(&b, "%s\n", appSyncLine(c, app, s, took))
-	// Through ui.WriteLine so the line erases any in-flight build spinner before
-	// printing — apps sync concurrently, so a summary can land mid-spinner.
-	ui.WriteLine(w, b.String())
+	fmt.Fprintf(&b, "%s\n", appSyncLine(c, app, s, took, nameW))
+	return b.String()
 }
 
-// appSyncLine renders one app's completed-sync status line in the ship-emoji
-// style shared by `ksync sync` and the watch loop: a health symbol (✓ applied &
-// healthy · ⚠ applied but a resource is degraded · ✗ a sync task failed), the
-// 🚢 apply icon (distinct from a 🔨 build line), the app name, and a dim summary
-// of what changed. took, when > 0, is appended — both `ksync sync` and the watch
-// loop report the per-app end-to-end timing; only a zero duration omits it.
-func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration) string {
+// printSummary writes one app's summary block above any live block (destroy has
+// no pipeline of its own to commit).
+func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string, took time.Duration, nameW int) {
+	ui.WriteLine(w, summaryBlock(c, app, results, degraded, took, nameW))
+}
+
+// appSyncLine renders one app's completed-sync status line — the committed form
+// of its pipeline's deploy, in the same 🚢 Deploy style as the live row so a
+// scrollback line and a live one read alike: a health symbol (✓ applied &
+// healthy · ⚠ applied but a resource is degraded · ✗ a sync task failed), the 🚢
+// icon with the explicit "Deploy" kind, the app name, and a dim summary of what
+// changed. nameW (the run's widest app name, 0 for a single-app run) pads the
+// name so the change-summary — and, when the summaries are equal width, the
+// trailing duration — line up across the streamed per-app lines. took, when > 0,
+// is appended (the per-app end-to-end timing); a zero duration omits it.
+func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration, nameW int) string {
 	parts := []string{fmt.Sprintf("%d applied", s.Applied)}
 	if s.Pruned > 0 {
 		parts = append(parts, fmt.Sprintf("%d pruned", s.Pruned))
@@ -806,13 +860,33 @@ func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration) 
 	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
-	line := fmt.Sprintf("%s %s %s  %s", symbol, iconSync, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
-	// The elapsed time trails the change summary in the same threshold-colored
-	// form the 🔨 build line uses, so both stages read alike.
+	// k8s names are ASCII, so len is the display width; pad with plain spaces
+	// after the colored name so the next column starts at a fixed offset.
+	name := c.Bold(app)
+	if pad := nameW - len(app); pad > 0 {
+		name += strings.Repeat(" ", pad)
+	}
+	line := fmt.Sprintf("%s %s Deploy %s  %s", symbol, ui.IconDeploy, name, c.Dim(strings.Join(parts, ", ")))
 	if took > 0 {
 		line += "  " + ui.Elapsed(c, took)
 	}
 	return line
+}
+
+// nameColWidth is the app-name column width for the streamed per-app summary
+// lines: the run's widest name, so they align — or 0 for a single-app run, which
+// needs no padding (and reads cleanest left-tight).
+func nameColWidth(apps []config.App) int {
+	if len(apps) <= 1 {
+		return 0
+	}
+	w := 0
+	for _, a := range apps {
+		if len(a.Name) > w {
+			w = len(a.Name)
+		}
+	}
+	return w
 }
 
 // printPlan opens a whole-stack sync with a titled overview: how many apps, the

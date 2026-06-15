@@ -16,7 +16,8 @@ import (
 func TestWatchReporter_CommitsSummaryAtInitialConvergence(t *testing.T) {
 	var buf bytes.Buffer
 	apps := []config.App{{Name: "api-b"}, {Name: "shop"}}
-	r := startWatchReporter(&buf, ui.NewColors(&buf), apps, "prod-cluster")
+	out := ui.NewColors(&buf)
+	r := startWatchReporter(&buf, out, newProgress(&buf, out, apps), apps, "prod-cluster")
 
 	if out := buf.String(); !strings.Contains(out, "Plan") || !strings.Contains(out, "prod-cluster") {
 		t.Fatalf("watch start = %q, want a Plan naming the context", out)
@@ -46,7 +47,8 @@ func TestWatchReporter_CommitsSummaryAtInitialConvergence(t *testing.T) {
 func TestWatchReporter_SingleAppHasNoPlanOrSummary(t *testing.T) {
 	var buf bytes.Buffer
 	apps := []config.App{{Name: "duo"}}
-	r := startWatchReporter(&buf, ui.NewColors(&buf), apps, "prod-cluster")
+	colors := ui.NewColors(&buf)
+	r := startWatchReporter(&buf, colors, newProgress(&buf, colors, apps), apps, "prod-cluster")
 	r.report("duo", loop.SyncStats{Applied: 3}, 0)
 	out := buf.String()
 	if strings.Contains(out, "Plan") || strings.Contains(out, "Summary") {

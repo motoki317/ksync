@@ -58,8 +58,13 @@ re-litigate only with new evidence):
   content-addressed local tag exists in no registry, so `Always` would force a doomed pull.
 - `internal/ui` — human-facing output: a `logr.LogSink` that renders clean, colored,
   single-line records (a quiet variant drops Info/V noise; used for the engine and the routed
-  klog/client-go stream), color helpers (NO_COLOR + TTY aware), and `Activity`, the nix-style
-  single-line progress for external build/import commands (full log shown only on failure).
+  klog/client-go stream), color helpers (NO_COLOR + TTY aware), and the live terminal block
+  (`console`) — a set of per-app `Pipeline`s, each grouping its named **🔨 Build → 📦 Import →
+  🚢 Deploy** stages (not-yet-reached stages shown as pending `○`; a deploy-only app collapses to
+  one line) with a pinned Summary footer, height-clamped so concurrent groups never overflow.
+  Each build/import command's output is collapsed to one live line per stage; the full log shows
+  only on failure. Off a terminal the block is inert (plain per-stage and per-app lines). See ADR
+  20260615-grouped-pipeline-progress.
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.

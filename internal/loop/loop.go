@@ -57,6 +57,10 @@ type Options struct {
 	// the watch output matches `ksync sync`'s ship-emoji apply line rather than
 	// a plain log record; when nil, the loop logs a structured "synced" line.
 	Report func(app string, stats SyncStats, took time.Duration)
+	// OnError is called once when an app's run ends in failure (build, render, or
+	// sync) and Report therefore does not fire — the command layer uses it to
+	// tear down that app's live progress group so a retry starts clean. Optional.
+	OnError func(app string, err error)
 	// Resync, when a value is received, marks every app dirty — the manual
 	// "redeploy everything now" the watch command wires to keyboard input.
 	// A nil channel simply never fires.
@@ -78,6 +82,9 @@ func (o *Options) applyDefaults() {
 	}
 	if o.Log.GetSink() == nil {
 		o.Log = logr.Discard()
+	}
+	if o.OnError == nil {
+		o.OnError = func(string, error) {}
 	}
 }
 
@@ -200,6 +207,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		buildFn:     opts.Build,
 		syncFn:      syncFn,
 		report:      opts.Report,
+		onError:     opts.OnError,
 		maxParallel: opts.MaxParallel,
 		log:         log,
 	}
@@ -322,6 +330,7 @@ type runner struct {
 	buildFn     BuildFunc
 	syncFn      SyncFunc
 	report      func(app string, stats SyncStats, took time.Duration)
+	onError     func(app string, err error)
 	maxParallel int
 	log         logr.Logger
 }
@@ -342,12 +351,14 @@ func (rn *runner) run(ctx context.Context, app config.App, todo []int, tags map[
 	}
 	if err != nil {
 		r.failed = unbuilt(todo, r.built)
+		rn.onError(app.Name, err)
 		return r
 	}
 
 	res, err := rn.renderer.Render(app.Path)
 	if err != nil {
 		rn.log.Error(err, "render failed", "app", app.Name)
+		rn.onError(app.Name, err)
 		return r
 	}
 	if len(tags) > 0 {
@@ -359,12 +370,14 @@ func (rn *runner) run(ctx context.Context, app config.App, todo []int, tags map[
 		}
 		if err := res.SetImages(images); err != nil {
 			rn.log.Error(err, "injecting built image tags failed", "app", app.Name)
+			rn.onError(app.Name, err)
 			return r
 		}
 	}
 	stats, err := rn.syncFn(ctx, app.Name, res.Objects)
 	if err != nil {
 		rn.log.Error(err, "sync failed", "app", app.Name)
+		rn.onError(app.Name, err)
 		return r
 	}
 	rn.reportSync(app.Name, stats, time.Since(started))
@@ -402,8 +415,8 @@ func (rn *runner) reportSync(app string, stats SyncStats, took time.Duration) {
 // longer run one at a time, which is the bulk of its change→applied latency.
 // On the first batch failure it cancels the rest and returns the tags built so
 // far plus that error, so the caller re-dirties only what did not build. Build
-// progress and failures are surfaced by the injected BuildFunc (ui.Activity:
-// one live line per batch, full log only on failure).
+// progress and failures are surfaced by the injected BuildFunc (a build/import
+// row per batch in the app's pipeline, full log only on failure).
 func BuildAll(ctx context.Context, app config.App, todo []int, buildFn BuildFunc, maxParallel int) (map[int]string, error) {
 	batches := app.BuildBatches(todo)
 	built := make(map[int]string, len(todo))

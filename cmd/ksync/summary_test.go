@@ -28,10 +28,10 @@ func TestPrintSummary_CleanIsCheckmark(t *testing.T) {
 		synced("Deployment", "api", common.ResultCodeSynced),
 		synced("Service", "api", common.ResultCodeSynced),
 	}
-	printSummary(&b, ui.NewColors(&b), "shop", results, nil, 1500*time.Millisecond)
+	printSummary(&b, ui.NewColors(&b), "shop", results, nil, 1500*time.Millisecond, 0)
 	out := b.String()
-	if !strings.Contains(out, "✓") || !strings.Contains(out, "shop") || !strings.Contains(out, "2 applied") {
-		t.Errorf("clean summary = %q, want ✓ shop 2 applied", out)
+	if !strings.Contains(out, "✓") || !strings.Contains(out, "Deploy shop") || !strings.Contains(out, "2 applied") {
+		t.Errorf("clean summary = %q, want ✓ 🚢 Deploy shop 2 applied", out)
 	}
 	// The per-app apply duration is appended (the watch loop and `ksync sync` both
 	// report it on the 🚢 line).
@@ -43,13 +43,31 @@ func TestPrintSummary_CleanIsCheckmark(t *testing.T) {
 	}
 }
 
+// The committed per-app line names the deploy stage explicitly (🚢 Deploy) and
+// pads the app name to the run's widest, so the change-summary column lines up
+// across the streamed lines regardless of how long each app's name is.
+func TestAppSyncLine_TitledAndAligned(t *testing.T) {
+	c := ui.NewColors(&bytes.Buffer{}) // not a TTY → plain, byte-offset-assertable text
+	nameW := nameColWidth([]config.App{{Name: "alloy"}, {Name: "ns-system"}})
+	short := appSyncLine(c, "alloy", loop.SyncStats{}, 300*time.Millisecond, nameW)
+	long := appSyncLine(c, "ns-system", loop.SyncStats{}, 23*time.Second, nameW)
+	for _, ln := range []string{short, long} {
+		if !strings.Contains(ln, "🚢 Deploy ") {
+			t.Errorf("committed line should name the deploy stage, got %q", ln)
+		}
+	}
+	if i, j := strings.Index(short, "0 applied"), strings.Index(long, "0 applied"); i != j {
+		t.Errorf("the applied column should align (shorter name padded): %d vs %d\n%q\n%q", i, j, short, long)
+	}
+}
+
 // A degraded resource downgrades the symbol to ⚠, adds the count, and lists the
 // offending resource under the app line — without it counting as a sync failure.
 func TestPrintSummary_DegradedIsWarning(t *testing.T) {
 	var b bytes.Buffer
 	results := []common.ResourceSyncResult{synced("Deployment", "api", common.ResultCodeSynced)}
 	degraded := []string{"apps/Deployment/api-b/api: Degraded — progress deadline exceeded"}
-	printSummary(&b, ui.NewColors(&b), "shop", results, degraded, 0)
+	printSummary(&b, ui.NewColors(&b), "shop", results, degraded, 0, 0)
 	out := b.String()
 	if !strings.Contains(out, "⚠") {
 		t.Errorf("degraded summary = %q, want ⚠", out)
@@ -68,7 +86,7 @@ func TestPrintSummary_FailedIsCross(t *testing.T) {
 	results := []common.ResourceSyncResult{
 		synced("Deployment", "api", common.ResultCodeSyncFailed),
 	}
-	printSummary(&b, ui.NewColors(&b), "shop", results, nil, 0)
+	printSummary(&b, ui.NewColors(&b), "shop", results, nil, 0, 0)
 	if out := b.String(); !strings.Contains(out, "✗") || !strings.Contains(out, "1 failed") {
 		t.Errorf("failed summary = %q, want ✗ ... 1 failed", out)
 	}
