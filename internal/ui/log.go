@@ -78,10 +78,36 @@ func (s *Sink) Info(_ int, msg string, kv ...any) {
 }
 
 func (s *Sink) Error(err error, msg string, kv ...any) {
+	// In quiet mode (the engine/klog stream) drop known-benign notices that
+	// gitops-engine logs at Error level but recovers from. The motivating case:
+	// on a cold cluster an aggregated APIService (metrics-server) is registered
+	// but not yet serving, so discovery returns a partial result; gitops-engine's
+	// kube ctl logs "Partial success when performing preferred resource discovery"
+	// and continues with the groups it did get (it errors only on *zero*). Surfaced
+	// to the user it reads as a scary ✗ at startup for a transient non-problem.
+	if s.quiet && isBenignEngineNotice(msg) {
+		return
+	}
 	if err != nil {
 		kv = append(kv, "error", err.Error())
 	}
 	s.write(s.colors.Red("✗"), msg, kv, true)
+}
+
+// benignEngineNotices are message prefixes gitops-engine/client-go log at Error
+// level but recover from — noise the quiet engine logger should swallow. Matched
+// by prefix so an appended detail does not defeat it.
+var benignEngineNotices = []string{
+	"Partial success when performing preferred resource discovery",
+}
+
+func isBenignEngineNotice(msg string) bool {
+	for _, p := range benignEngineNotices {
+		if strings.HasPrefix(msg, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Sink) write(symbol, msg string, kv []any, isError bool) {

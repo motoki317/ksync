@@ -56,6 +56,33 @@ func TestSink_QuietDropsInfoKeepsError(t *testing.T) {
 	}
 }
 
+// The quiet engine logger swallows gitops-engine's benign "Partial success"
+// discovery notice (logged at Error level on a cold cluster while an aggregated
+// APIService warms up) but still surfaces a real Error — and a non-quiet logger
+// keeps even the benign notice, since only the engine/klog stream is filtered.
+func TestSink_QuietDropsBenignDiscoveryNotice(t *testing.T) {
+	var buf bytes.Buffer
+	quiet := New(Options{Writer: &buf, Clock: fixedClock, Quiet: true})
+	quiet.Error(errString("metrics.k8s.io/v1beta1: stale GroupVersion discovery"),
+		"Partial success when performing preferred resource discovery")
+	quiet.Error(errString("connection refused"), "real failure")
+
+	got := buf.String()
+	if strings.Contains(got, "Partial success") {
+		t.Errorf("quiet sink leaked the benign discovery notice: %q", got)
+	}
+	if !strings.Contains(got, "real failure") {
+		t.Errorf("quiet sink dropped a real Error: %q", got)
+	}
+
+	buf.Reset()
+	loud := New(Options{Writer: &buf, Clock: fixedClock})
+	loud.Error(nil, "Partial success when performing preferred resource discovery")
+	if !strings.Contains(buf.String(), "Partial success") {
+		t.Errorf("non-quiet sink should not filter: %q", buf.String())
+	}
+}
+
 func TestSink_VerbosityGate(t *testing.T) {
 	var buf bytes.Buffer
 	log := New(Options{Writer: &buf, Clock: fixedClock, Verbosity: 0})
