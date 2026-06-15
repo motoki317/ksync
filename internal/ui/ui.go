@@ -23,6 +23,13 @@ const (
 	ansiGreen  = "\x1b[32m"
 	ansiYellow = "\x1b[33m"
 	ansiCyan   = "\x1b[36m"
+
+	// Faint (SGR 2) combined with a hue: a dimmer shade of the same color, used
+	// to recede a duration's unit letters behind its digits. Terminals that don't
+	// support faint degrade to the plain hue, which is acceptable.
+	ansiFaintRed    = "\x1b[2;31m"
+	ansiFaintGreen  = "\x1b[2;32m"
+	ansiFaintYellow = "\x1b[2;33m"
 )
 
 // Colors renders ANSI-colored strings, or plain ones when color is disabled, so

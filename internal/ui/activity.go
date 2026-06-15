@@ -88,7 +88,7 @@ func (a *Activity) Write(p []byte) (int, error) {
 // summary with the elapsed time, and — only on failure — the full captured
 // output so the developer can see what went wrong.
 func (a *Activity) Done(err error) {
-	elapsed := a.c.Dim("(" + Duration(a.now().Sub(a.start)) + ")")
+	elapsed := Elapsed(a.c, a.now().Sub(a.start))
 	var b strings.Builder
 	if err != nil {
 		a.mu.Lock()
@@ -135,17 +135,54 @@ func sanitizeLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// Elapsed renders a stage's duration as a threshold-colored token — the single
+// form shared by the build/import and apply lines so every stage's timing reads
+// alike. Color escalates with how long it took (vitest-style): a fast stage is
+// green (the happy path), a slower one warms to yellow then red so it draws the
+// eye in a stack of otherwise-quiet lines. Thresholds suit a local dev loop,
+// where a single-app edit targets a few seconds — past ~10s is worth a glance,
+// past a minute is the slow stage to fix. The color alone conveys the tier,
+// so no parentheses are needed; the unit letters (m, s) recede into a fainter
+// shade of the tier color so the magnitude is what stands out.
+func Elapsed(c Colors, d time.Duration) string {
+	var bright, faint string
+	switch {
+	case d >= time.Minute:
+		bright, faint = ansiRed, ansiFaintRed
+	case d >= 10*time.Second:
+		bright, faint = ansiYellow, ansiFaintYellow
+	default:
+		bright, faint = ansiGreen, ansiFaintGreen
+	}
+	// The magnitude takes the bright tier code, the unit letters the faint one —
+	// so "1m05s" shades its 1 and 05 bright, its m and s faint.
+	return formatDuration(d,
+		func(num string) string { return c.wrap(bright, num) },
+		func(unit string) string { return c.wrap(faint, unit) },
+	)
+}
+
 // Duration renders an elapsed time compactly for human status lines: "0.4s",
 // "12s", "1m03s". Shared by the build/import activity lines and the per-app
 // sync status so durations read the same everywhere.
 func Duration(d time.Duration) string {
+	plain := func(s string) string { return s }
+	return formatDuration(d, plain, plain)
+}
+
+// formatDuration is the single source of truth for the compact duration layout:
+// "0.4s", "12s", "1m03s". It calls num for each magnitude run and unit for each
+// unit-letter run, so a caller can style the two differently (Elapsed colors
+// them) without re-parsing the formatted string — the number/unit boundaries are
+// known here by construction, not rediscovered downstream.
+func formatDuration(d time.Duration, num, unit func(string) string) string {
 	if d < time.Minute {
 		if d < 10*time.Second {
-			return fmt.Sprintf("%.1fs", d.Seconds())
+			return num(fmt.Sprintf("%.1f", d.Seconds())) + unit("s")
 		}
-		return fmt.Sprintf("%ds", int(d.Seconds()))
+		return num(fmt.Sprintf("%d", int(d.Seconds()))) + unit("s")
 	}
 	m := int(d.Minutes())
 	s := int(d.Seconds()) - m*60
-	return fmt.Sprintf("%dm%02ds", m, s)
+	return num(fmt.Sprintf("%d", m)) + unit("m") + num(fmt.Sprintf("%02d", s)) + unit("s")
 }

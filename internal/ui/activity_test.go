@@ -21,6 +21,33 @@ func TestSanitizeLine(t *testing.T) {
 	}
 }
 
+// Elapsed escalates the tier color past the noticeable/slow thresholds, has no
+// parentheses (color carries the tier), and shades unit letters fainter than the
+// digits so the magnitude is what stands out.
+func TestElapsed(t *testing.T) {
+	c := Colors{on: true}
+	seg := func(code, s string) string { return code + s + ansiReset }
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		// fast → green (the happy path)
+		{2 * time.Second, seg(ansiGreen, "2.0") + seg(ansiFaintGreen, "s")},
+		// noticeable threshold (inclusive) → yellow
+		{10 * time.Second, seg(ansiYellow, "10") + seg(ansiFaintYellow, "s")},
+		// still yellow just below a minute
+		{59 * time.Second, seg(ansiYellow, "59") + seg(ansiFaintYellow, "s")},
+		// slow threshold (inclusive) → red; compound shades digits bright, units faint
+		{63 * time.Second, seg(ansiRed, "1") + seg(ansiFaintRed, "m") + seg(ansiRed, "03") + seg(ansiFaintRed, "s")},
+	}
+	for _, tc := range cases {
+		got := Elapsed(c, tc.d)
+		if got != tc.want {
+			t.Errorf("Elapsed(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
 func TestDuration(t *testing.T) {
 	cases := map[time.Duration]string{
 		400 * time.Millisecond: "0.4s",

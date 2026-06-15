@@ -28,10 +28,15 @@ func TestPrintSummary_CleanIsCheckmark(t *testing.T) {
 		synced("Deployment", "api", common.ResultCodeSynced),
 		synced("Service", "api", common.ResultCodeSynced),
 	}
-	printSummary(&b, ui.NewColors(&b), "shop", results, nil)
+	printSummary(&b, ui.NewColors(&b), "shop", results, nil, 1500*time.Millisecond)
 	out := b.String()
 	if !strings.Contains(out, "✓") || !strings.Contains(out, "shop") || !strings.Contains(out, "2 applied") {
 		t.Errorf("clean summary = %q, want ✓ shop 2 applied", out)
+	}
+	// The per-app apply duration is appended (the watch loop and `ksync sync` both
+	// report it on the 🚢 line).
+	if !strings.Contains(out, "1.5s") {
+		t.Errorf("clean summary = %q, want the apply duration 1.5s", out)
 	}
 	if strings.Contains(out, "degraded") || strings.Contains(out, "⚠") {
 		t.Errorf("clean summary must not mention degraded: %q", out)
@@ -44,7 +49,7 @@ func TestPrintSummary_DegradedIsWarning(t *testing.T) {
 	var b bytes.Buffer
 	results := []common.ResourceSyncResult{synced("Deployment", "api", common.ResultCodeSynced)}
 	degraded := []string{"apps/Deployment/api-b/api: Degraded — progress deadline exceeded"}
-	printSummary(&b, ui.NewColors(&b), "shop", results, degraded)
+	printSummary(&b, ui.NewColors(&b), "shop", results, degraded, 0)
 	out := b.String()
 	if !strings.Contains(out, "⚠") {
 		t.Errorf("degraded summary = %q, want ⚠", out)
@@ -63,7 +68,7 @@ func TestPrintSummary_FailedIsCross(t *testing.T) {
 	results := []common.ResourceSyncResult{
 		synced("Deployment", "api", common.ResultCodeSyncFailed),
 	}
-	printSummary(&b, ui.NewColors(&b), "shop", results, nil)
+	printSummary(&b, ui.NewColors(&b), "shop", results, nil, 0)
 	if out := b.String(); !strings.Contains(out, "✗") || !strings.Contains(out, "1 failed") {
 		t.Errorf("failed summary = %q, want ✗ ... 1 failed", out)
 	}

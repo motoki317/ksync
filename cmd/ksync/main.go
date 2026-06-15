@@ -244,10 +244,15 @@ func runSync(args []string) error {
 		})
 	}
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
+		// Per-app wall clock: build + render + apply + health gate, the same
+		// end-to-end span the watch loop reports on its 🚢 line. Captured per
+		// invocation since apps run concurrently.
+		start := time.Now()
 		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, app, *prune, *timeout, *maxParallel, os.Stderr, out)
 		if err != nil {
 			return err
 		}
+		took := time.Since(start)
 		stats := syncStats(results)
 		stats.Degraded = len(degraded)
 		mu.Lock()
@@ -262,7 +267,7 @@ func runSync(args []string) error {
 		mu.Unlock()
 		// Print after tallying so the ✓ line and the footer's bumped count land
 		// together (printSummary repaints the footer as it writes the line).
-		printSummary(os.Stderr, out, app.Name, results, degraded)
+		printSummary(os.Stderr, out, app.Name, results, degraded, took)
 		return nil
 	})
 	footer.Stop()
@@ -719,12 +724,13 @@ func runDestroy(args []string) error {
 		// Destroy is a sync to an empty target set: prune removes everything
 		// the tracking label scopes to this app, and nothing else.
 		syncCtx, cancel := withTimeout(ctx, *timeout)
+		start := time.Now()
 		results, err := eng.Sync(syncCtx, app.Name, nil, engine.SyncOptions{Prune: true})
 		cancel()
 		if err != nil {
 			return fmt.Errorf("app %s: destroy: %w", app.Name, err)
 		}
-		printSummary(os.Stderr, out, app.Name, results, nil)
+		printSummary(os.Stderr, out, app.Name, results, nil, time.Since(start))
 	}
 	return nil
 }
@@ -751,7 +757,7 @@ func syncStats(results []common.ResourceSyncResult) loop.SyncStats {
 	return s
 }
 
-func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string) {
+func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string, took time.Duration) {
 	var b strings.Builder
 	s := syncStats(results)
 	s.Degraded = len(degraded)
@@ -766,8 +772,7 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	for _, line := range degraded {
 		fmt.Fprintf(&b, "  %s %s\n", c.Yellow("⚠"), c.Dim(line))
 	}
-	// took=0: a one-shot sync leaves timing to the Summary block's Duration row.
-	fmt.Fprintf(&b, "%s\n", appSyncLine(c, app, s, 0))
+	fmt.Fprintf(&b, "%s\n", appSyncLine(c, app, s, took))
 	// Through ui.WriteLine so the line erases any in-flight build spinner before
 	// printing — apps sync concurrently, so a summary can land mid-spinner.
 	ui.WriteLine(w, b.String())
@@ -777,8 +782,8 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 // style shared by `ksync sync` and the watch loop: a health symbol (✓ applied &
 // healthy · ⚠ applied but a resource is degraded · ✗ a sync task failed), the
 // 🚢 apply icon (distinct from a 🔨 build line), the app name, and a dim summary
-// of what changed. took, when > 0, is appended — the watch loop shows per-sync
-// timing; one-shot sync leaves it 0.
+// of what changed. took, when > 0, is appended — both `ksync sync` and the watch
+// loop report the per-app end-to-end timing; only a zero duration omits it.
 func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration) string {
 	parts := []string{fmt.Sprintf("%d applied", s.Applied)}
 	if s.Pruned > 0 {
@@ -790,9 +795,6 @@ func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration) 
 	if s.Degraded > 0 {
 		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", s.Degraded)))
 	}
-	if took > 0 {
-		parts = append(parts, ui.Duration(took))
-	}
 	symbol := c.Green("✓")
 	if s.Degraded > 0 {
 		symbol = c.Yellow("⚠")
@@ -800,7 +802,13 @@ func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration) 
 	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
-	return fmt.Sprintf("%s %s %s  %s", symbol, iconSync, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
+	line := fmt.Sprintf("%s %s %s  %s", symbol, iconSync, c.Bold(app), c.Dim(strings.Join(parts, ", ")))
+	// The elapsed time trails the change summary in the same threshold-colored
+	// form the 🔨 build line uses, so both stages read alike.
+	if took > 0 {
+		line += "  " + ui.Elapsed(c, took)
+	}
+	return line
 }
 
 // printPlan opens a whole-stack sync with a titled overview: how many apps, the

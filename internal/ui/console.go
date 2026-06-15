@@ -106,11 +106,14 @@ func (t *track) render(frame rune) string {
 	tail := t.tail
 	t.mu.Unlock()
 
-	meta := Duration(t.now().Sub(t.start))
+	// The running elapsed gets the same threshold color as the finished line, so
+	// a stage that is taking a while warms from green toward red as you watch it.
+	// The tail (latest output line) stays dim — it is context, not the headline.
+	meta := Elapsed(t.colors, t.now().Sub(t.start))
 	if tail != "" {
-		meta = tail + "  " + meta
+		meta = t.colors.Dim(tail) + "  " + meta
 	}
-	return fmt.Sprintf("%s %s  %s", t.colors.Cyan(string(frame)), t.colors.Bold(t.label), t.colors.Dim(meta))
+	return fmt.Sprintf("%s %s  %s", t.colors.Cyan(string(frame)), t.colors.Bold(t.label), meta)
 }
 
 // addTrack registers a live line and (re)paints the block. The first track to
