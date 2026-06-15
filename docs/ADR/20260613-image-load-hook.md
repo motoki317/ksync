@@ -3,6 +3,12 @@
 Date: 2026-06-13
 Status: accepted
 
+> Update: the config shape evolved since this ADR. `imageLoad` is now a structured object
+> (`command:` + `allowParallel:`) and the command receives `$KSYNC_IMAGES` (the whole batch), not
+> a per-ref `$KSYNC_IMAGE` — see ADR 20260614-bulk-build-groups (batching) and
+> 20260615-imageload-concurrency (the structured field + serialization). The rationale below for
+> *why a hook* still holds; the `imageLoad: <string>` / `$KSYNC_IMAGE` examples are historical.
+
 ## Context
 
 The build-integration ADR (2026-06-12, decision 4) chose the local docker daemon as the only

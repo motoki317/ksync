@@ -39,15 +39,18 @@ re-litigate only with new evidence):
 - `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / destroy`
   implemented; `diff` still a stub).
 - `internal/config` — ksync.yaml model: app list, single explicit kubectl context (the safety
-  model), optional top-level `imageLoad` command (separate-image-store clusters), per-app
-  default namespace (ArgoCD destination.namespace parity), `needs` DAG, per-app `build` entries
-  (image/context + optional dockerfile/watch/watchIgnore/command); `SortByNeeds`.
+  model), optional top-level `imageLoad` (`command` + `allowParallel`, for separate-image-store
+  clusters; `allowParallel` defaults true, set false for non-concurrency-safe loaders like
+  `k3d image import`), per-app default namespace (ArgoCD destination.namespace parity), `needs`
+  DAG, per-app `build` entries (image/context + optional dockerfile/watch/watchIgnore/command);
+  `SortByNeeds`.
 - `internal/build` — source→image: docker build (or the `command` escape hatch producing
   `$KSYNC_IMAGE`), content-addressed dev tags `ksync-<12 hex of image ID>` (no persisted
   build state; `--provenance=false` keeps IDs deterministic), `.dockerignore`-scoped watch
-  derivation (WatchScope), and `Loader` (the `imageLoad` hook: runs per built ref with
-  `$KSYNC_IMAGE` set, for k3d/kind `image import` / registry push). See ADRs
-  20260612-build-integration and 20260613-image-load-hook.
+  derivation (WatchScope), and `Loader` (the `imageLoad` hook: runs the command per build batch
+  with `$KSYNC_IMAGES` set, for k3d/kind `image import` / registry push; serializes its calls
+  unless `Parallel`, since k3d image import is not concurrency-safe). See ADRs
+  20260612-build-integration, 20260613-image-load-hook, and 20260615-imageload-concurrency.
 - `internal/render` — in-process kustomize (krusty) replicating
   `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
   binary is enforced by test. `SetImages` (the build-tag injection path) also rewrites an

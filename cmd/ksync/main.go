@@ -613,6 +613,11 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 	// so re-importing it is pure waste — and on k3d/kind that waste is seconds.
 	var mu sync.Mutex
 	imported := map[string]bool{}
+	// One Loader shared across the parallel per-app builds. It serializes loads
+	// unless the config marks the command concurrency-safe (allowParallel) —
+	// k3d image import, the unsafe default case, races on a shared tools node +
+	// tarball and silently drops images (see build.Loader).
+	loader := &build.Loader{Command: cfg.ImageLoad.Command, Parallel: cfg.ImageLoad.Parallel()}
 	return func(ctx context.Context, app string, builds []config.Build) ([]string, error) {
 		if len(builds) == 0 {
 			return nil, nil
@@ -645,7 +650,7 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 			}
 			refs = []string{ref}
 		}
-		if cfg.ImageLoad != "" {
+		if cfg.ImageLoad.Command != "" {
 			mu.Lock()
 			fresh := make([]string, 0, len(refs))
 			for _, ref := range refs {
@@ -656,8 +661,7 @@ func makeBuildFunc(cfg *config.Config, w io.Writer, colors ui.Colors) loop.Build
 			mu.Unlock()
 			if len(fresh) > 0 {
 				act := ui.StartActivity(w, colors, iconImport+" "+label)
-				loader := &build.Loader{Command: cfg.ImageLoad, Output: act}
-				err := loader.Load(ctx, fresh)
+				err := loader.Load(ctx, act, fresh)
 				act.Done(err)
 				if err != nil {
 					return nil, err

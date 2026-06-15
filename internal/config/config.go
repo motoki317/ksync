@@ -24,20 +24,40 @@ type Config struct {
 	Context string `json:"context"`
 	// ImageLoad makes freshly built images visible to a cluster whose image
 	// store is separate from the local docker daemon (k3d, kind, a remote
-	// registry). It runs once per build batch via `sh -c` with $KSYNC_IMAGES set
-	// to the newline-separated built refs ($KSYNC_IMAGE holds the first, for the
-	// single-image case) — the same contract as a build command — so ksync needs
-	// no per-cluster-type knowledge. Empty for daemon-shared clusters (Docker
-	// Desktop). Examples:
-	//   k3d image import --cluster dev $KSYNC_IMAGES
-	//   kind load docker-image --name dev $KSYNC_IMAGES
-	//   docker push $KSYNC_IMAGE
-	ImageLoad string `json:"imageLoad,omitempty"`
+	// registry). Omit it for daemon-shared clusters (Docker Desktop).
+	ImageLoad ImageLoad `json:"imageLoad,omitempty"`
 	// BuildGroups batch several build entries into one bulk command (see
 	// BuildGroup). Optional; a config can build every image individually.
 	BuildGroups []BuildGroup `json:"buildGroups,omitempty"`
 	Apps        []App        `json:"apps"`
 }
+
+// ImageLoad is the hook that makes freshly built images visible to a cluster
+// with a separate image store. Command runs once per build batch via `sh -c`
+// with $KSYNC_IMAGES set to the newline-separated built refs ($KSYNC_IMAGE
+// holds the first, for the single-image case) — the same contract as a build
+// command — so ksync needs no per-cluster-type knowledge. Examples:
+//
+//	command: k3d image import --cluster dev $KSYNC_IMAGES
+//	command: kind load docker-image --name dev $KSYNC_IMAGES
+//	command: for i in $KSYNC_IMAGES; do docker push "$i"; done
+type ImageLoad struct {
+	Command string `json:"command"`
+	// AllowParallel governs whether ksync may run Command for several build
+	// batches at once. It defaults to true (concurrent loads — the parallel
+	// builds each load as they finish). Set it to false when the command is not
+	// safe to run concurrently against one cluster: `k3d image import`, notably,
+	// stages every import through a shared per-cluster tools node and a tarball
+	// named only to the second in a shared volume, then deletes them on cleanup,
+	// so overlapping imports clobber each other and silently drop images.
+	// Registry pushes and `kind load` are concurrency-safe and keep the default.
+	AllowParallel *bool `json:"allowParallel,omitempty"`
+}
+
+// Parallel reports whether load commands may run concurrently. Unset means yes
+// (the default favors the common concurrency-safe loaders — registry push,
+// shared daemon); only an explicit `allowParallel: false` serializes.
+func (l ImageLoad) Parallel() bool { return l.AllowParallel == nil || *l.AllowParallel }
 
 // BuildGroup batches several build entries into a single bulk command — one
 // `docker buildx bake <targets>`, one host compile producing many images — so
