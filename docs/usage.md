@@ -525,10 +525,13 @@ Flags:
 | `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
 | `-v` | `false` | Verbose: also log every detected file change. |
 
-Each sync prints the same one-line summary `ksync sync` does — `✓ 🚢 Deploy api-b  2 applied  0.9s`
-— led by the **🚢 Deploy** stage, with the `✓`/`⚠`/`✗` status symbol (applied & healthy / applied
-but a resource is degraded / a sync task failed) and the per-sync time. `applied` is what actually
-changed (a no-op edit reads `0 applied`); `pruned`, `failed`, and `degraded` show only when nonzero
+Each sync commits the same summary `ksync sync` does: a build-less app a single
+`✓ 🚢 api-b  2 applied  0.9s` line — the 🚢 icon and the `applied` count already say what happened,
+so it carries no redundant "Deploy" word — and a build app its whole 🔨 Build → 📦 Import →
+🚢 Deploy stage tree, each row keeping its own time so a slow build is still visible afterward. The
+`✓`/`⚠`/`✗` status symbol means applied & healthy / applied but a resource is degraded / a sync task
+failed; the deploy time is that stage's own (apply + health gate). `applied` is what actually changed
+(a no-op edit reads `0 applied`); `pruned`, `failed`, and `degraded` show only when nonzero
 (`degraded` is the post-sync health check described under `ksync sync` below).
 
 A whole-stack `watch` frames its **startup convergence** exactly like a `sync` run — a titled
@@ -559,7 +562,8 @@ waits for every workload to reach Ready (Deployments rolled out, StatefulSets up
 up to `-timeout`. This is what makes `needs` meaningful — a dependent does not start against a
 database whose pod is still pulling its image; it waits until that database is actually serving.
 While an app is in this wait its **🚢 Deploy** row reads `waiting for health  N not ready` (on a
-terminal), then resolves to its one-line apply summary once Ready. An app that cannot become Healthy (e.g. a workload
+terminal), then resolves to its committed form once Ready — one apply line for a build-less app, the
+frozen stage tree for a build app. An app that cannot become Healthy (e.g. a workload
 crash-looping on a missing external prerequisite) blocks until `-timeout` and then fails, naming the
 resources still not healthy — so a broken deploy surfaces instead of passing as `✓ applied`. An
 already-healthy re-sync returns immediately (the wait finds nothing pending).
@@ -583,16 +587,21 @@ apps' namespaces, say), ksync creates those namespaces if missing — bare and u
 never touches them and the app that owns one adopts it on its own sync. The common single-namespace
 app is unaffected.
 
-Each app prints a one-line summary, led by the **🚢 Deploy** stage (so it reads distinctly from a
-🔨 Build line). The status symbol tells you the outcome at a glance — `✓` applied and healthy, `⚠`
-applied but a resource is broken at runtime, `✗` a sync task failed. In a whole-stack run the app
-name is padded to the widest so the `applied` (and, when the counts read alike, the duration)
-column lines up across the apps:
+A build-less app commits a one-line summary led by the **🚢** icon (the app is the subject, so no
+"Deploy" word is needed); a build app commits its whole stage tree, each 🔨 Build / 📦 Import / 🚢
+deploy row keeping its time. The status symbol tells you the outcome at a glance — `✓` applied and
+healthy, `⚠` applied but a resource is broken at runtime, `✗` a sync task failed. In a whole-stack
+run the app name is padded to the widest so the `applied` (and, when the counts read alike, the
+duration) column lines up across the apps:
 
 ```text
-✓ 🚢 Deploy api-b  3 applied, 1 pruned
+✓ 🚢 api-b  3 applied, 1 pruned
   ⚠ apps/Deployment/shop/web: Degraded — progress deadline exceeded
-⚠ 🚢 Deploy shop   0 applied, 1 degraded
+⚠ 🚢 shop   0 applied, 1 degraded
+duo
+    ✓ 🔨 rust-services (3)  1m20s   ← a build app keeps its per-stage times
+    ✓ 📦 rust-services (3)  8.0s
+    ✓ 🚢 deploy             21 applied  1m52s
 ```
 
 The `⚠` is a post-sync health snapshot: a resource that applied cleanly but is **Degraded** (a
@@ -612,12 +621,12 @@ Plan
   16 apps → docker-desktop
   postgres redis traefik … duo sistema
 
-✓ 🚢 Deploy redis     0 applied  0.4s   ← finished apps commit one line to the scrollback,
-✓ 🚢 Deploy postgres  0 applied  0.6s     the name padded so the columns line up
+✓ 🚢 redis     0 applied  0.4s   ← finished build-less apps commit one line to the scrollback,
+✓ 🚢 postgres  0 applied  0.6s     the name padded so the columns line up
 
 ⠹ duo                              ← in-flight apps show their live pipeline,
-    ⠹ 🔨 Build   rust-services (3)  2.3s    grouped under the pinned, updating block:
-    ○ 🚢 Deploy
+    ⠹ 🔨 Build   rust-services (3)  2.3s    grouped under the pinned, updating block
+    ○ 🚢 Deploy                            (a build app commits this whole tree, frozen, when it finishes)
 
 Summary
       Apps  12/16 synced

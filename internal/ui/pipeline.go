@@ -222,15 +222,154 @@ func (p *Pipeline) Deploy() *Stage {
 	return d
 }
 
-// Finish commits the group: it prints summary (the committed app line, with any
-// failure/degraded rows above it) to scrollback in place of the live group and
-// removes the group from the block. Off a terminal it just prints summary.
-func (p *Pipeline) Finish(summary string) {
+// CommitInfo carries the deploy outcome the committed view needs but the
+// pipeline does not itself track: the dim apply summary ("21 applied, 2 pruned"),
+// the health symbol for the deploy row/line (✓ healthy · ⚠ degraded · ✗ failed),
+// any per-resource failure/degraded lines to print above the block, and the
+// app-name column width that aligns the deploy-only single line across a run.
+type CommitInfo struct {
+	Summary string
+	Symbol  string
+	Above   []string
+	NameW   int
+}
+
+// Finish commits the group in place of the live one and removes it from the
+// block. A build app keeps its full stage tree frozen — every build/import row
+// and the deploy row retain their final time — so the per-stage timings survive
+// the run; a build-less app collapses to one deploy line. Off a terminal it
+// prints only that single line (the build/import stages already streamed their
+// own result lines as they finished).
+func (p *Pipeline) Finish(info CommitInfo) {
+	block := p.committed(info)
 	if p.tty {
-		liveTerm.finishItem(p, summary)
+		liveTerm.finishItem(p, block)
 		return
 	}
-	liveTerm.line(p.w, summary)
+	liveTerm.line(p.w, block)
+}
+
+// Discard removes the live group without committing a summary — used when a run
+// failed before producing one (its error is reported elsewhere). A no-op off a
+// terminal, where there is no pinned group to remove.
+func (p *Pipeline) Discard() {
+	if p.tty {
+		liveTerm.finishItem(p, "")
+	}
+}
+
+// committed renders the frozen committed block: the per-resource failure/degraded
+// lines first, then a build app's full stage tree (so each stage's final time is
+// preserved) or a build-less app's single deploy line. Off a terminal it is
+// always the single line — the build/import rows already printed as they ran.
+func (p *Pipeline) committed(info CommitInfo) string {
+	lines := append([]string{}, info.Above...)
+	if p.tty && p.expand {
+		lines = append(lines, p.committedTree(info)...)
+	} else {
+		lines = append(lines, p.committedLine(info))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// committedTree freezes a build app's group: the app header, then each stage as a
+// row carrying its final symbol and elapsed (the deploy row also the apply
+// summary), ordered build→import→deploy and column-aligned like the live tree.
+func (p *Pipeline) committedTree(info CommitInfo) []string {
+	p.mu.Lock()
+	stages := make([]*Stage, len(p.stages))
+	copy(stages, p.stages)
+	p.mu.Unlock()
+	sort.SliceStable(stages, func(i, j int) bool { return stages[i].phase < stages[j].phase })
+
+	labelW := 0
+	for _, s := range stages {
+		if w := displayWidth(committedLabel(s)); w > labelW {
+			labelW = w
+		}
+	}
+	out := make([]string, 0, len(stages)+1)
+	out = append(out, p.c.Bold(p.app))
+	for _, s := range stages {
+		out = append(out, p.committedRow(s, info, labelW))
+	}
+	return out
+}
+
+// committedRow renders one frozen stage row: status symbol, icon, padded label,
+// then its elapsed. The deploy row additionally takes the health symbol and apply
+// summary from info — the pipeline only knows the row's time, not its outcome.
+func (p *Pipeline) committedRow(s *Stage, info CommitInfo, labelW int) string {
+	s.mu.Lock()
+	failed := s.state == stateFailed
+	elapsed := s.end.Sub(s.start)
+	s.mu.Unlock()
+
+	sym := p.c.Green("✓")
+	if failed {
+		sym = p.c.Red("✗")
+	}
+	meta := Elapsed(p.c, elapsed)
+	if s.phase == phaseDeploy {
+		if info.Symbol != "" {
+			sym = info.Symbol
+		}
+		if info.Summary != "" {
+			meta = info.Summary + "  " + meta
+		}
+	}
+	label := committedLabel(s)
+	label += strings.Repeat(" ", labelW-displayWidth(label))
+	return strings.TrimRight(fmt.Sprintf("    %s %s %s  %s", sym, s.icon, label, meta), " ")
+}
+
+// committedLabel is a stage's name in the committed tree: its build/import label,
+// or "deploy" for the deploy row — whose own label is empty (the app heads the
+// group), so the row needs a word of its own.
+func committedLabel(s *Stage) string {
+	if s.phase == phaseDeploy {
+		return "deploy"
+	}
+	return s.label
+}
+
+// committedLine renders a build-less app's single committed line, reading the
+// deploy stage's own elapsed (the apply + health-gate time) so the number is that
+// stage's, not the app's end-to-end wall clock.
+func (p *Pipeline) committedLine(info CommitInfo) string {
+	var elapsed time.Duration
+	if p.deploy != nil {
+		p.deploy.mu.Lock()
+		if p.deploy.end.After(p.deploy.start) {
+			elapsed = p.deploy.end.Sub(p.deploy.start)
+		}
+		p.deploy.mu.Unlock()
+	}
+	return DeployLine(p.c, p.app, info.Summary, info.Symbol, elapsed, info.NameW)
+}
+
+// DeployLine renders one app's committed deploy line — the single-row form used
+// for a build-less app and by `ksync destroy`: a health symbol, the 🚢 icon, the
+// app name (padded to nameW so a run's lines align), the dim apply summary, and
+// the elapsed time (omitted when zero). It carries no "Deploy" kind word: the
+// icon and the "N applied" summary already say what happened and the app is the
+// subject, so the committed line never collides with the in-pipeline Deploy stage.
+func DeployLine(c Colors, app, summary, symbol string, elapsed time.Duration, nameW int) string {
+	if symbol == "" {
+		symbol = c.Green("✓")
+	}
+	name := c.Bold(app)
+	if pad := nameW - displayWidth(app); pad > 0 {
+		name += strings.Repeat(" ", pad)
+	}
+	line := fmt.Sprintf("%s %s %s", symbol, IconDeploy, name)
+	if summary != "" {
+		line += "  " + summary
+	}
+	if elapsed > 0 {
+		line += "  " + Elapsed(c, elapsed)
+	}
+	return line
 }
 
 func (p *Pipeline) refresh() {

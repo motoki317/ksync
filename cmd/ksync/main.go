@@ -283,22 +283,16 @@ func runSync(args []string) error {
 	defer waitBuilds()
 	defer buildCancel()
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
-		// Per-app wall clock: the deploy turn (render + apply + health gate, plus
-		// any residual wait for the app's own build, which mostly overlapped the
-		// needs it just waited on). Captured per invocation since apps run
-		// concurrently.
-		start := time.Now()
 		bo := awaitBuild(app.Name)
 		if bo.err != nil {
-			prog.finish(app.Name, "")
+			prog.finish(app.Name, nil)
 			return fmt.Errorf("app %s: build failed: %w", app.Name, bo.err)
 		}
 		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, *prune, *force, *timeout)
 		if err != nil {
-			prog.finish(app.Name, "") // remove the live group; the error is returned and printed at the top level
+			prog.finish(app.Name, nil) // remove the live group; the error is returned and printed at the top level
 			return err
 		}
-		took := time.Since(start)
 		stats := syncStats(results)
 		stats.Degraded = len(degraded)
 		mu.Lock()
@@ -312,8 +306,11 @@ func runSync(args []string) error {
 		}
 		mu.Unlock()
 		// Commit after tallying so the ✓ line and the footer's bumped count land
-		// together (Finish repaints the footer as it writes the line).
-		prog.finish(app.Name, summaryBlock(out, app.Name, results, degraded, took, nameW))
+		// together (Finish repaints the footer as it writes the block). The deploy
+		// time on the committed row is the deploy stage's own (read from the
+		// pipeline), so per-app build and apply times both survive the run.
+		summary, symbol := applyParts(out, stats)
+		prog.finish(app.Name, &ui.CommitInfo{Summary: summary, Symbol: symbol, Above: failureLines(out, results, degraded), NameW: nameW})
 		return nil
 	})
 	footer.Stop()
@@ -582,7 +579,7 @@ func runWatch(args []string) error {
 		Report:      reporter.report,
 		// A build/render failure (or a failed sync) ends the run without a Report;
 		// remove the live group so a retry starts fresh rather than stacking rows.
-		OnError: func(app string, _ error) { prog.finish(app, "") },
+		OnError: func(app string, _ error) { prog.finish(app, nil) },
 		Resync:  resyncOnEnter(ctx, log),
 	})
 }
@@ -651,11 +648,13 @@ func startWatchReporter(w io.Writer, out ui.Colors, prog *progress, apps []confi
 }
 
 // report commits one completed app sync (the loop's Report hook): it Finishes
-// the app's pipeline with the shared ship-emoji apply line, and on the run that
-// completes the initial convergence commits the Summary block and removes the
-// footer.
-func (r *watchReporter) report(app string, stats loop.SyncStats, took time.Duration) {
-	line := appSyncLine(r.out, app, stats, took, r.nameW)
+// the app's pipeline — a build app's frozen stage tree or a build-less app's ship
+// line — and on the run that completes the initial convergence commits the
+// Summary block and removes the footer. The deploy time on the committed line is
+// the deploy stage's own, read from the pipeline, so took is not needed here.
+func (r *watchReporter) report(app string, stats loop.SyncStats, _ time.Duration) {
+	summary, symbol := applyParts(r.out, stats)
+	info := &ui.CommitInfo{Summary: summary, Symbol: symbol, NameW: r.nameW}
 	done := false
 	r.mu.Lock()
 	// Tally each app's FIRST sync only, so the Summary reflects one convergence
@@ -678,7 +677,7 @@ func (r *watchReporter) report(app string, stats loop.SyncStats, took time.Durat
 	}
 	r.mu.Unlock()
 
-	r.prog.finish(app, line+"\n")
+	r.prog.finish(app, info)
 
 	if done {
 		r.footer.Stop()
@@ -733,22 +732,32 @@ func (p *progress) pipeline(app string) *ui.Pipeline {
 	return pipe
 }
 
-// finish commits the app's pipeline (summary printed in place of the live group,
-// or the group removed silently when summary is empty — a failed run whose error
-// surfaces elsewhere) and clears it so the next run starts fresh.
-func (p *progress) finish(app, summary string) {
+// finish commits the app's pipeline (the frozen committed block printed in place
+// of the live group) and clears it so the next run starts fresh. A nil info
+// removes the group silently — a failed run whose error surfaces elsewhere.
+func (p *progress) finish(app string, info *ui.CommitInfo) {
 	p.mu.Lock()
 	pipe := p.pipes[app]
 	delete(p.pipes, app)
 	p.mu.Unlock()
 	if pipe != nil {
-		pipe.Finish(summary)
+		if info == nil {
+			pipe.Discard()
+		} else {
+			pipe.Finish(*info)
+		}
 		return
 	}
-	// No live group for this app (a path that opened none); still surface the
-	// summary above any other live block so a committed line is never lost.
-	if summary != "" {
-		ui.WriteLine(p.w, summary)
+	// No live group for this app (a report with no prior deploy, as in tests, or a
+	// path that opened none): still surface the committed line — without the live
+	// pipeline there is no deploy stage to time, so the line omits its duration.
+	if info != nil {
+		var b strings.Builder
+		for _, ln := range info.Above {
+			b.WriteString(ln + "\n")
+		}
+		b.WriteString(ui.DeployLine(p.colors, app, info.Summary, info.Symbol, 0, info.NameW) + "\n")
+		ui.WriteLine(p.w, b.String())
 	}
 }
 
@@ -923,25 +932,34 @@ func syncStats(results []common.ResourceSyncResult) loop.SyncStats {
 
 // summaryBlock renders one app's committed sync block: the ship-emoji apply
 // line, preceded by a line per failed resource (✗) and per degraded one (⚠). It
-// is what a pipeline commits to scrollback in place of its live group, and what
-// destroy prints directly.
+// is what destroy prints directly (a synced app commits the richer pipeline
+// block via ui.CommitInfo instead).
 func summaryBlock(c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string, took time.Duration, nameW int) string {
 	var b strings.Builder
 	s := syncStats(results)
 	s.Degraded = len(degraded)
-	for _, res := range results {
-		if res.Status == common.ResultCodeSyncFailed {
-			fmt.Fprintf(&b, "  %s %s: %s\n", c.Red("✗"), res.ResourceKey.String(), res.Message)
-		}
-	}
-	// A resource applied cleanly but is broken at runtime (CrashLoop, failed
-	// Job): the sync succeeded, yet the developer needs to see it. Listed under
-	// the app line, distinct from a sync ✗.
-	for _, line := range degraded {
-		fmt.Fprintf(&b, "  %s %s\n", c.Yellow("⚠"), c.Dim(line))
+	for _, line := range failureLines(c, results, degraded) {
+		b.WriteString(line + "\n")
 	}
 	fmt.Fprintf(&b, "%s\n", appSyncLine(c, app, s, took, nameW))
 	return b.String()
+}
+
+// failureLines lists the per-resource notices that print above an app's committed
+// block: a ✗ for each resource the sync failed on, and a ⚠ for each that applied
+// cleanly but is broken at runtime (CrashLoop, failed Job) — a sync success the
+// developer still needs to see. Empty on a clean sync (the common case).
+func failureLines(c ui.Colors, results []common.ResourceSyncResult, degraded []string) []string {
+	var lines []string
+	for _, res := range results {
+		if res.Status == common.ResultCodeSyncFailed {
+			lines = append(lines, fmt.Sprintf("  %s %s: %s", c.Red("✗"), res.ResourceKey.String(), res.Message))
+		}
+	}
+	for _, line := range degraded {
+		lines = append(lines, fmt.Sprintf("  %s %s", c.Yellow("⚠"), c.Dim(line)))
+	}
+	return lines
 }
 
 // printSummary writes one app's summary block above any live block (destroy has
@@ -950,16 +968,11 @@ func printSummary(w io.Writer, c ui.Colors, app string, results []common.Resourc
 	ui.WriteLine(w, summaryBlock(c, app, results, degraded, took, nameW))
 }
 
-// appSyncLine renders one app's completed-sync status line — the committed form
-// of its pipeline's deploy, in the same 🚢 Deploy style as the live row so a
-// scrollback line and a live one read alike: a health symbol (✓ applied &
-// healthy · ⚠ applied but a resource is degraded · ✗ a sync task failed), the 🚢
-// icon with the explicit "Deploy" kind, the app name, and a dim summary of what
-// changed. nameW (the run's widest app name, 0 for a single-app run) pads the
-// name so the change-summary — and, when the summaries are equal width, the
-// trailing duration — line up across the streamed per-app lines. took, when > 0,
-// is appended (the per-app end-to-end timing); a zero duration omits it.
-func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration, nameW int) string {
+// applyParts renders the dim apply summary ("21 applied, 2 pruned, …") and the
+// health symbol (✓ applied & healthy · ⚠ applied but a resource is degraded · ✗ a
+// sync task failed) shared by the committed deploy row (ui.CommitInfo), the
+// deploy-only line, and `ksync destroy`.
+func applyParts(c ui.Colors, s loop.SyncStats) (summary, symbol string) {
 	parts := []string{fmt.Sprintf("%d applied", s.Applied)}
 	if s.Pruned > 0 {
 		parts = append(parts, fmt.Sprintf("%d pruned", s.Pruned))
@@ -970,24 +983,22 @@ func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration, 
 	if s.Degraded > 0 {
 		parts = append(parts, c.Yellow(fmt.Sprintf("%d degraded", s.Degraded)))
 	}
-	symbol := c.Green("✓")
+	symbol = c.Green("✓")
 	if s.Degraded > 0 {
 		symbol = c.Yellow("⚠")
 	}
 	if s.Failed > 0 {
 		symbol = c.Red("✗")
 	}
-	// k8s names are ASCII, so len is the display width; pad with plain spaces
-	// after the colored name so the next column starts at a fixed offset.
-	name := c.Bold(app)
-	if pad := nameW - len(app); pad > 0 {
-		name += strings.Repeat(" ", pad)
-	}
-	line := fmt.Sprintf("%s %s Deploy %s  %s", symbol, ui.IconDeploy, name, c.Dim(strings.Join(parts, ", ")))
-	if took > 0 {
-		line += "  " + ui.Elapsed(c, took)
-	}
-	return line
+	return c.Dim(strings.Join(parts, ", ")), symbol
+}
+
+// appSyncLine renders one app's completed-sync status line via the shared
+// ui.DeployLine layout — used by `ksync destroy`, which has no pipeline. took,
+// when > 0, is appended; a zero duration omits it.
+func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration, nameW int) string {
+	summary, symbol := applyParts(c, s)
+	return ui.DeployLine(c, app, summary, symbol, took, nameW)
 }
 
 // nameColWidth is the app-name column width for the streamed per-app summary

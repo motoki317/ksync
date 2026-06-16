@@ -125,7 +125,7 @@ func TestPipeline_NonTTYBuildPrintsDeploySilent(t *testing.T) {
 	d.Start()
 	clk.add(500 * time.Millisecond)
 	d.Done(nil)
-	p.Finish("✓ 🚢 ns-system  3 applied  1.5s\n")
+	p.Finish(CommitInfo{Summary: "3 applied", Symbol: "✓"})
 
 	out := buf.String()
 	if !strings.Contains(out, "Build img") {
@@ -136,6 +136,62 @@ func TestPipeline_NonTTYBuildPrintsDeploySilent(t *testing.T) {
 	}
 	if !strings.Contains(out, "3 applied") {
 		t.Errorf("Finish should print the committed summary, got %q", out)
+	}
+}
+
+// A finished build app commits its full stage tree — each build/import row and
+// the deploy row keep their final time — instead of collapsing to the deploy
+// line, so the per-stage timings survive after the run.
+func TestPipeline_CommittedTreeKeepsStageTimes(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "ns-system", true, clk)
+	d := p.Deploy()
+	b := p.Build("img")
+	clk.add(80 * time.Second)
+	b.Done(nil)
+	i := p.Import("img")
+	clk.add(8 * time.Second)
+	i.Done(nil)
+	d.Start()
+	clk.add(112 * time.Second)
+	d.Done(nil)
+
+	lines := p.committedTree(CommitInfo{Summary: "21 applied", Symbol: "✓"})
+	if lines[0] != "ns-system" {
+		t.Errorf("first committed line should be the app header, got %q", lines[0])
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, IconBuild) || !strings.Contains(joined, "img") || !strings.Contains(joined, "1m20s") {
+		t.Errorf("committed tree should keep the build row with its time, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, IconImport) || !strings.Contains(joined, "8.0s") {
+		t.Errorf("committed tree should keep the import row with its time, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "deploy") || !strings.Contains(joined, "21 applied") || !strings.Contains(joined, "1m52s") {
+		t.Errorf("committed deploy row should carry the apply summary and its time, got:\n%s", joined)
+	}
+}
+
+// A build-less app commits one deploy line — the app is the subject, the 🚢 icon
+// and the "N applied" summary say what happened — so the line carries no "Deploy"
+// word that would collide with the in-pipeline Deploy stage. The time shown is
+// the deploy stage's own, not an end-to-end wall clock.
+func TestPipeline_CommittedLineDropsDeployWord(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "db", false, clk)
+	d := p.Deploy()
+	d.Start()
+	clk.add(32 * time.Second)
+	d.Done(nil)
+
+	line := p.committedLine(CommitInfo{Summary: "40 applied", Symbol: "✓"})
+	if !strings.Contains(line, IconDeploy) || !strings.Contains(line, "db") || !strings.Contains(line, "40 applied") || !strings.Contains(line, "32s") {
+		t.Errorf("committed line should name the app with its apply summary and time, got %q", line)
+	}
+	if strings.Contains(strings.ToLower(line), "deploy") {
+		t.Errorf("committed deploy-only line must not carry the Deploy word, got %q", line)
 	}
 }
 

@@ -66,8 +66,12 @@ re-litigate only with new evidence):
   🚢 Deploy** stages (not-yet-reached stages shown as pending `○`; a deploy-only app collapses to
   one line) with a pinned Summary footer, height-clamped so concurrent groups never overflow.
   Each build/import command's output is collapsed to one live line per stage; the full log shows
-  only on failure. Off a terminal the block is inert (plain per-stage and per-app lines). See ADR
-  20260615-grouped-pipeline-progress.
+  only on failure. On commit a build app **freezes its whole stage tree** (every build/import/deploy
+  row keeps its own final time) instead of collapsing to the deploy line, so per-stage timings
+  survive the run; a build-less app commits one `🚢 <app>  N applied  <time>` line (no redundant
+  "Deploy" word — the committed deploy time is the deploy stage's own, via `ui.CommitInfo`). Off a
+  terminal the block is inert (plain per-stage and per-app lines). See ADRs
+  20260615-grouped-pipeline-progress and 20260616-committed-stage-timings.
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.

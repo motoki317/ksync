@@ -30,8 +30,14 @@ func TestPrintSummary_CleanIsCheckmark(t *testing.T) {
 	}
 	printSummary(&b, ui.NewColors(&b), "shop", results, nil, 1500*time.Millisecond, 0)
 	out := b.String()
-	if !strings.Contains(out, "✓") || !strings.Contains(out, "Deploy shop") || !strings.Contains(out, "2 applied") {
-		t.Errorf("clean summary = %q, want ✓ 🚢 Deploy shop 2 applied", out)
+	if !strings.Contains(out, "✓") || !strings.Contains(out, ui.IconDeploy+" shop") || !strings.Contains(out, "2 applied") {
+		t.Errorf("clean summary = %q, want ✓ 🚢 shop 2 applied", out)
+	}
+	// The committed line names the app directly, not "Deploy shop" — the icon and
+	// "N applied" already say what happened, so the word would only collide with
+	// the in-pipeline Deploy stage.
+	if strings.Contains(out, "Deploy") {
+		t.Errorf("committed line should drop the redundant Deploy word: %q", out)
 	}
 	// The per-app apply duration is appended (the watch loop and `ksync sync` both
 	// report it on the 🚢 line).
@@ -43,17 +49,18 @@ func TestPrintSummary_CleanIsCheckmark(t *testing.T) {
 	}
 }
 
-// The committed per-app line names the deploy stage explicitly (🚢 Deploy) and
-// pads the app name to the run's widest, so the change-summary column lines up
-// across the streamed lines regardless of how long each app's name is.
+// The committed per-app line leads with the 🚢 icon and the app name (no
+// redundant "Deploy" word) and pads the name to the run's widest, so the
+// change-summary column lines up across the streamed lines regardless of how
+// long each app's name is.
 func TestAppSyncLine_TitledAndAligned(t *testing.T) {
 	c := ui.NewColors(&bytes.Buffer{}) // not a TTY → plain, byte-offset-assertable text
 	nameW := nameColWidth([]config.App{{Name: "alloy"}, {Name: "ns-system"}})
 	short := appSyncLine(c, "alloy", loop.SyncStats{}, 300*time.Millisecond, nameW)
 	long := appSyncLine(c, "ns-system", loop.SyncStats{}, 23*time.Second, nameW)
 	for _, ln := range []string{short, long} {
-		if !strings.Contains(ln, "🚢 Deploy ") {
-			t.Errorf("committed line should name the deploy stage, got %q", ln)
+		if !strings.Contains(ln, ui.IconDeploy+" ") || strings.Contains(ln, "Deploy") {
+			t.Errorf("committed line should lead with the 🚢 icon and no Deploy word, got %q", ln)
 		}
 	}
 	if i, j := strings.Index(short, "0 applied"), strings.Index(long, "0 applied"); i != j {
