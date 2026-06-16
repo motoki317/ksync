@@ -7,7 +7,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -509,6 +508,7 @@ func runWatch(args []string) error {
 	debounce := fs.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
 	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
+	auto := fs.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
 	kctx := contextFlag(fs)
@@ -525,8 +525,13 @@ func runWatch(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// A cancelable context derived from the signal context, so the confirmation
+	// picker can quit the run on Ctrl-C/q (in raw mode the terminal delivers no
+	// SIGINT, so the picker calls cancel itself).
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
 
 	log, engineLog := setupLogging(*verbose)
 	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
@@ -564,11 +569,23 @@ func runWatch(args []string) error {
 		}
 		return stats, err
 	}
+	// By default ksync holds incremental changes for an explicit build/deploy
+	// choice via the confirmation picker; -auto (or a non-interactive stdin, which
+	// has no one to answer) keeps the classic auto-rebuild loop. The gate needs
+	// both a readable stdin (raw keystrokes) and a stderr terminal (to draw on).
+	var gate *loop.Gate
+	if !*auto && interactiveTerminal() {
+		gate = newBuildGate(ctx, cancel, os.Stderr, out)
+		log.Info("watching; on change you'll be asked what to rebuild — Ctrl-C to quit")
+	} else {
+		log.Info("watching; rebuilding automatically on change — Ctrl-C to quit")
+	}
+
 	// Frame the startup convergence like a `ksync sync` run — a Plan, a live
 	// Summary footer, then the committed Summary once every app has synced once
 	// — after which incremental syncs just stream. Stop the footer on exit so a
 	// Ctrl-C mid-convergence never leaves it pinned.
-	reporter := startWatchReporter(os.Stderr, out, prog, apps, kubeContext)
+	reporter := startWatchReporter(os.Stderr, out, log, prog, apps, kubeContext)
 	defer reporter.stop()
 	return loop.Run(ctx, apps, syncFn, loop.Options{
 		Debounce:    *debounce,
@@ -580,118 +597,169 @@ func runWatch(args []string) error {
 		// A build/render failure (or a failed sync) ends the run without a Report;
 		// remove the live group so a retry starts fresh rather than stacking rows.
 		OnError: func(app string, _ error) { prog.finish(app, nil) },
-		Resync:  resyncOnEnter(ctx, log),
+		Gate:    gate,
+		// On settling back to idle (convergence done, or a rebuild batch finished),
+		// commit a Summary block and log "watching for changes".
+		OnIdle: reporter.onIdle,
 	})
 }
 
-// resyncOnEnter returns a channel that fires whenever the user presses Enter,
-// the watch loop's manual "redeploy everything" control. It is active only when
-// stdin is an interactive terminal — under a pipe or a process manager there is
-// no keyboard, so it returns nil (the loop treats that as "never"). The reader
-// goroutine ends with the process; Ctrl-C remains the way to quit.
-func resyncOnEnter(ctx context.Context, log logr.Logger) <-chan struct{} {
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return nil
-	}
-	log.Info("watching; press Enter to resync all apps, Ctrl-C to quit")
-	ch := make(chan struct{})
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			select {
-			case ch <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return ch
+// interactiveTerminal reports whether ksync can run the confirmation picker: it
+// needs stdin to read raw keystrokes from and stderr (where it draws) to be a
+// terminal. Under a pipe, a redirect, or a process manager this is false and the
+// loop falls back to auto-rebuild.
+func interactiveTerminal() bool {
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
 }
 
-// watchReporter renders the watch loop's per-app sync lines and, for a
-// whole-stack watch, frames the startup convergence the way a `ksync sync` run
-// is framed: a Plan up front, a live Summary footer pinned with the running
-// tally, and the committed Summary block once every app has synced once. After
-// that first convergence it streams incremental syncs with no footer — a
-// per-keystroke summary block would be noise. A single-app watch skips all of
-// it (footer == nil) and just streams the one ship line, like a one-app sync.
-type watchReporter struct {
-	w       io.Writer
-	out     ui.Colors
-	prog    *progress
-	total   int
-	nameW   int
-	started time.Time
+// buildGate drives the interactive confirmation picker for the watch loop. Its
+// Ask launches one picker goroutine — the loop guarantees no overlap by issuing
+// exactly one prompt at a time — which reads the user's choice via
+// ui.ConfirmBuilds and reports it on Decisions; a quit (Ctrl-C / q) cancels the
+// run instead (in raw mode the terminal sends no SIGINT).
+type buildGate struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	w         io.Writer // stderr: where the picker draws and skip notes print
+	out       ui.Colors
+	decisions chan loop.Decision
+}
 
-	mu           sync.Mutex
-	agg          loop.SyncStats
-	degradedApps []string
-	seen         map[string]bool // apps that have completed their first sync
-	converged    bool
-	footer       *ui.Footer
+func newBuildGate(ctx context.Context, cancel context.CancelFunc, w io.Writer, out ui.Colors) *loop.Gate {
+	g := &buildGate{ctx: ctx, cancel: cancel, w: w, out: out, decisions: make(chan loop.Decision)}
+	return &loop.Gate{Ask: g.ask, Decisions: g.decisions}
+}
+
+func (g *buildGate) ask(pending []loop.PendingItem) {
+	items := make([]ui.PromptItem, len(pending))
+	for i, p := range pending {
+		if p.Build == loop.DeployOnly {
+			items[i] = ui.PromptItem{Icon: ui.IconDeploy, Label: p.Label, Note: "manifests only"}
+		} else {
+			items[i] = ui.PromptItem{Icon: ui.IconBuild, Label: p.Label, Note: p.App}
+		}
+	}
+	go func() {
+		selected, build, quit := ui.ConfirmBuilds(g.ctx, os.Stdin, g.w, g.out, items)
+		if quit {
+			g.cancel()
+			return
+		}
+		var chosen []loop.PendingItem
+		if build {
+			chosen = make([]loop.PendingItem, 0, len(selected))
+			for _, i := range selected {
+				chosen = append(chosen, pending[i])
+			}
+		} else {
+			plural := "s"
+			if len(pending) == 1 {
+				plural = ""
+			}
+			ui.WriteLine(g.w, g.out.Dim(fmt.Sprintf("— skipped (%d change%s still pending; edit to re-prompt)", len(pending), plural))+"\n")
+		}
+		select {
+		case g.decisions <- loop.Decision{Selected: chosen}:
+		case <-g.ctx.Done():
+		}
+	}()
+}
+
+// watchReporter renders the watch loop's per-app sync lines and frames each
+// batch — the initial convergence and every later rebuild — the way a `ksync
+// sync` run is framed: for a multi-app watch, a Plan up front, then a committed
+// Summary block once the batch settles. The initial convergence additionally
+// pins a live Summary footer with the running tally while it runs (it can be
+// slow); later rebuilds stream their pipelines and commit a Summary when idle.
+// Every batch, multi- or single-app, ends with a "watching for changes" log
+// line. A single-app watch skips the Plan/footer/Summary and just streams its
+// one ship line, like a one-app sync — but still logs the watching line.
+//
+// The batch tally (synced/agg/degraded) accumulates as apps report and is read
+// (under mu) by both the live footer and onIdle, then reset per batch.
+type watchReporter struct {
+	w     io.Writer
+	out   ui.Colors
+	log   logr.Logger
+	prog  *progress
+	total int
+	nameW int
+	multi bool // frame with a Plan/footer/Summary (more than one app)
+
+	mu       sync.Mutex
+	synced   int            // apps synced in the current batch
+	agg      loop.SyncStats // apply stats aggregated over the current batch
+	degraded []string       // degraded apps in the current batch
+	started  time.Time      // initial-convergence start, for the live footer's elapsed
+	footer   *ui.Footer     // live tally; pinned only during the initial convergence
 }
 
 // startWatchReporter prints the Plan and pins the live Summary footer for a
 // multi-app watch; a single-app watch gets an inert reporter (no Plan/footer).
-func startWatchReporter(w io.Writer, out ui.Colors, prog *progress, apps []config.App, kubeContext string) *watchReporter {
-	r := &watchReporter{w: w, out: out, prog: prog, total: len(apps), nameW: nameColWidth(apps), started: time.Now(), seen: make(map[string]bool, len(apps))}
-	if r.total <= 1 {
+func startWatchReporter(w io.Writer, out ui.Colors, log logr.Logger, prog *progress, apps []config.App, kubeContext string) *watchReporter {
+	r := &watchReporter{w: w, out: out, log: log, prog: prog, total: len(apps), nameW: nameColWidth(apps), multi: len(apps) > 1, started: time.Now()}
+	if !r.multi {
 		return r
 	}
 	printPlan(w, out, apps, kubeContext)
 	r.footer = ui.StartFooter(w, out, func() []string {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		return summaryLines(out, r.total, len(r.seen), r.agg, r.degradedApps, time.Since(r.started), false)
+		return summaryLines(out, r.total, r.synced, r.agg, r.degraded, time.Since(r.started), false)
 	})
 	return r
 }
 
 // report commits one completed app sync (the loop's Report hook): it Finishes
-// the app's pipeline — a build app's frozen stage tree or a build-less app's ship
-// line — and on the run that completes the initial convergence commits the
-// Summary block and removes the footer. The deploy time on the committed line is
-// the deploy stage's own, read from the pipeline, so took is not needed here.
+// the app's pipeline — a build app's frozen stage tree or a build-less app's
+// ship line — and tallies the sync into the current batch (read back by the
+// footer and onIdle). The deploy time on the committed line is the deploy
+// stage's own, read from the pipeline, so took is not needed here.
 func (r *watchReporter) report(app string, stats loop.SyncStats, _ time.Duration) {
 	summary, symbol := applyParts(r.out, stats)
 	info := &ui.CommitInfo{Summary: summary, Symbol: symbol, NameW: r.nameW}
-	done := false
 	r.mu.Lock()
-	// Tally each app's FIRST sync only, so the Summary reflects one convergence
-	// rather than every later edit; convergence is when all apps have synced.
-	// Idle (no app dirty/running) is reached only when every app has succeeded,
-	// so a stuck app holds the footer open instead of committing a false "done".
-	if r.footer != nil && !r.converged && !r.seen[app] {
-		r.seen[app] = true
-		r.agg.Applied += stats.Applied
-		r.agg.Pruned += stats.Pruned
-		r.agg.Failed += stats.Failed
-		r.agg.Degraded += stats.Degraded
-		if stats.Degraded > 0 {
-			r.degradedApps = append(r.degradedApps, app)
-		}
-		if len(r.seen) == r.total {
-			r.converged = true
-			done = true
-		}
+	r.synced++
+	r.agg.Applied += stats.Applied
+	r.agg.Pruned += stats.Pruned
+	r.agg.Failed += stats.Failed
+	r.agg.Degraded += stats.Degraded
+	if stats.Degraded > 0 {
+		r.degraded = append(r.degraded, app)
 	}
 	r.mu.Unlock()
-
 	r.prog.finish(app, info)
+}
 
-	if done {
-		r.footer.Stop()
-		r.mu.Lock()
-		final := summaryLines(r.out, r.total, len(r.seen), r.agg, r.degradedApps, time.Since(r.started), true)
-		r.mu.Unlock()
-		printSummaryBlock(r.w, final)
+// onIdle closes out a batch (the loop's OnIdle hook): it commits the batch's
+// Summary block (multi-app only) and logs a watching-for-changes line, then
+// resets the per-batch tally for the next one. The initial convergence also has
+// a live footer to tear down first, so its pinned block is replaced by the
+// committed Summary. took is the batch's wall-clock, from the loop.
+func (r *watchReporter) onIdle(took time.Duration) {
+	r.mu.Lock()
+	synced, agg, degraded := r.synced, r.agg, r.degraded
+	r.synced, r.agg, r.degraded = 0, loop.SyncStats{}, nil
+	footer := r.footer
+	r.footer = nil
+	r.mu.Unlock()
+
+	footer.Stop() // nil-safe; present only for the initial convergence
+	if r.multi {
+		printSummaryBlock(r.w, summaryLines(r.out, r.total, synced, agg, degraded, took, true))
 	}
+	r.log.Info("finished, watching for changes")
 }
 
 // stop removes the live footer; idempotent, so the deferred call after the loop
-// exits is harmless when convergence already stopped it. It matters when Ctrl-C
+// exits is harmless when a batch already stopped it. It matters when Ctrl-C
 // arrives mid-convergence — without it the footer stays pinned.
-func (r *watchReporter) stop() { r.footer.Stop() }
+func (r *watchReporter) stop() {
+	r.mu.Lock()
+	footer := r.footer
+	r.mu.Unlock()
+	footer.Stop()
+}
 
 // progress coordinates the per-app pipelines (ui.Pipeline) that group an app's
 // build, import, and deploy stages under one header. One pipeline per app run:
@@ -792,10 +860,10 @@ func makeBuildFunc(cfg *config.Config, prog *progress, kubeContext string) loop.
 		pipe := prog.pipeline(app)
 		// A batch is either one ungrouped entry or all the dirty members of one
 		// group; builds[0].Group tells which, since the loop never mixes them. The
-		// app heads the group, so an ungrouped label is just the image name and a
-		// group's label is the group name plus its member count (how many images
-		// this one bake produces).
-		label := imageName(builds[0].Image)
+		// app heads the group, so an ungrouped label is the build's name (the same
+		// name the confirmation prompt uses) and a group's label is the group name
+		// plus its member count (how many images this one bake produces).
+		label := builds[0].Name
 		if group := builds[0].Group; group != "" {
 			label = fmt.Sprintf("%s (%d)", group, len(builds))
 		}
@@ -838,19 +906,6 @@ func makeBuildFunc(cfg *config.Config, prog *progress, kubeContext string) loop.
 		}
 		return refs, nil
 	}
-}
-
-// imageName is the short, human-facing name of an image ref for progress
-// labels: the last path segment without the tag (ghcr.io/org/ns-auth-dev →
-// ns-auth-dev).
-func imageName(image string) string {
-	if i := strings.LastIndexByte(image, ':'); i > strings.LastIndexByte(image, '/') {
-		image = image[:i]
-	}
-	if i := strings.LastIndexByte(image, '/'); i >= 0 {
-		image = image[i+1:]
-	}
-	return image
 }
 
 func runDestroy(args []string) error {
