@@ -638,6 +638,279 @@ func TestRun_DependentBuildsWhileDependencyDeploys(t *testing.T) {
 	}
 }
 
+// fakeGate is a test double for the manual gate: it records each Ask's items and
+// lets the test drive the Decision channel, so the gate's hold/release behavior
+// is exercised without a real terminal.
+type fakeGate struct {
+	mu      sync.Mutex
+	asks    [][]PendingItem
+	decided chan Decision
+}
+
+func newFakeGate() *fakeGate { return &fakeGate{decided: make(chan Decision)} }
+
+func (g *fakeGate) gate() *Gate { return &Gate{Ask: g.ask, Decisions: g.decided} }
+
+func (g *fakeGate) ask(items []PendingItem) {
+	g.mu.Lock()
+	g.asks = append(g.asks, items)
+	g.mu.Unlock()
+}
+
+func (g *fakeGate) askCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.asks)
+}
+
+func (g *fakeGate) lastAsk() []PendingItem {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.asks) == 0 {
+		return nil
+	}
+	return append([]PendingItem(nil), g.asks[len(g.asks)-1]...)
+}
+
+// A held source change is not built until the user decides; the gate is asked
+// with the dirty image, and the matching decision then builds and deploys it.
+func TestRun_GateHoldsBuildUntilDecision(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	app.Build[0].Name = "api-b" // config.Parse defaults this; set it directly here
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	g := newFakeGate()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Gate: g.gate()})
+	}()
+
+	// Startup still converges automatically (the gate only holds incremental change).
+	waitFor(t, func() bool { return len(sink.synced()) == 1 && builder.builds() == 1 })
+
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	items := g.lastAsk()
+	if len(items) != 1 || items[0].App != "app1" || items[0].Build != 0 || items[0].Label != "api-b" {
+		t.Fatalf("ask items = %+v, want one build item (app1, entry 0, api-b)", items)
+	}
+	if got := builder.builds(); got != 1 {
+		t.Fatalf("build ran before the decision: builds=%d, want 1 (held)", got)
+	}
+
+	g.decided <- Decision{Selected: items}
+	waitFor(t, func() bool { return builder.builds() == 2 && len(sink.synced()) == 2 })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// Skipping (an empty decision) builds nothing; a later, new change re-asks.
+func TestRun_GateSkipBuildsNothing(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	g := newFakeGate()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Gate: g.gate()})
+	}()
+	waitFor(t, func() bool { return builder.builds() == 1 })
+
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edit 1\n")
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	g.decided <- Decision{} // skip
+
+	// Nothing should build; a skip holds without acting.
+	time.Sleep(100 * time.Millisecond)
+	if got := builder.builds(); got != 1 {
+		t.Fatalf("skip built anyway: builds=%d, want 1", got)
+	}
+
+	// A fresh change re-arms the prompt.
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edit 2\n")
+	waitFor(t, func() bool { return g.askCount() == 2 })
+
+	cancel()
+	<-done
+}
+
+// A manifest-only change is offered as a deploy-only item and, when chosen,
+// redeploys without rebuilding.
+func TestRun_GateManifestChangeIsDeployOnly(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	g := newFakeGate()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Gate: g.gate()})
+	}()
+	waitFor(t, func() bool { return len(sink.synced()) == 1 && builder.builds() == 1 })
+
+	writeFile(t, filepath.Join(tmp, "app1", "deployment.yaml"),
+		strings.Replace(deploymentYAML, "name: api", "name: api-renamed", 1))
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	items := g.lastAsk()
+	if len(items) != 1 || items[0].Build != DeployOnly || items[0].App != "app1" {
+		t.Fatalf("ask items = %+v, want one deploy-only item for app1", items)
+	}
+
+	g.decided <- Decision{Selected: items}
+	waitFor(t, func() bool { return len(sink.synced()) == 2 })
+	if got := builder.builds(); got != 1 {
+		t.Errorf("manifest-only change rebuilt: builds=%d, want 1", got)
+	}
+
+	cancel()
+	<-done
+}
+
+// Selecting a subset builds only the chosen images; the unselected one stays
+// pending and is re-offered once the chosen work finishes.
+func TestRun_GateSubsetLeavesRemainderPending(t *testing.T) {
+	tmp := t.TempDir()
+	app := multiBuildApp(t, tmp, 2) // images api-b, api-c from one shared source dir
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	g := newFakeGate()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, MaxParallel: 4, Build: builder.build, Gate: g.gate()})
+	}()
+	// Startup builds both images.
+	waitFor(t, func() bool { return builder.builds() == 2 })
+
+	// A shared-source edit dirties both; the gate offers both.
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	items := g.lastAsk()
+	if len(items) != 2 {
+		t.Fatalf("ask items = %+v, want both dirty images", items)
+	}
+
+	// Choose only the first image.
+	g.decided <- Decision{Selected: items[:1]}
+	// Exactly one more build runs (the chosen image); the other stays held.
+	waitFor(t, func() bool { return builder.builds() == 3 })
+	// The remainder is re-offered once the chosen work finishes.
+	waitFor(t, func() bool { return g.askCount() == 2 })
+	remainder := g.lastAsk()
+	if len(remainder) != 1 || remainder[0].App != items[1].App || remainder[0].Build != items[1].Build {
+		t.Fatalf("re-offer = %+v, want only the unselected image %+v", remainder, items[1])
+	}
+	if got := builder.builds(); got != 3 {
+		t.Errorf("the unselected image built without being chosen: builds=%d, want 3", got)
+	}
+
+	cancel()
+	<-done
+}
+
+// idleRecorder counts the loop's OnIdle calls (one per settled batch) and keeps
+// the last reported batch duration.
+type idleRecorder struct {
+	mu    sync.Mutex
+	calls int
+	last  time.Duration
+}
+
+func (r *idleRecorder) onIdle(took time.Duration) {
+	r.mu.Lock()
+	r.calls++
+	r.last = took
+	r.mu.Unlock()
+}
+
+func (r *idleRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+func (r *idleRecorder) lastTook() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last
+}
+
+// OnIdle fires exactly once when a batch settles back to idle: once for the
+// initial convergence (however many apps it synced), and once more per later
+// change batch — the signal the command layer turns into a per-batch summary.
+func TestRun_OnIdleFiresOncePerBatch(t *testing.T) {
+	tmp := t.TempDir()
+	writeApp(t, tmp, "app1")
+	writeApp(t, tmp, "app2")
+	apps := []config.App{
+		{Name: "app1", Path: filepath.Join(tmp, "app1")},
+		{Name: "app2", Path: filepath.Join(tmp, "app2")},
+	}
+	rec := &recorder{calls: map[string]int{}}
+	idle := &idleRecorder{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, apps, rec.sync, Options{Debounce: 20 * time.Millisecond, OnIdle: idle.onIdle})
+	}()
+
+	// The whole startup convergence settles to idle once, not once per app.
+	waitFor(t, func() bool { return rec.count("app1") == 1 && rec.count("app2") == 1 })
+	waitFor(t, func() bool { return idle.count() == 1 })
+	if idle.lastTook() <= 0 {
+		t.Errorf("OnIdle took = %v, want a positive batch duration", idle.lastTook())
+	}
+
+	// One change forms a new batch; settling again fires OnIdle a second time.
+	writeFile(t, filepath.Join(tmp, "app1", "configmap.yaml"), configmapYAML("changed"))
+	waitFor(t, func() bool { return idle.count() == 2 })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// A change merely held by the manual gate (then skipped) runs no build or
+// deploy, so the loop never re-enters a busy span and OnIdle must not fire — a
+// "finished" summary for work that never ran would be misleading.
+func TestRun_OnIdleNotFiredByHeldGateChange(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	g := newFakeGate()
+	idle := &idleRecorder{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Gate: g.gate(), OnIdle: idle.onIdle})
+	}()
+	// Startup convergence still fires OnIdle once (it runs work directly).
+	waitFor(t, func() bool { return len(sink.synced()) == 1 })
+	waitFor(t, func() bool { return idle.count() == 1 })
+
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	g.decided <- Decision{} // skip: hold the change, run nothing
+
+	time.Sleep(100 * time.Millisecond)
+	if got := idle.count(); got != 1 {
+		t.Errorf("a held/skipped change must not fire OnIdle: count=%d, want 1", got)
+	}
+
+	cancel()
+	<-done
+}
+
 type recorder struct {
 	mu        sync.Mutex
 	calls     map[string]int

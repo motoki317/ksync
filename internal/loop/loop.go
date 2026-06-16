@@ -44,6 +44,37 @@ type SyncFunc func(ctx context.Context, app string, objects []*unstructured.Unst
 // its images), so it is what distinguishes the two apps' progress lines.
 type BuildFunc func(ctx context.Context, app string, builds []config.Build) ([]string, error)
 
+// DeployOnly marks a PendingItem as a manifest-only redeploy (no image rebuild),
+// as opposed to a non-negative build-entry index.
+const DeployOnly = -1
+
+// PendingItem is one change the manual gate holds back awaiting the user's
+// decision: a dirty image build (Build is its entry index, Label its build name)
+// or a manifest-only redeploy of an app (Build == DeployOnly, Label the app name).
+type PendingItem struct {
+	App   string
+	Build int
+	Label string
+}
+
+// Decision is the user's answer to one gate prompt: the items to build and deploy
+// now. An empty Selected means skip — build nothing and keep watching.
+type Decision struct {
+	Selected []PendingItem
+}
+
+// Gate makes the watch loop ask before acting on incremental changes instead of
+// rebuilding automatically. When set, the loop collects each change's affected
+// images/apps and, once idle, hands the pending list to Ask; it then acts only on
+// the items returned on Decisions. Ask must not block the loop — it kicks off the
+// async picker, and exactly one prompt is outstanding at a time (the loop calls
+// Ask again only after a Decision). A nil Gate keeps the classic auto-rebuild
+// behavior, which is also the fallback when stdin is not an interactive terminal.
+type Gate struct {
+	Ask       func([]PendingItem)
+	Decisions <-chan Decision
+}
+
 // Options tune the loop; zero values get sensible watch-mode defaults.
 type Options struct {
 	Debounce    time.Duration // default 200ms
@@ -61,10 +92,22 @@ type Options struct {
 	// sync) and Report therefore does not fire — the command layer uses it to
 	// tear down that app's live progress group so a retry starts clean. Optional.
 	OnError func(app string, err error)
-	// Resync, when a value is received, marks every app dirty — the manual
-	// "redeploy everything now" the watch command wires to keyboard input.
-	// A nil channel simply never fires.
+	// Resync, when a value is received, marks every app dirty — a programmatic
+	// "redeploy everything now". A nil channel simply never fires.
 	Resync <-chan struct{}
+	// Gate, when set, holds incremental changes for an explicit build/deploy
+	// decision instead of rebuilding automatically (see Gate). Nil keeps the
+	// auto-rebuild behavior — the only option when stdin is not interactive.
+	Gate *Gate
+	// OnIdle, when set, is called each time the loop settles back to idle after
+	// doing work — once for the initial convergence and once per rebuild batch.
+	// took is the batch's wall-clock (from the loop leaving idle to returning to
+	// it). The command layer uses it to print a per-batch summary and a
+	// watching-for-changes line. It runs on the loop goroutine, after every app's
+	// Report for the batch has fired, so it may read state those Reports updated.
+	// Pure change accumulation in the manual gate never counts as work, so a held
+	// or skipped change does not trigger it. Optional.
+	OnIdle func(took time.Duration)
 }
 
 func (o *Options) applyDefaults() {
@@ -261,6 +304,87 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		}
 	}
 
+	// Manual gate state. Incremental changes accumulate here (instead of marking
+	// the schedulers dirty) until the user picks what to build; startup
+	// convergence is unaffected (it marks the schedulers directly above).
+	gate := opts.Gate
+	var gateDecisions <-chan Decision
+	if gate != nil {
+		gateDecisions = gate.Decisions
+	}
+	pendingBuilds := make(map[string]map[int]bool) // app -> dirty build-entry set
+	pendingDeploy := make(map[string]bool)         // app -> manifest-only redeploy pending
+	prompting := false                             // a prompt is outstanding (awaiting a Decision)
+	dismissed := false                             // user skipped; do not re-ask until a new change
+	var promptDeadline time.Time                   // debounce: prompt only after the change burst settles
+
+	// Busy-span tracking: a batch begins when the loop leaves idle (work starts)
+	// and ends when it returns to idle, at which point OnIdle reports the span.
+	busy := false
+	var busySince time.Time
+
+	pendingEmpty := func() bool {
+		for _, m := range pendingBuilds {
+			if len(m) > 0 {
+				return false
+			}
+		}
+		return len(pendingDeploy) == 0
+	}
+	// pendingItems is the ordered prompt list: a 🔨 row per dirty image, then a 🚢
+	// row for an app whose manifests changed with no image pending (a built app
+	// redeploys anyway, so that row would be redundant).
+	pendingItems := func() []PendingItem {
+		var items []PendingItem
+		for _, a := range apps {
+			m := pendingBuilds[a.Name]
+			for j := range a.Build {
+				if m[j] {
+					items = append(items, PendingItem{App: a.Name, Build: j, Label: a.Build[j].Name})
+				}
+			}
+			if pendingDeploy[a.Name] && len(m) == 0 {
+				items = append(items, PendingItem{App: a.Name, Build: DeployOnly, Label: a.Name})
+			}
+		}
+		return items
+	}
+	gateIdle := func() bool { return buildSched.Idle() && deploySched.Idle() }
+	// maybePrompt hands the pending list to the gate once the loop is idle and the
+	// change burst has settled, exactly once per batch (prompting guards re-asks).
+	maybePrompt := func(now time.Time) {
+		if gate == nil || prompting || dismissed || pendingEmpty() || !gateIdle() || now.Before(promptDeadline) {
+			return
+		}
+		items := pendingItems()
+		if len(items) == 0 {
+			return
+		}
+		prompting = true
+		gate.Ask(items)
+	}
+	// release acts on one chosen item: a build re-dirties its entry and schedules
+	// the build plus the deploy (gated on the build); a deploy-only schedules the
+	// redeploy. Either way the app's pending manifest flag clears (the redeploy
+	// covers it).
+	release := func(it PendingItem, now time.Time) {
+		if it.Build == DeployOnly {
+			delete(pendingDeploy, it.App)
+			deploySched.MarkDirty(it.App, now)
+			return
+		}
+		if m := pendingBuilds[it.App]; m != nil {
+			delete(m, it.Build)
+			if len(m) == 0 {
+				delete(pendingBuilds, it.App)
+			}
+		}
+		builds[it.App][it.Build].dirty = true
+		buildSched.MarkDirty(it.App, now)
+		deploySched.MarkDirty(it.App, now)
+		delete(pendingDeploy, it.App)
+	}
+
 	for {
 		now := time.Now()
 		for _, name := range buildSched.StartDue(now) {
@@ -311,8 +435,34 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			}()
 		}
 
+		// Report each busy→idle transition (a convergence or rebuild batch settling)
+		// before re-prompting, so a batch summary lands ahead of any remainder
+		// prompt. A change merely held by the gate never sets busy, so it does not
+		// trigger a spurious "finished".
+		if gateIdle() {
+			if busy {
+				busy = false
+				if opts.OnIdle != nil {
+					opts.OnIdle(now.Sub(busySince))
+				}
+			}
+		} else if !busy {
+			busy = true
+			busySince = now
+		}
+
+		maybePrompt(now)
+
 		var timerC <-chan time.Time
-		if deadline, ok := earliestDeadline(buildSched, deploySched); ok {
+		deadline, ok := earliestDeadline(buildSched, deploySched)
+		// When the gate is armed and idle, also wake at the prompt deadline so the
+		// menu appears once a change burst settles, even with no scheduler work due.
+		if gate != nil && !prompting && !dismissed && !pendingEmpty() && gateIdle() {
+			if !ok || promptDeadline.Before(deadline) {
+				deadline, ok = promptDeadline, true
+			}
+		}
+		if ok {
 			timerC = time.After(time.Until(deadline))
 		}
 
@@ -325,13 +475,45 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				deploySched.MarkDirty(a.Name, now)
 			}
 			log.Info("manual resync requested", "apps", len(apps))
+		case dec := <-gateDecisions:
+			now := time.Now()
+			prompting = false
+			if len(dec.Selected) == 0 {
+				// Skip: keep the pending set but stop asking until a new change.
+				dismissed = true
+				log.V(1).Info("build prompt skipped")
+				break
+			}
+			for _, it := range dec.Selected {
+				release(it, now)
+			}
+			// Re-offer any unselected remainder once this work finishes (idle again).
+			promptDeadline = now
 		case path, ok := <-watcher.Events:
 			if !ok {
 				return nil
 			}
 			now := time.Now()
+			changed := false
 			for _, key := range mapping.AffectedBy(path) {
 				name, entry, isBuild := parseKey(key)
+				if gate != nil {
+					// Manual gate: hold the change for the user's decision instead of
+					// scheduling it. A build dirties its entry's pending set; any other
+					// change marks a manifest-only redeploy.
+					if isBuild {
+						log.V(1).Info("source change held for confirmation", "path", path, "app", name, "image", byName[name].Build[entry].Image)
+						if pendingBuilds[name] == nil {
+							pendingBuilds[name] = map[int]bool{}
+						}
+						pendingBuilds[name][entry] = true
+					} else {
+						log.V(1).Info("change held for confirmation", "path", path, "app", name)
+						pendingDeploy[name] = true
+					}
+					changed = true
+					continue
+				}
 				if isBuild {
 					log.V(1).Info("source change detected", "path", path, "app", name, "image", byName[name].Build[entry].Image)
 					builds[name][entry].dirty = true
@@ -342,6 +524,12 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				// Either way the app must re-deploy; the external gate makes the
 				// deploy wait when a rebuild is also pending.
 				deploySched.MarkDirty(name, now)
+			}
+			if changed {
+				// A new change re-arms the prompt (clears a prior skip) and restarts
+				// the debounce so a burst coalesces into one menu.
+				dismissed = false
+				promptDeadline = now.Add(opts.Debounce)
 			}
 		case err := <-watcher.Errors:
 			log.Error(err, "watch error")
