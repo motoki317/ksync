@@ -37,7 +37,11 @@ re-litigate only with new evidence):
 ## Repo at a glance
 
 - `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / destroy`
-  implemented; `diff` still a stub).
+  implemented; `diff` still a stub). `override.go` resolves **image overrides** (`--image IMAGE=REF`
+  on sync/watch, or `KSYNC_IMAGE_OVERRIDES`): a supplied ref deploys a pre-built image instead of
+  building that `build:` entry — the build (and its `imageLoad`) is skipped and the ref is injected
+  at deploy; an override for an image no app builds is dropped with a note. This is what lets a
+  wrapper own image resolution and call ksync as the deploy engine (ADR 20260616-image-override).
 - `internal/config` — ksync.yaml model: app list, `allowedContexts` allowlist (the safety model —
   the run targets the current-context or `--context`, but it must match an entry; entries are
   shell-style globs (`path.Match`, e.g. `k3s-*` for per-worktree microVMs), a plain name matches
@@ -100,7 +104,9 @@ re-litigate only with new evidence):
   two phases independently: an image builds the moment its source is dirty (needs-free), overlapping
   the dependency chain's deploys, while the deploy stays `needs`-gated and waits on the external gate
   until its own build finishes — so an unbuilt tag is never deployed, and `--max-parallel` now bounds
-  builds and deploys with independent budgets (ADR 20260616-eager-build-ahead). Manifest-only edits
+  builds and deploys with independent budgets (ADR 20260616-eager-build-ahead). An entry in
+  `Options.Overrides` (a supplied image ref) is never built and its sources are not watched — the ref
+  is injected at deploy (ADR 20260616-image-override). Manifest-only edits
   never invoke docker. By default (interactive TTY, no `-auto`) incremental changes pass through a
   **manual gate** (`Options.Gate`): instead of scheduling, they accumulate into a pending set and,
   once idle, the loop asks which images/apps to rebuild via the `internal/ui` picker, acting only on

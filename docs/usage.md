@@ -357,6 +357,43 @@ keep their tags. (ksync renders kustomize; if your services are deployed another
 helmfile, say — give each a small kustomization that inflates its chart via `helmCharts:` so
 ksync can render and tag-inject it.)
 
+### Using a pre-built image instead of building (`--image` / `KSYNC_IMAGE_OVERRIDES`)
+
+Sometimes the image already exists and you do not want ksync to build it: a CI artifact, a
+`docker pull` of a registry tag, a pinned digest, or a wrapper script that resolves a ref per
+service its own way. Give ksync the ref and it deploys that instead of building from source — for
+that image only; the app's other builds are unaffected.
+
+Two equivalent inputs, accepted by `sync` and `watch`:
+
+```bash
+# Repeatable flag — IMAGE is the build entry's image:, REF is the ref to deploy.
+ksync sync --image ghcr.io/team-a/api-b=ghcr.io/team-a/api-b:ci-1234 \
+           --image ghcr.io/team-a/ui-b=ghcr.io/team-a/ui-b@sha256:abc…
+
+# Env var — whitespace/newline-separated IMAGE=REF tokens (handy for a script).
+export KSYNC_IMAGE_OVERRIDES="
+  ghcr.io/team-a/api-b=ghcr.io/team-a/api-b:ci-1234
+  ghcr.io/team-a/ui-b=ghcr.io/team-a/ui-b@sha256:abc…
+"
+ksync sync
+```
+
+- `IMAGE` is the `build` entry's `image:` exactly (the bare name; it is unique across the config).
+- `REF` is a bare tag (`ci-1234`), `:tag`, a full `name:tag`, a digest (`@sha256:…`), or
+  `name@digest`. A name that differs from `IMAGE` redirects the registry/repo; otherwise only the
+  tag/digest changes. A flag beats the env var for the same image.
+- An overridden image is **not built**, and in `watch` its sources are not watched (a source edit
+  does nothing; a manifest edit still redeploys, re-injecting the ref). Because the build is
+  skipped, the `imageLoad` step is skipped too — **making the supplied image visible to the cluster
+  is the supplier's job** (it is already a registry image the cluster can pull, or you loaded it).
+- An override naming an image no app builds is ignored with a note, so a wrapper can hand ksync its
+  full set of resolved refs without tracking which ones ksync builds.
+
+This is what lets a wrapper own image resolution and use ksync purely as the deploy engine: resolve
+every ref (build/pull/pin), make them cluster-visible, then `ksync sync` with the overrides. See
+ADR 20260616-image-override.
+
 ### Making built images visible to the cluster
 
 ksync builds into your **local docker daemon**. Docker Desktop's Kubernetes runs pods straight
@@ -668,7 +705,8 @@ mostly idle for the CPU; when those dominate, `-max-parallel 0` (no limit) or a 
 core count can still shorten the run.
 
 It takes the same `-timeout` (default `5m`), `-max-parallel`, and `-v` flags as `watch`, plus
-`--force` (re-run hooks even with no diff, above). The timeout matters
+`--force` (re-run hooks even with no diff, above) and `--image`/`KSYNC_IMAGE_OVERRIDES` (deploy a
+pre-built image instead of building it — see "Using a pre-built image"). The timeout matters
 most here: a one-time sync waits for the app to become healthy, so without it a pod stuck in
 `ErrImagePull` would hang `ksync sync` forever. On timeout the sync fails and names the
 resources that never became healthy, so you know where to look.

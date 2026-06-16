@@ -82,8 +82,15 @@ type Options struct {
 	RetryBase   time.Duration // default 1s
 	RetryMax    time.Duration // default 2m
 	Render      render.Options
-	Build       BuildFunc // required when any app declares builds
-	Log         logr.Logger
+	Build       BuildFunc // required when any app declares builds (that aren't all overridden)
+	// Overrides pins externally-supplied image refs instead of building them: a
+	// build entry whose Image is a key here is never built (its source changes are
+	// not watched) and the given ref is injected at deploy in place of a built
+	// tag. Keyed by the build entry's Image. This lets a pre-built image (a CI
+	// artifact, a registry pull resolved by a wrapper) stand in for a local build.
+	// See ADR 20260616-image-override.
+	Overrides map[string]render.Image
+	Log       logr.Logger
 	// Report renders one app's completed sync. The loop calls it on success so
 	// the watch output matches `ksync sync`'s ship-emoji apply line rather than
 	// a plain log record; when nil, the loop logs a structured "synced" line.
@@ -138,6 +145,10 @@ type buildState struct {
 	scope *build.Scope
 	dirty bool
 	tag   string
+	// override, when set, is the externally-supplied image ref for this entry
+	// (Options.Overrides). It is never built and its sources are not watched; the
+	// ref is injected at deploy in place of a built tag.
+	override *render.Image
 }
 
 // Run watches the apps' inputs and builds+renders+syncs them on change until
@@ -154,13 +165,22 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	byName := make(map[string]config.App, len(apps))
 	scheduleApps := make([]schedule.App, len(apps)) // deploy phase: needs-gated
 	var buildApps []schedule.App                    // build phase: no needs edges
+	buildable := make(map[string]bool, len(apps))   // apps with ≥1 entry to actually build (not overridden)
 	for i, a := range apps {
-		if len(a.Build) > 0 && opts.Build == nil {
-			return fmt.Errorf("app %s declares builds but no build function is configured", a.Name)
-		}
 		byName[a.Name] = a
 		scheduleApps[i] = schedule.App{Name: a.Name, Needs: a.Needs}
-		if len(a.Build) > 0 {
+		for j := range a.Build {
+			if _, ov := opts.Overrides[a.Build[j].Image]; !ov {
+				buildable[a.Name] = true
+				break
+			}
+		}
+		// A build func is needed only for entries actually built; an app whose
+		// every build is overridden deploys the supplied refs with no builder.
+		if buildable[a.Name] {
+			if opts.Build == nil {
+				return fmt.Errorf("app %s declares builds but no build function is configured", a.Name)
+			}
 			buildApps = append(buildApps, schedule.App{Name: a.Name})
 		}
 	}
@@ -169,6 +189,9 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	deriveScopes := func(app config.App) {
 		states := builds[app.Name]
 		for j := range states {
+			if states[j].override != nil {
+				continue // overridden entries are never watched or built
+			}
 			scope, err := build.WatchScope(app.Build[j])
 			if err != nil {
 				log.Error(err, "deriving build watch scope; watching without ignore rules", "app", app.Name, "image", app.Build[j].Image)
@@ -179,7 +202,12 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	for _, a := range apps {
 		states := make([]buildState, len(a.Build))
 		for j := range states {
-			states[j].dirty = true
+			if ov, ok := opts.Overrides[a.Build[j].Image]; ok {
+				o := ov
+				states[j].override = &o // supplied ref: deploy it, never build
+			} else {
+				states[j].dirty = true
+			}
 		}
 		builds[a.Name] = states
 		deriveScopes(a)
@@ -205,6 +233,9 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		entries := append([]watch.AppRoots{}, appRoots...)
 		for _, a := range apps {
 			for j, st := range builds[a.Name] {
+				if st.override != nil {
+					continue // not built → not watched
+				}
 				entries = append(entries, watch.AppRoots{
 					App:    buildKey(a.Name, j),
 					Roots:  st.scope.Roots,
@@ -223,6 +254,9 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		}
 		for _, a := range apps {
 			for _, st := range builds[a.Name] {
+				if st.override != nil {
+					continue // not built → not watched
+				}
 				for _, r := range st.scope.Roots {
 					roots = append(roots, watch.Root{Path: r, Skip: st.scope.SkipDir})
 				}
@@ -276,7 +310,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		// Every app deploys once at startup to converge the cluster; a build-app's
 		// deploy waits on the external gate until its startup build completes.
 		deploySched.MarkDirty(a.Name, now)
-		if len(a.Build) > 0 {
+		if buildable[a.Name] {
 			buildSched.MarkDirty(a.Name, now)
 		}
 	}
@@ -418,16 +452,22 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		for _, name := range deploySched.StartDue(now) {
 			app := byName[name]
 			states := builds[name]
-			tags := make(map[int]string, len(states))
+			// Build the deploy's image set under the loop goroutine (the deploy
+			// goroutine must not touch shared state): an overridden entry injects
+			// its supplied ref, a built one its remembered tag.
+			images := make([]render.Image, 0, len(states))
 			for j := range states {
-				if states[j].tag != "" {
-					tags[j] = states[j].tag
+				switch {
+				case states[j].override != nil:
+					images = append(images, *states[j].override)
+				case states[j].tag != "":
+					images = append(images, render.Image{Name: app.Build[j].Image, NewTag: states[j].tag})
 				}
 			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				r := rn.runDeploy(ctx, app, tags)
+				r := rn.runDeploy(ctx, app, images)
 				select {
 				case deployResults <- r:
 				case <-ctx.Done():
@@ -619,11 +659,12 @@ type runner struct {
 	log      logr.Logger
 }
 
-// runDeploy is one deploy of one app: render, inject the known dev tags, sync.
-// The build phase runs separately and ahead of this, and the deploy scheduler's
-// external gate holds the deploy until the app's images have built — so a tag
-// missing here means a build-less image, and the manifest's own pin is used.
-func (rn *runner) runDeploy(ctx context.Context, app config.App, tags map[int]string) deployResult {
+// runDeploy is one deploy of one app: render, inject the image refs (built dev
+// tags and/or supplied overrides), sync. The build phase runs separately and
+// ahead of this, and the deploy scheduler's external gate holds the deploy until
+// the app's images have built — so an image absent from images here is a
+// build-less, non-overridden one, and the manifest's own pin is used.
+func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render.Image) deployResult {
 	started := time.Now()
 	res, err := rn.renderer.Render(app.Path)
 	if err != nil {
@@ -631,15 +672,9 @@ func (rn *runner) runDeploy(ctx context.Context, app config.App, tags map[int]st
 		rn.onError(app.Name, err)
 		return deployResult{app: app.Name}
 	}
-	if len(tags) > 0 {
-		images := make([]render.Image, 0, len(tags))
-		for j := range app.Build {
-			if tag, ok := tags[j]; ok {
-				images = append(images, render.Image{Name: app.Build[j].Image, NewTag: tag})
-			}
-		}
+	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {
-			rn.log.Error(err, "injecting built image tags failed", "app", app.Name)
+			rn.log.Error(err, "injecting image refs failed", "app", app.Name)
 			rn.onError(app.Name, err)
 			return deployResult{app: app.Name}
 		}

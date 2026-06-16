@@ -178,6 +178,27 @@ func TestSetImages_RewritesMatchingImagesEverywhere(t *testing.T) {
 	}
 }
 
+// A digest override (the image-override path for a pinned, registry-resolved
+// ref) rewrites the reference to name@digest, not name:tag.
+func TestSetImages_Digest(t *testing.T) {
+	res, err := New(Options{}).Render("testdata/images")
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	const digest = "sha256:0123456789012345678901234567890123456789012345678901234567890123"
+	if err := res.SetImages([]Image{{Name: "example.com/team-a/api-b", Digest: digest}}); err != nil {
+		t.Fatalf("SetImages: %v", err)
+	}
+	yml, err := res.YAML()
+	if err != nil {
+		t.Fatalf("YAML: %v", err)
+	}
+	want := "example.com/team-a/api-b@" + digest
+	if !strings.Contains(string(yml), want) {
+		t.Errorf("YAML() does not contain the digest-pinned ref %q", want)
+	}
+}
+
 func TestForceLocalImagePullPolicy(t *testing.T) {
 	container := func(image, policy string) map[string]any {
 		c := map[string]any{"name": "c", "image": image}

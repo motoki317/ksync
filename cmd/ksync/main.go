@@ -212,6 +212,8 @@ func runSync(args []string) error {
 	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	var images stringSlice
+	fs.Var(&images, "image", "deploy a pre-built image instead of building it: IMAGE=REF (repeatable; also via "+overrideEnv+")")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -230,7 +232,11 @@ func runSync(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	_, engineLog := setupLogging(*verbose)
+	appLog, engineLog := setupLogging(*verbose)
+	overrides, err := imageOverrides(cfg, images, appLog)
+	if err != nil {
+		return err
+	}
 	eng, err := engine.New(kubeContext, engineLog)
 	if err != nil {
 		return err
@@ -278,7 +284,7 @@ func runSync(args []string) error {
 	// waits behind a deploy, so a one-time sync is never slower than the loop's
 	// startup pass (which does the same; ADR 20260616-eager-build-ahead).
 	buildCtx, buildCancel := context.WithCancel(ctx)
-	awaitBuild, waitBuilds := startEagerBuilds(buildCtx, apps, buildFn, *maxParallel)
+	awaitBuild, waitBuilds := startEagerBuilds(buildCtx, apps, buildFn, *maxParallel, overrides)
 	defer waitBuilds()
 	defer buildCancel()
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
@@ -287,7 +293,7 @@ func runSync(args []string) error {
 			prog.finish(app.Name, nil)
 			return fmt.Errorf("app %s: build failed: %w", app.Name, bo.err)
 		}
-		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, *prune, *force, *timeout)
+		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, overrides, *prune, *force, *timeout)
 		if err != nil {
 			prog.finish(app.Name, nil) // remove the live group; the error is returned and printed at the top level
 			return err
@@ -332,11 +338,13 @@ type buildOutcome struct {
 // startEagerBuilds launches one build goroutine per build-app immediately,
 // bounded by maxParallel and independent of the needs DAG — an image is local
 // (docker build + load into the cluster store), so it can build while the apps
-// it depends on are still deploying, instead of waiting behind them. It returns
-// `await`, which blocks for one app's build outcome (the deploy phase calls it
-// so an unbuilt image is never applied; a build-less app returns a zero outcome
-// at once), and `wait`, which drains the goroutines on shutdown.
-func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.BuildFunc, maxParallel int) (await func(string) buildOutcome, wait func()) {
+// it depends on are still deploying, instead of waiting behind them. Entries
+// whose image is in overrides are skipped (the supplied ref is injected at
+// deploy, not built). It returns `await`, which blocks for one app's build
+// outcome (the deploy phase calls it so an unbuilt image is never applied; an
+// app with nothing to build returns a zero outcome at once), and `wait`, which
+// drains the goroutines on shutdown.
+func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.BuildFunc, maxParallel int, overrides map[string]render.Image) (await func(string) buildOutcome, wait func()) {
 	done := make(map[string]chan struct{}, len(apps))
 	outcomes := make(map[string]buildOutcome, len(apps))
 	var mu sync.Mutex
@@ -346,15 +354,17 @@ func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.Build
 	}
 	var wg sync.WaitGroup
 	for _, a := range apps {
-		if len(a.Build) == 0 {
-			continue
+		var todo []int
+		for j := range a.Build {
+			if _, ov := overrides[a.Build[j].Image]; !ov {
+				todo = append(todo, j)
+			}
+		}
+		if len(todo) == 0 {
+			continue // build-less, or every image overridden
 		}
 		ch := make(chan struct{})
 		done[a.Name] = ch
-		all := make([]int, len(a.Build))
-		for i := range all {
-			all[i] = i
-		}
 		app := a
 		wg.Add(1)
 		go func() {
@@ -373,7 +383,7 @@ func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.Build
 			}
 			// Independent build batches within the app run concurrently too (the
 			// same fan-out the watch loop uses), bounded by maxParallel.
-			tags, err := loop.BuildAll(ctx, app, all, buildFn, maxParallel)
+			tags, err := loop.BuildAll(ctx, app, todo, buildFn, maxParallel)
 			mu.Lock()
 			outcomes[app.Name] = buildOutcome{tags: tags, err: err}
 			mu.Unlock()
@@ -396,16 +406,19 @@ func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.Build
 	return await, wg.Wait
 }
 
-// deployApp renders one app, injects its already-built image tags, and applies
-// it — returning the per-resource sync results and the names of any degraded
-// resources. The build ran ahead of this (startEagerBuilds) and the caller
-// awaited it, so the applied manifests always reference images that exist. The
-// deploy row lands in the app's pipeline; the caller commits it after tallying
-// so the live footer's count tracks the committed lines.
-func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, prune, force bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
-	images := make([]render.Image, 0, len(tags))
+// deployApp renders one app, injects its image refs (built dev tags and/or
+// supplied overrides), and applies it — returning the per-resource sync results
+// and the names of any degraded resources. The build ran ahead of this
+// (startEagerBuilds) and the caller awaited it, so the applied manifests always
+// reference images that exist. The deploy row lands in the app's pipeline; the
+// caller commits it after tallying so the live footer's count tracks the
+// committed lines.
+func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, overrides map[string]render.Image, prune, force bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
+	images := make([]render.Image, 0, len(app.Build))
 	for j := range app.Build {
-		if tag, ok := tags[j]; ok {
+		if ov, ok := overrides[app.Build[j].Image]; ok {
+			images = append(images, ov)
+		} else if tag, ok := tags[j]; ok {
 			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: tag})
 		}
 	}
@@ -511,6 +524,8 @@ func runWatch(args []string) error {
 	auto := fs.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	var images stringSlice
+	fs.Var(&images, "image", "deploy a pre-built image instead of building it: IMAGE=REF (repeatable; also via "+overrideEnv+")")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -534,6 +549,10 @@ func runWatch(args []string) error {
 	defer cancel()
 
 	log, engineLog := setupLogging(*verbose)
+	overrides, err := imageOverrides(cfg, images, log)
+	if err != nil {
+		return err
+	}
 	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
 		return err
@@ -592,6 +611,7 @@ func runWatch(args []string) error {
 		MaxParallel: *maxParallel,
 		Render:      renderOpts,
 		Build:       makeBuildFunc(cfg, prog, kubeContext),
+		Overrides:   overrides,
 		Log:         log,
 		Report:      reporter.report,
 		// A build/render failure (or a failed sync) ends the run without a Report;

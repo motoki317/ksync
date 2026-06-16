@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/motoki317/ksync/internal/config"
+	"github.com/motoki317/ksync/internal/render"
 )
 
 func TestRun_SyncsAllAppsOnStartThenOnlyChangedOnes(t *testing.T) {
@@ -271,6 +272,50 @@ func TestRun_BuildsOnStartupAndInjectsTheTag(t *testing.T) {
 	}
 	if got := sink.synced()[2]; got != "api-b:ksync-000000000002" {
 		t.Errorf("synced image = %q, want the new dev tag", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// An overridden build is never built: its supplied ref is injected at deploy and
+// its sources are not watched, so a source edit triggers neither a build nor a
+// redeploy (only a manifest edit redeploys, re-injecting the override).
+func TestRun_OverriddenImageNotBuiltAndRefInjected(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	overrides := map[string]render.Image{"api-b": {Name: "api-b", NewTag: "supplied-1"}}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Overrides: overrides})
+	}()
+
+	// Startup deploys with the supplied ref, building nothing.
+	waitFor(t, func() bool { return len(sink.synced()) == 1 })
+	if got := sink.synced()[0]; got != "api-b:supplied-1" {
+		t.Errorf("synced image = %q, want the supplied override", got)
+	}
+	if got := builder.builds(); got != 0 {
+		t.Errorf("builds = %d, want 0 (overridden image must not be built)", got)
+	}
+
+	// A source edit to the overridden image is not watched; only a manifest edit
+	// redeploys. Pair them so the observed second sync proves the source edit ran
+	// no build.
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	writeFile(t, filepath.Join(tmp, "app1", "deployment.yaml"),
+		strings.Replace(deploymentYAML, "name: api", "name: api-renamed", 1))
+	waitFor(t, func() bool { return len(sink.synced()) == 2 })
+	if got := builder.builds(); got != 0 {
+		t.Errorf("builds = %d, want 0 (a source change to an overridden image must not build)", got)
+	}
+	if got := sink.synced()[1]; got != "api-b:supplied-1" {
+		t.Errorf("redeploy image = %q, want the supplied override re-injected", got)
 	}
 
 	cancel()
