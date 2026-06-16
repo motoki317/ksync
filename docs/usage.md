@@ -159,6 +159,7 @@ That is all you need for the common case: a directory with a `Dockerfile` in it.
 | Field | Required | Meaning |
 |---|---|---|
 | `image` | yes | The image name **exactly as your manifests reference it**, without a tag. ksync replaces the tag of every matching image in the rendered output (same rules as kustomize's `images:` field). |
+| `name` | no | Short label for this image in progress output and in the watch confirmation prompt (where it names one selectable image). Default: the image's last path segment (`example.com/team-a/api-b` → `api-b`). Must be unique within an app. |
 | `context` | yes | The docker build context directory. Relative paths are resolved from the config file's directory. ksync watches it for changes. |
 | `dockerfile` | no | Path to the Dockerfile, relative to `context`. Default: `Dockerfile` in the context. |
 | `watch` | no | Only these paths (relative to `context`) trigger a rebuild. Useful in monorepos where one big context feeds many images. Default: the whole context. |
@@ -499,10 +500,18 @@ What it does:
    app directory that the kustomization points to: a shared `chartHome`, values files,
    `resources:` entries, and so on — and the source directories of `build` entries.
 3. When you save a file, ksync waits a short quiet period (debounce, default 200ms), so one
-   "save all" in your editor becomes one sync, not ten.
-4. Only the affected app is re-rendered and applied. If two apps share a chart directory and
-   you edit the chart, both apps sync.
-5. If a sync fails (for example, the YAML is broken half-way through your edit), ksync prints
+   "save all" in your editor becomes one sync, not ten — then **asks what to rebuild** instead
+   of acting on its own.
+4. The confirmation prompt lists each changed image (🔨) and each manifest-only app (🚢) and lets
+   you choose with the keyboard: **Build all** (the default — just press Enter), **Select which
+   to build** (then ↑/↓ to move, Space to toggle each one, `a` for all, Enter to confirm), or
+   **Skip**. ksync rebuilds or redeploys nothing until you choose, so a mid-edit save costs nothing.
+5. Only the chosen images are rebuilt and their apps re-applied (a chosen manifest-only app is just
+   re-applied, no rebuild). Unchosen changes stay pending and are offered again the next time the
+   loop is idle, until you Skip them. If two apps share a chart directory and you edit the chart,
+   both appear in the prompt. While a build or deploy is in flight, new saves accumulate quietly and
+   the prompt reappears once it finishes.
+6. If a sync fails (for example, the YAML is broken half-way through your edit), ksync prints
    the error, keeps running, and retries with growing wait times. The next file save resets
    the retry and syncs immediately again.
 
@@ -512,14 +521,18 @@ waits for dependencies to be Healthy. On a cold start of a deep stack this overl
 with the dependency chain that precedes it, so a dependent's image is already built by the time its
 turn to deploy arrives. The deploy still never applies an image that has not finished building.
 
-Stop it with Ctrl-C. When ksync is running in an interactive terminal, **press Enter to resync
-every app** — handy after restarting a dependency by hand, or to re-pull an image that failed.
+Stop it with Ctrl-C; inside the prompt, `q` or Ctrl-C also quits. The confirmation prompt appears
+only on an interactive terminal — under a pipe, a redirect, or a process manager (or with `-auto`)
+ksync rebuilds automatically on every change, with no prompt. There is no separate "resync
+everything" key: re-save any watched file to re-open the prompt, or run `ksync sync` for a one-shot
+re-apply of everything.
 
 Flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-debounce` | `200ms` | Quiet period after the last change before re-rendering. |
+| `-auto` | `false` | Rebuild and redeploy automatically on every change, skipping the confirmation prompt (the pre-prompt behavior). Always on when stdin is not an interactive terminal. |
+| `-debounce` | `200ms` | Quiet period after the last change before prompting. |
 | `-max-parallel` | CPU cores | How many apps may **build** at once and, separately, how many may **deploy** (render + sync) at once — builds and deploys have independent budgets of this size, since builds are CPU/IO-heavy while deploys mostly wait on health. Also bounds, within one app, how many of its independent images build at once. `0` removes the limit. |
 | `-prune` | `true` | Delete tracked resources that you removed from the files. |
 | `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
@@ -536,10 +549,14 @@ failed; the deploy time is that stage's own (apply + health gate). `applied` is 
 
 A whole-stack `watch` frames its **startup convergence** exactly like a `sync` run — a titled
 **Plan**, a live **Summary** footer pinned to the bottom while the apps come up, and the committed
-Summary block once every app has synced once (see the `ksync sync` example below) — then settles
-into the streaming loop, where each change prints just its build/apply lines. A stuck app keeps the
-footer open rather than committing a false "done". A single-app `watch` (e.g. `watch duo`) skips the
-framing and streams the one line, like a single-app sync.
+Summary block once every app has synced once (see the `ksync sync` example below). A stuck app keeps
+the footer open rather than committing a false "done". Each later rebuild batch is framed the same
+way: once it settles, ksync commits a fresh **Summary** for just that batch (the apps it touched and
+how long it took) so you see the result of every edit, not only the first convergence. After every
+settle — the initial convergence and each batch — ksync logs a `finished, watching for changes` line,
+the cue that the loop is idle and ready for your next save. A single-app `watch` (e.g. `watch duo`)
+skips the Plan/Summary framing and streams the one line like a single-app sync, but still logs the
+watching line when it settles.
 
 ### `ksync sync` — one-time sync
 

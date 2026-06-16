@@ -45,8 +45,9 @@ re-litigate only with new evidence):
   clusters yet never act on an unlisted one), optional top-level `imageLoad` (`command` + `allowParallel`, for separate-image-store
   clusters; `allowParallel` defaults true, set false for non-concurrency-safe loaders like
   `k3d image import`), per-app default namespace (ArgoCD destination.namespace parity), `needs`
-  DAG, per-app `build` entries (image/context + optional dockerfile/watch/watchIgnore/command);
-  `SortByNeeds`.
+  DAG, per-app `build` entries (image/context + optional name/dockerfile/watch/watchIgnore/command —
+  `name` defaults to the image's last path segment, unique within an app, labels the image in the
+  watch confirmation prompt); `SortByNeeds`.
 - `internal/build` — source→image: docker build (or the `command` escape hatch producing
   `$KSYNC_IMAGE`), content-addressed dev tags `ksync-<12 hex of image ID>` (no persisted
   build state; `--provenance=false` keeps IDs deterministic), `.dockerignore`-scoped watch
@@ -70,8 +71,12 @@ re-litigate only with new evidence):
   row keeps its own final time) instead of collapsing to the deploy line, so per-stage timings
   survive the run; a build-less app commits one `🚢 <app>  N applied  <time>` line (no redundant
   "Deploy" word — the committed deploy time is the deploy stage's own, via `ui.CommitInfo`). Off a
-  terminal the block is inert (plain per-stage and per-app lines). See ADRs
-  20260615-grouped-pipeline-progress and 20260616-committed-stage-timings.
+  terminal the block is inert (plain per-stage and per-app lines). Also the **watch confirmation
+  picker** (`prompt.go`): a two-step interactive gate (single-select Build all / Select which to
+  build / Skip, then an arrow-key + spacebar multi-select), a pure `buildPrompt` model (unit-tested
+  via key events) behind a thin raw-mode driver (`ConfirmBuilds`) that runs only while the loop is
+  idle. See ADRs 20260615-grouped-pipeline-progress, 20260616-committed-stage-timings, and
+  20260616-manual-build-gate.
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.
@@ -96,7 +101,14 @@ re-litigate only with new evidence):
   the dependency chain's deploys, while the deploy stays `needs`-gated and waits on the external gate
   until its own build finishes — so an unbuilt tag is never deployed, and `--max-parallel` now bounds
   builds and deploys with independent budgets (ADR 20260616-eager-build-ahead). Manifest-only edits
-  never invoke docker.
+  never invoke docker. By default (interactive TTY, no `-auto`) incremental changes pass through a
+  **manual gate** (`Options.Gate`): instead of scheduling, they accumulate into a pending set and,
+  once idle, the loop asks which images/apps to rebuild via the `internal/ui` picker, acting only on
+  the returned `Decision` — startup convergence is ungated; the gate intercepts only `watcher.Events`
+  (ADR 20260616-manual-build-gate). On settling back to idle after doing work — the initial
+  convergence and every later rebuild batch — an `Options.OnIdle(took)` hook fires once; the command
+  layer (`watchReporter`) turns it into a committed per-batch **Summary** and a `finished, watching
+  for changes` log line (a change merely held/skipped by the gate runs no work, so it never fires).
 - `internal/leakcheck` — the no-leak guard (see Conventions).
 - `docs/ADR/` — dated decision records (`YYYYMMDD-title.md`, template at `_template.md`).
 - `docs/plans/` — gitignored single-session scratch.
