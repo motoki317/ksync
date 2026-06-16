@@ -72,7 +72,10 @@ re-litigate only with new evidence):
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.
 - `internal/schedule` — pure scheduling state machine: debounce/coalesce, per-app
-  serialization, bounded parallelism, needs gating, exponential retry backoff.
+  serialization, bounded parallelism, needs gating, exponential retry backoff, and an optional
+  external gate (`SetExternalBlock`) the loop uses to hold a deploy until its image has built. The
+  watch loop runs two instances — needs-free builds and needs-gated deploys (ADR
+  20260616-eager-build-ahead).
 - `internal/engine` — gitops-engine wrapper (pin: argo-cd release-tag commits; k8s.io/* follow
   the engine's version): warm cluster cache, SSA, tracking-label-scoped prune, namespace
   auto-creation (create-if-missing — the app's own *and* every other namespace its resources
@@ -84,8 +87,12 @@ re-litigate only with new evidence):
   PostSync Job self-heals) or `--force` (re-run every hook, ArgoCD manual-sync parity; ADR
   20260616-hook-rerun-on-failure).
 - `internal/loop` — the watch-mode event loop tying the above together; cluster and docker
-  sides injected as SyncFunc/BuildFunc so it tests without either. Builds run per dirty
-  (app, entry) before render; manifest-only edits never invoke docker.
+  sides injected as SyncFunc/BuildFunc so it tests without either. Two scheduler instances run the
+  two phases independently: an image builds the moment its source is dirty (needs-free), overlapping
+  the dependency chain's deploys, while the deploy stays `needs`-gated and waits on the external gate
+  until its own build finishes — so an unbuilt tag is never deployed, and `--max-parallel` now bounds
+  builds and deploys with independent budgets (ADR 20260616-eager-build-ahead). Manifest-only edits
+  never invoke docker.
 - `internal/leakcheck` — the no-leak guard (see Conventions).
 - `docs/ADR/` — dated decision records (`YYYYMMDD-title.md`, template at `_template.md`).
 - `docs/plans/` — gitignored single-session scratch.

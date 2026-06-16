@@ -273,12 +273,27 @@ func runSync(args []string) error {
 			return summaryLines(out, len(apps), synced, agg, degradedApps, time.Since(started), false)
 		})
 	}
+	// Builds run ahead of the needs DAG: an image is local, so it can build
+	// while the apps it depends on still deploy. The deploy phase below awaits
+	// each app's own build, so nothing applies an unbuilt image — but no build
+	// waits behind a deploy, so a one-time sync is never slower than the loop's
+	// startup pass (which does the same; ADR 20260616-eager-build-ahead).
+	buildCtx, buildCancel := context.WithCancel(ctx)
+	awaitBuild, waitBuilds := startEagerBuilds(buildCtx, apps, buildFn, *maxParallel)
+	defer waitBuilds()
+	defer buildCancel()
 	err = runByNeeds(ctx, apps, *maxParallel, func(ctx context.Context, app config.App) error {
-		// Per-app wall clock: build + render + apply + health gate, the same
-		// end-to-end span the watch loop reports on its 🚢 line. Captured per
-		// invocation since apps run concurrently.
+		// Per-app wall clock: the deploy turn (render + apply + health gate, plus
+		// any residual wait for the app's own build, which mostly overlapped the
+		// needs it just waited on). Captured per invocation since apps run
+		// concurrently.
 		start := time.Now()
-		results, degraded, err := syncOneApp(ctx, r, eng, buildFn, prog, app, *prune, *force, *timeout, *maxParallel)
+		bo := awaitBuild(app.Name)
+		if bo.err != nil {
+			prog.finish(app.Name, "")
+			return fmt.Errorf("app %s: build failed: %w", app.Name, bo.err)
+		}
+		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, *prune, *force, *timeout)
 		if err != nil {
 			prog.finish(app.Name, "") // remove the live group; the error is returned and printed at the top level
 			return err
@@ -311,26 +326,90 @@ func runSync(args []string) error {
 	return err
 }
 
-// syncOneApp builds (by group batch), renders, injects built image tags, and
-// applies one app, returning the per-resource sync results and the names of any
-// degraded resources. Build precedes render so the applied manifests always
-// reference images that exist in the local daemon. The build/import rows and the
-// deploy row land in the app's pipeline; the caller commits it after tallying so
-// the live footer's count tracks the committed lines.
-func syncOneApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, buildFn loop.BuildFunc, prog *progress, app config.App, prune, force bool, timeout time.Duration, maxParallel int) ([]common.ResourceSyncResult, []string, error) {
-	all := make([]int, len(app.Build))
-	for i := range all {
-		all[i] = i
+// buildOutcome is one app's eager build result, published once its build
+// goroutine finishes. tags is nil when err is set.
+type buildOutcome struct {
+	tags map[int]string
+	err  error
+}
+
+// startEagerBuilds launches one build goroutine per build-app immediately,
+// bounded by maxParallel and independent of the needs DAG — an image is local
+// (docker build + load into the cluster store), so it can build while the apps
+// it depends on are still deploying, instead of waiting behind them. It returns
+// `await`, which blocks for one app's build outcome (the deploy phase calls it
+// so an unbuilt image is never applied; a build-less app returns a zero outcome
+// at once), and `wait`, which drains the goroutines on shutdown.
+func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.BuildFunc, maxParallel int) (await func(string) buildOutcome, wait func()) {
+	done := make(map[string]chan struct{}, len(apps))
+	outcomes := make(map[string]buildOutcome, len(apps))
+	var mu sync.Mutex
+	var sem chan struct{}
+	if maxParallel > 0 {
+		sem = make(chan struct{}, maxParallel)
 	}
-	// Independent build batches run concurrently (up to maxParallel), the same
-	// fan-out the watch loop uses — a multi-image app's builds are not serialized.
-	built, err := loop.BuildAll(ctx, app, all, buildFn, maxParallel)
-	if err != nil {
-		return nil, nil, fmt.Errorf("app %s: build failed: %w", app.Name, err)
+	var wg sync.WaitGroup
+	for _, a := range apps {
+		if len(a.Build) == 0 {
+			continue
+		}
+		ch := make(chan struct{})
+		done[a.Name] = ch
+		all := make([]int, len(a.Build))
+		for i := range all {
+			all[i] = i
+		}
+		app := a
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(ch)
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					mu.Lock()
+					outcomes[app.Name] = buildOutcome{err: ctx.Err()}
+					mu.Unlock()
+					return
+				}
+				defer func() { <-sem }()
+			}
+			// Independent build batches within the app run concurrently too (the
+			// same fan-out the watch loop uses), bounded by maxParallel.
+			tags, err := loop.BuildAll(ctx, app, all, buildFn, maxParallel)
+			mu.Lock()
+			outcomes[app.Name] = buildOutcome{tags: tags, err: err}
+			mu.Unlock()
+		}()
 	}
-	images := make([]render.Image, 0, len(built))
+	await = func(app string) buildOutcome {
+		ch, ok := done[app]
+		if !ok {
+			return buildOutcome{} // app has no build
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return buildOutcome{err: ctx.Err()}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return outcomes[app]
+	}
+	return await, wg.Wait
+}
+
+// deployApp renders one app, injects its already-built image tags, and applies
+// it — returning the per-resource sync results and the names of any degraded
+// resources. The build ran ahead of this (startEagerBuilds) and the caller
+// awaited it, so the applied manifests always reference images that exist. The
+// deploy row lands in the app's pipeline; the caller commits it after tallying
+// so the live footer's count tracks the committed lines.
+func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, prune, force bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
+	images := make([]render.Image, 0, len(tags))
 	for j := range app.Build {
-		if tag, ok := built[j]; ok {
+		if tag, ok := tags[j]; ok {
 			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: tag})
 		}
 	}

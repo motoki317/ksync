@@ -109,13 +109,17 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	renderer := render.New(opts.Render)
 
 	byName := make(map[string]config.App, len(apps))
-	scheduleApps := make([]schedule.App, len(apps))
+	scheduleApps := make([]schedule.App, len(apps)) // deploy phase: needs-gated
+	var buildApps []schedule.App                    // build phase: no needs edges
 	for i, a := range apps {
 		if len(a.Build) > 0 && opts.Build == nil {
 			return fmt.Errorf("app %s declares builds but no build function is configured", a.Name)
 		}
 		byName[a.Name] = a
 		scheduleApps[i] = schedule.App{Name: a.Name, Needs: a.Needs}
+		if len(a.Build) > 0 {
+			buildApps = append(buildApps, schedule.App{Name: a.Name})
+		}
 	}
 
 	builds := make(map[string][]buildState, len(apps))
@@ -191,44 +195,107 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	}
 	defer func() { _ = watcher.Close() }()
 
-	sched := schedule.New(schedule.Options{
+	schedOpts := schedule.Options{
 		Debounce:    opts.Debounce,
 		MaxParallel: opts.MaxParallel,
 		RetryBase:   opts.RetryBase,
 		RetryMax:    opts.RetryMax,
-	}, scheduleApps)
+	}
+	// Two schedulers run the two phases independently. buildSched has no `needs`
+	// edges: an image is pure-local (docker build + load into the cluster store),
+	// so it builds the moment its source is dirty — overlapping the dependency
+	// chain's deploys instead of waiting behind them. deploySched keeps the
+	// `needs` gating (a deploy waits for its dependencies to be Healthy) plus an
+	// external gate that holds it until its own image has finished building, so an
+	// unbuilt tag is never deployed. Each scheduler has its own MaxParallel budget
+	// — builds are the CPU/IO-heavy work, deploys are mostly health-gate waiting.
+	buildSched := schedule.New(schedOpts, buildApps)
+	deploySched := schedule.New(schedOpts, scheduleApps)
+
+	// building tracks apps with a build goroutine in flight; together with any
+	// still-dirty build entry it is the deploy's external gate.
+	building := make(map[string]bool, len(apps))
+	buildPending := func(app string) bool {
+		if building[app] {
+			return true
+		}
+		for j := range builds[app] {
+			if builds[app][j].dirty {
+				return true
+			}
+		}
+		return false
+	}
+	deploySched.SetExternalBlock(buildPending)
+
 	now := time.Now()
 	for _, a := range apps {
-		sched.MarkDirty(a.Name, now)
+		// Every app deploys once at startup to converge the cluster; a build-app's
+		// deploy waits on the external gate until its startup build completes.
+		deploySched.MarkDirty(a.Name, now)
+		if len(a.Build) > 0 {
+			buildSched.MarkDirty(a.Name, now)
+		}
 	}
 
 	rn := &runner{
-		renderer:    renderer,
-		buildFn:     opts.Build,
-		syncFn:      syncFn,
-		report:      opts.Report,
-		onError:     opts.OnError,
-		maxParallel: opts.MaxParallel,
-		log:         log,
+		renderer: renderer,
+		syncFn:   syncFn,
+		report:   opts.Report,
+		onError:  opts.OnError,
+		log:      log,
 	}
 
-	results := make(chan result)
+	buildResults := make(chan buildResult)
+	deployResults := make(chan deployResult)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
+	// refreshWatch re-derives the change→app/build mapping and the watched roots
+	// after a phase completes: a render can change what a kustomization
+	// references, and a build's .dockerignore can change what affects its image.
+	refreshWatch := func() {
+		mapping = watch.NewMapping(mappingEntries())
+		if err := watcher.SetRoots(watchRoots()); err != nil {
+			log.Error(err, "re-deriving watch roots")
+		}
+	}
+
 	for {
-		for _, name := range sched.StartDue(time.Now()) {
+		now := time.Now()
+		for _, name := range buildSched.StartDue(now) {
 			app := byName[name]
 			states := builds[name]
-			// Snapshot the work under the loop goroutine: the run goroutine
-			// must not touch shared state.
+			// Snapshot the dirty entries under the loop goroutine; the build
+			// goroutine must not touch shared state.
 			var todo []int
-			tags := make(map[int]string, len(states))
 			for j := range states {
 				if states[j].dirty {
 					todo = append(todo, j)
 					states[j].dirty = false
 				}
+			}
+			building[name] = true
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				built, err := BuildAll(ctx, app, todo, opts.Build, opts.MaxParallel)
+				r := buildResult{app: name, built: built, ok: err == nil}
+				if err != nil {
+					r.failed = unbuilt(todo, built)
+					opts.OnError(name, err)
+				}
+				select {
+				case buildResults <- r:
+				case <-ctx.Done():
+				}
+			}()
+		}
+		for _, name := range deploySched.StartDue(now) {
+			app := byName[name]
+			states := builds[name]
+			tags := make(map[int]string, len(states))
+			for j := range states {
 				if states[j].tag != "" {
 					tags[j] = states[j].tag
 				}
@@ -236,16 +303,16 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				r := rn.run(ctx, app, todo, tags)
+				r := rn.runDeploy(ctx, app, tags)
 				select {
-				case results <- r:
+				case deployResults <- r:
 				case <-ctx.Done():
 				}
 			}()
 		}
 
 		var timerC <-chan time.Time
-		if deadline, ok := sched.NextDeadline(); ok {
+		if deadline, ok := earliestDeadline(buildSched, deploySched); ok {
 			timerC = time.After(time.Until(deadline))
 		}
 
@@ -255,7 +322,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		case <-opts.Resync:
 			now := time.Now()
 			for _, a := range apps {
-				sched.MarkDirty(a.Name, now)
+				deploySched.MarkDirty(a.Name, now)
 			}
 			log.Info("manual resync requested", "apps", len(apps))
 		case path, ok := <-watcher.Events:
@@ -268,47 +335,78 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				if isBuild {
 					log.V(1).Info("source change detected", "path", path, "app", name, "image", byName[name].Build[entry].Image)
 					builds[name][entry].dirty = true
+					buildSched.MarkDirty(name, now)
 				} else {
 					log.V(1).Info("change detected", "path", path, "app", name)
 				}
-				sched.MarkDirty(name, now)
+				// Either way the app must re-deploy; the external gate makes the
+				// deploy wait when a rebuild is also pending.
+				deploySched.MarkDirty(name, now)
 			}
 		case err := <-watcher.Errors:
 			log.Error(err, "watch error")
-		case r := <-results:
+		case r := <-buildResults:
+			building[r.app] = false
 			states := builds[r.app]
-			// Tags from successful builds stick even when the run failed
-			// later (a failed sync must not force a rebuild); failed builds
-			// re-dirty so the retry runs them again.
+			// Tags from successful batches stick; failed entries re-dirty so the
+			// build scheduler retries them (the deploy stays gated meanwhile).
 			for j, tag := range r.built {
 				states[j].tag = tag
 			}
 			for _, j := range r.failed {
 				states[j].dirty = true
 			}
-			sched.Finish(r.app, r.ok, time.Now())
-			// The run may have changed what the app references.
-			for i, a := range apps {
+			buildSched.Finish(r.app, r.ok, time.Now())
+			// A build's .dockerignore may have changed what affects the image.
+			for _, a := range apps {
 				if a.Name == r.app {
-					rebuildRoots(i)
 					deriveScopes(a)
 				}
 			}
-			mapping = watch.NewMapping(mappingEntries())
-			if err := watcher.SetRoots(watchRoots()); err != nil {
-				log.Error(err, "re-deriving watch roots")
+			refreshWatch()
+		case r := <-deployResults:
+			deploySched.Finish(r.app, r.ok, time.Now())
+			// The render may have changed what the app references.
+			for i, a := range apps {
+				if a.Name == r.app {
+					rebuildRoots(i)
+				}
 			}
+			refreshWatch()
 		case <-timerC:
 			// A debounce or retry deadline passed; StartDue above picks it up.
 		}
 	}
 }
 
-type result struct {
+// earliestDeadline returns the soonest NextDeadline across the schedulers, so a
+// single timer wakes the loop for whichever phase is due first.
+func earliestDeadline(scheds ...*schedule.Scheduler) (time.Time, bool) {
+	var earliest time.Time
+	found := false
+	for _, s := range scheds {
+		if d, ok := s.NextDeadline(); ok && (!found || d.Before(earliest)) {
+			earliest = d
+			found = true
+		}
+	}
+	return earliest, found
+}
+
+// buildResult reports one app's build phase: the dev tag per built entry
+// (recorded even when a later batch fails, so a good build is never wasted) and
+// the entries whose build must run again.
+type buildResult struct {
 	app    string
 	ok     bool
-	built  map[int]string // entry -> dev tag, recorded even when the run fails later
+	built  map[int]string // entry -> dev tag
 	failed []int          // entries whose build must run again
+}
+
+// deployResult reports one app's deploy phase (render + inject + sync).
+type deployResult struct {
+	app string
+	ok  bool
 }
 
 // unbuilt returns the todo entries that built does not record — what a build
@@ -323,43 +421,27 @@ func unbuilt(todo []int, built map[int]string) []int {
 	return failed
 }
 
-// runner holds the per-run collaborators so one scheduled app run does not
+// runner holds the per-deploy collaborators so one scheduled deploy does not
 // thread half a dozen parameters; the loop builds it once and reuses it.
 type runner struct {
-	renderer    *render.Renderer
-	buildFn     BuildFunc
-	syncFn      SyncFunc
-	report      func(app string, stats SyncStats, took time.Duration)
-	onError     func(app string, err error)
-	maxParallel int
-	log         logr.Logger
+	renderer *render.Renderer
+	syncFn   SyncFunc
+	report   func(app string, stats SyncStats, took time.Duration)
+	onError  func(app string, err error)
+	log      logr.Logger
 }
 
-// run is one scheduled run of one app: build the dirty entries, render, inject
-// the known dev tags, sync. A build failure aborts before render — syncing
-// manifests whose images were never built would deploy whatever tag the
-// manifests pin, which is exactly not the local source.
-func (rn *runner) run(ctx context.Context, app config.App, todo []int, tags map[int]string) result {
+// runDeploy is one deploy of one app: render, inject the known dev tags, sync.
+// The build phase runs separately and ahead of this, and the deploy scheduler's
+// external gate holds the deploy until the app's images have built — so a tag
+// missing here means a build-less image, and the manifest's own pin is used.
+func (rn *runner) runDeploy(ctx context.Context, app config.App, tags map[int]string) deployResult {
 	started := time.Now()
-	r := result{app: app.Name, built: map[int]string{}}
-	built, err := BuildAll(ctx, app, todo, rn.buildFn, rn.maxParallel)
-	// Successful batches keep their tags even on a partial failure; only the
-	// rest re-dirty (a failed sync later must not re-trigger a good build).
-	for j, tag := range built {
-		r.built[j] = tag
-		tags[j] = tag
-	}
-	if err != nil {
-		r.failed = unbuilt(todo, r.built)
-		rn.onError(app.Name, err)
-		return r
-	}
-
 	res, err := rn.renderer.Render(app.Path)
 	if err != nil {
 		rn.log.Error(err, "render failed", "app", app.Name)
 		rn.onError(app.Name, err)
-		return r
+		return deployResult{app: app.Name}
 	}
 	if len(tags) > 0 {
 		images := make([]render.Image, 0, len(tags))
@@ -371,18 +453,17 @@ func (rn *runner) run(ctx context.Context, app config.App, todo []int, tags map[
 		if err := res.SetImages(images); err != nil {
 			rn.log.Error(err, "injecting built image tags failed", "app", app.Name)
 			rn.onError(app.Name, err)
-			return r
+			return deployResult{app: app.Name}
 		}
 	}
 	stats, err := rn.syncFn(ctx, app.Name, res.Objects)
 	if err != nil {
 		rn.log.Error(err, "sync failed", "app", app.Name)
 		rn.onError(app.Name, err)
-		return r
+		return deployResult{app: app.Name}
 	}
 	rn.reportSync(app.Name, stats, time.Since(started))
-	r.ok = true
-	return r
+	return deployResult{app: app.Name, ok: true}
 }
 
 // reportSync emits one app's completed-sync line: the injected ship-emoji

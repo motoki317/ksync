@@ -8,7 +8,10 @@
 // (MarkDirty, Finish) and time, and poll StartDue/NextDeadline. It does no
 // I/O and starts no goroutines, which is what makes the watch loop's timing
 // behavior unit-testable; it is not safe for concurrent use (the watch loop
-// drives it from one goroutine).
+// drives it from one goroutine). The watch loop runs two of them — one for
+// the needs-free build phase and one for the needs-gated deploy phase — so a
+// deploy can additionally wait on the loop's own state (its image still
+// building) via the optional external gate (SetExternalBlock).
 package schedule
 
 import "time"
@@ -47,6 +50,13 @@ type Scheduler struct {
 	order   []string // declaration order, the iteration and priority order
 	apps    map[string]*appState
 	running int
+	// extBlock is an optional gate beyond `needs`: it reports whether an app
+	// cannot start yet for a reason the scheduler does not model. The deploy
+	// scheduler uses it to wait while the app's image is still building. Like
+	// `blocked`, it clears on an event (a build result re-polls StartDue), not
+	// on time, so deadlines of externally-blocked apps are kept out of
+	// NextDeadline to avoid a hot poll loop.
+	extBlock func(name string) bool
 }
 
 func New(opts Options, apps []App) *Scheduler {
@@ -56,6 +66,16 @@ func New(opts Options, apps []App) *Scheduler {
 		s.apps[a.Name] = &appState{needs: a.Needs}
 	}
 	return s
+}
+
+// SetExternalBlock installs the optional external gate (see Scheduler.extBlock).
+// It is evaluated synchronously inside StartDue/NextDeadline, so the predicate
+// may read state the same goroutine owns without locking. A nil fn clears it.
+func (s *Scheduler) SetExternalBlock(fn func(name string) bool) { s.extBlock = fn }
+
+// externallyBlocked reports whether the external gate currently holds name back.
+func (s *Scheduler) externallyBlocked(name string) bool {
+	return s.extBlock != nil && s.extBlock(name)
 }
 
 // MarkDirty records a change to app name at time now. Each call slides the
@@ -86,7 +106,7 @@ func (s *Scheduler) StartDue(now time.Time) []string {
 			break
 		}
 		st := s.apps[name]
-		if !st.dirty || st.running || now.Before(st.deadline) || s.blocked(st) {
+		if !st.dirty || st.running || now.Before(st.deadline) || s.blocked(st) || s.externallyBlocked(name) {
 			continue
 		}
 		st.dirty = false
@@ -149,15 +169,18 @@ func (s *Scheduler) retryDelay(attempts int) time.Duration {
 	return min(d, max)
 }
 
-// NextDeadline returns the earliest deadline among apps waiting to run, so
-// the caller knows when to poll StartDue next. Running apps are excluded:
-// their Finish triggers the next poll.
+// NextDeadline returns the earliest deadline among apps that can actually run
+// when it elapses, so the caller knows when to poll StartDue next. Running,
+// needs-blocked, and externally-blocked apps are excluded: a blocked app's
+// deadline is already in the past while its dependency runs, so reporting it
+// would make the caller's timer fire immediately and spin until the
+// dependency's Finish — which is itself the event that re-polls StartDue.
 func (s *Scheduler) NextDeadline() (time.Time, bool) {
 	var earliest time.Time
 	found := false
 	for _, name := range s.order {
 		st := s.apps[name]
-		if !st.dirty || st.running {
+		if !st.dirty || st.running || s.blocked(st) || s.externallyBlocked(name) {
 			continue
 		}
 		if !found || st.deadline.Before(earliest) {

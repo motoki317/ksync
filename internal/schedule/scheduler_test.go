@@ -169,6 +169,42 @@ func TestScheduler_NewChangeResetsBackoff(t *testing.T) {
 	}
 }
 
+func TestScheduler_ExternalBlockGatesStartUntilCleared(t *testing.T) {
+	s := New(Options{}, []App{{Name: "api-b"}})
+	building := true
+	s.SetExternalBlock(func(string) bool { return building })
+	s.MarkDirty("api-b", at(0))
+	if got := s.StartDue(at(0)); len(got) != 0 {
+		t.Fatalf("StartDue while externally blocked = %v, want none (image still building)", got)
+	}
+	// The deadline of an externally-blocked app must not drive the timer — its
+	// unblocking is an event (the build finishing), not the clock.
+	if _, ok := s.NextDeadline(); ok {
+		t.Error("NextDeadline reported an externally-blocked app, which would spin the loop")
+	}
+	building = false // the build finished
+	if got := s.StartDue(at(0)); !reflect.DeepEqual(got, []string{"api-b"}) {
+		t.Errorf("StartDue after the gate cleared = %v, want [api-b]", got)
+	}
+}
+
+// A needs-blocked dependent's deadline is already in the past while its
+// dependency runs; NextDeadline must not report it, or the loop hot-spins until
+// the dependency finishes. It surfaces only once the dependency is clean.
+func TestScheduler_NextDeadlineSkipsBlockedApps(t *testing.T) {
+	s := New(Options{}, []App{{Name: "db"}, {Name: "api-b", Needs: []string{"db"}}})
+	s.MarkDirty("db", at(0))
+	s.MarkDirty("api-b", at(0))
+	s.StartDue(at(0)) // db starts; api-b is blocked, still dirty, deadline in the past
+	if _, ok := s.NextDeadline(); ok {
+		t.Error("NextDeadline reported a needs-blocked app's past deadline (busy-loop)")
+	}
+	s.Finish("db", true, at(time.Second))
+	if _, ok := s.NextDeadline(); !ok {
+		t.Error("NextDeadline did not surface api-b once its dependency was clean")
+	}
+}
+
 func TestScheduler_NextDeadline(t *testing.T) {
 	s := New(Options{Debounce: 100 * time.Millisecond}, []App{{Name: "db"}, {Name: "api-b"}})
 	if _, ok := s.NextDeadline(); ok {

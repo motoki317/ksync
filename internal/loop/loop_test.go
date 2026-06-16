@@ -558,6 +558,86 @@ func TestRun_FailedBuildRetriesAndBlocksSync(t *testing.T) {
 	<-done
 }
 
+// buildAppNamed writes a build-app with its own name, image, source dir, and a
+// kustomization deploying that one image.
+func buildAppNamed(t *testing.T, base, name, img string) config.App {
+	t.Helper()
+	appDir := filepath.Join(base, name)
+	writeFile(t, filepath.Join(appDir, "kustomization.yaml"), "resources:\n  - deployment.yaml\n")
+	writeFile(t, filepath.Join(appDir, "deployment.yaml"), oneDeploymentYAML(img))
+	src := filepath.Join(base, name+"-src")
+	writeFile(t, filepath.Join(src, "Dockerfile"), "FROM scratch\n")
+	writeFile(t, filepath.Join(src, "main.go"), "package main\n")
+	return config.App{
+		Name:  name,
+		Path:  appDir,
+		Build: []config.Build{{Image: img, Context: src, Dockerfile: filepath.Join(src, "Dockerfile")}},
+	}
+}
+
+// TestRun_DependentBuildsWhileDependencyDeploys is the core of the build/deploy
+// split: a dependent's build must run while its dependency is still deploying,
+// not behind it. App b needs a; a's deploy is held in flight until b's build is
+// observed to start. Builds are needs-free, so b builds immediately and the gate
+// releases; under the old fused run b's build would wait for a's deploy and this
+// would deadlock (caught by the timeout). b's *deploy* still waits for a.
+func TestRun_DependentBuildsWhileDependencyDeploys(t *testing.T) {
+	tmp := t.TempDir()
+	a := buildAppNamed(t, tmp, "a", "img-a")
+	b := buildAppNamed(t, tmp, "b", "img-b")
+	b.Needs = []string{"a"}
+
+	var once sync.Once
+	bBuildStarted := make(chan struct{})
+	releaseADeploy := make(chan struct{})
+	builder := func(_ context.Context, app string, builds []config.Build) ([]string, error) {
+		if app == "b" {
+			once.Do(func() { close(bBuildStarted) })
+		}
+		refs := make([]string, len(builds))
+		for i, bld := range builds {
+			refs[i] = bld.Image + ":ksync-000000000001"
+		}
+		return refs, nil
+	}
+
+	var mu sync.Mutex
+	deployed := map[string]int{}
+	syncFn := func(_ context.Context, app string, _ []*unstructured.Unstructured) (SyncStats, error) {
+		if app == "a" {
+			<-releaseADeploy // hold a's deploy in flight
+		}
+		mu.Lock()
+		deployed[app]++
+		mu.Unlock()
+		return SyncStats{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{a, b}, syncFn, Options{Debounce: 10 * time.Millisecond, Build: builder})
+	}()
+
+	select {
+	case <-bBuildStarted:
+	case <-time.After(3 * time.Second):
+		close(releaseADeploy) // unblock so Run can shut down cleanly
+		cancel()
+		<-done
+		t.Fatal("b's build did not start while a's deploy was in flight — builds are still gated by needs")
+	}
+	// a's deploy is still blocked here; releasing it lets the stack converge, with
+	// b's deploy following a's (the needs edge on the deploy phase still holds).
+	close(releaseADeploy)
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return deployed["a"] == 1 && deployed["b"] == 1 })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 type recorder struct {
 	mu        sync.Mutex
 	calls     map[string]int

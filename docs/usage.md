@@ -506,6 +506,12 @@ What it does:
    the error, keeps running, and retries with growing wait times. The next file save resets
    the retry and syncs immediately again.
 
+Builds run **ahead of the `needs` order**: an image is local (build + load into the cluster), so it
+starts the moment its source changes, regardless of which apps it depends on — only the *deploy*
+waits for dependencies to be Healthy. On a cold start of a deep stack this overlaps every app's build
+with the dependency chain that precedes it, so a dependent's image is already built by the time its
+turn to deploy arrives. The deploy still never applies an image that has not finished building.
+
 Stop it with Ctrl-C. When ksync is running in an interactive terminal, **press Enter to resync
 every app** — handy after restarting a dependency by hand, or to re-pull an image that failed.
 
@@ -514,7 +520,7 @@ Flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `-debounce` | `200ms` | Quiet period after the last change before re-rendering. |
-| `-max-parallel` | CPU cores | How many apps may build, render, and sync at once — and, within one app, how many of its independent images may build at once. `0` removes the limit. |
+| `-max-parallel` | CPU cores | How many apps may **build** at once and, separately, how many may **deploy** (render + sync) at once — builds and deploys have independent budgets of this size, since builds are CPU/IO-heavy while deploys mostly wait on health. Also bounds, within one app, how many of its independent images build at once. `0` removes the limit. |
 | `-prune` | `true` | Delete tracked resources that you removed from the files. |
 | `-timeout` | `5m` | Max time to wait for one app to become healthy before giving up and retrying. `0` disables the limit. |
 | `-v` | `false` | Verbose: also log every detected file change. |
