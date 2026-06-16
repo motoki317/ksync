@@ -179,6 +179,52 @@ apps:
 	if len(b.Watch) != 2 || b.Watch[0] != filepath.Join("/src/api-b", "src") || b.Watch[1] != filepath.Join("/src/api-b", "Cargo.toml") {
 		t.Errorf("Watch = %v, want paths resolved against context", b.Watch)
 	}
+	if b.Name != "api-b" {
+		t.Errorf("Name = %q, want %q (defaulted to the image's last path segment)", b.Name, "api-b")
+	}
+}
+
+// An explicit build name overrides the image-derived default; it is what the
+// watch prompt and progress rows label the image by.
+func TestParse_BuildNameExplicit(t *testing.T) {
+	yml := `
+allowedContexts: [docker-desktop]
+apps:
+  - path: apps/api-b
+    build:
+      - image: ghcr.io/org/api-b
+        name: backend
+        context: ../src
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Apps[0].Build[0].Name; got != "backend" {
+		t.Errorf("Name = %q, want the explicit %q", got, "backend")
+	}
+}
+
+// Two builds in one app may not share a name (defaulted or explicit), or the
+// prompt could not tell their rows apart.
+func TestParse_BuildNameDuplicateInApp(t *testing.T) {
+	yml := `
+allowedContexts: [docker-desktop]
+apps:
+  - path: apps/api-b
+    build:
+      - image: ghcr.io/a/web
+        context: ../src
+      - image: ghcr.io/b/web
+        context: ../src
+`
+	_, err := Parse([]byte(yml), "/cfg")
+	if err == nil {
+		t.Fatal("Parse: want an error for the duplicate build name, got nil")
+	}
+	if !strings.Contains(err.Error(), `build name "web" is already used`) {
+		t.Errorf("error = %v, want it to flag the duplicate build name", err)
+	}
 }
 
 func TestParse_BuildDefaultsDockerfile(t *testing.T) {

@@ -118,6 +118,12 @@ type Build struct {
 	// (no tag or digest) — it selects which image fields the built tag is
 	// injected into, with kustomize `images:` matching semantics.
 	Image string `json:"image"`
+	// Name is the short label for this build in progress output and in the watch
+	// confirmation prompt (where it names one selectable image). It defaults to
+	// the image's last path segment (ghcr.io/org/api-b → api-b) and must be
+	// unique within an app, so two of its builds are never ambiguous in the
+	// picker; cross-app duplicates are fine (the prompt qualifies each by app).
+	Name string `json:"name,omitempty"`
 	// Context is the docker build context directory. Relative paths are
 	// resolved against the config file's directory.
 	Context string `json:"context"`
@@ -305,6 +311,7 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	imageOwner := make(map[string]string)
 	for i := range cfg.Apps {
 		app := &cfg.Apps[i]
+		seenNames := make(map[string]bool, len(app.Build))
 		for j := range app.Build {
 			b := &app.Build[j]
 			where := fmt.Sprintf("apps[%d] (%s) build[%d]", i, app.Name, j)
@@ -317,6 +324,18 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 				errs = append(errs, fmt.Errorf("%s: image %q already has a build definition under app %q", where, b.Image, imageOwner[b.Image]))
 			default:
 				imageOwner[b.Image] = app.Name
+			}
+			// Default the build name to the image's last path segment and keep it
+			// unique within the app, so the watch prompt can label each selectable
+			// image unambiguously.
+			if b.Name == "" && b.Image != "" {
+				b.Name = imageBaseName(b.Image)
+			}
+			if b.Name != "" {
+				if seenNames[b.Name] {
+					errs = append(errs, fmt.Errorf("%s: build name %q is already used in this app (set a distinct name:)", where, b.Name))
+				}
+				seenNames[b.Name] = true
 			}
 			if b.Context == "" {
 				errs = append(errs, fmt.Errorf("%s: context is required", where))
@@ -540,6 +559,19 @@ func validImageName(ref string) bool {
 	}
 	last := ref[strings.LastIndex(ref, "/")+1:]
 	return last != "" && !strings.Contains(last, ":")
+}
+
+// imageBaseName is the default build name: the image's last path segment without
+// any tag (ghcr.io/org/api-b:dev → api-b). It is only called on names that passed
+// validImageName (no tag/digest), so the colon strip is just defensive.
+func imageBaseName(image string) string {
+	if i := strings.LastIndexByte(image, '/'); i >= 0 {
+		image = image[i+1:]
+	}
+	if i := strings.IndexByte(image, ':'); i >= 0 {
+		image = image[:i]
+	}
+	return image
 }
 
 func resolveAgainst(base, p string) string {
