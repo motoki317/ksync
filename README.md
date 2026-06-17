@@ -52,6 +52,7 @@ Then run the loop and edit your manifests:
 ksync sync            # one-shot: converge the cluster to the local files
 ksync watch           # keep watching; re-render + apply affected apps on save
 ksync render api-b    # print the rendered YAML of one app (no cluster access)
+ksync images --live   # list the images the apps deploy (canonical refs; for cache scoping)
 ksync destroy -yes    # delete everything ksync tracks (and nothing else)
 ```
 

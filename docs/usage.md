@@ -737,6 +737,31 @@ avoid the small per-render cluster round-trip. Offline, the output is the same b
 `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone <dir>` produces (verified
 by tests); charts that require `lookup` will not render.
 
+### `ksync images` — list the images the apps deploy
+
+```bash
+ksync images                # every image ksync.yaml deploys, one per line
+ksync images shop           # just one app's images
+ksync images --live         # also include operator-derived images (see below)
+```
+
+Renders the selected apps and prints the **canonical** references of the container images they
+deploy — sorted, deduplicated, one per line on stdout. "Canonical" means the same fully-qualified
+form a container runtime stores: `redis:7` becomes `docker.io/library/redis:7`, an untagged image
+gets an explicit `:latest`. So the output can be matched against a cluster's image store by plain
+string equality — which is what makes it useful for **scoping an image cache or a pre-pull step to
+exactly what ksync deploys**, rather than to whatever a node happens to have accumulated.
+
+Images ksync builds locally (any `build:` entry's image) are **excluded**: those are
+content-addressed dev tags that live only in the local store and are never pulled, so caching them
+is pointless.
+
+A plain `ksync images` lists only what the manifests literally name. Images a controller derives
+at runtime are not in the rendered YAML — for example an ECK `Elasticsearch` whose data image
+comes from `spec.version`, not an `image:` field. Add **`--live`** to also read the images of
+running pods in the apps' namespaces, which captures those. `--live` needs a reachable cluster
+(it reuses the same `--context` rules as the other commands); the plain form needs none.
+
 ### `ksync destroy` — delete what ksync created
 
 ```bash

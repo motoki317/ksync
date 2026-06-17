@@ -36,8 +36,14 @@ re-litigate only with new evidence):
 
 ## Repo at a glance
 
-- `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / destroy`
-  implemented; `diff` still a stub). `override.go` resolves **image overrides** (`--image IMAGE=REF`
+- `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / images / destroy`
+  implemented; `diff` still a stub). `images.go` is the **`ksync images`** command: renders the
+  apps and prints the **canonical** refs (containerd-normalized via `distribution/reference`, so a
+  consumer matches the cluster store by string equality) of the images they deploy, excluding
+  `build:` repos (local dev tags, never pulled). `--live` also reads running-pod images so
+  operator-derived ones absent from the manifests (an ECK Elasticsearch's data image from
+  `spec.version`) are covered — the set a cache/pre-pull scopes to (ADR 20260617-images-command).
+  `override.go` resolves **image overrides** (`--image IMAGE=REF`
   on sync/watch, or `KSYNC_IMAGE_OVERRIDES`): a supplied ref deploys a pre-built image instead of
   building that `build:` entry — the build (and its `imageLoad`) is skipped and the ref is injected
   at deploy; an override for an image no app builds is dropped with a note. This is what lets a
