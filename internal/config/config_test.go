@@ -72,8 +72,7 @@ func TestParse_ImageLoadField(t *testing.T) {
 	yml := `
 allowedContexts: [k3d-dev]
 imageLoad:
-  command: k3d image import --cluster dev $KSYNC_IMAGE
-  allowParallel: false
+  command: k3d image import --cluster dev $KSYNC_IMAGES
 apps:
   - path: apps/api-b
 `
@@ -81,31 +80,8 @@ apps:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if want := "k3d image import --cluster dev $KSYNC_IMAGE"; cfg.ImageLoad.Command != want {
+	if want := "k3d image import --cluster dev $KSYNC_IMAGES"; cfg.ImageLoad.Command != want {
 		t.Errorf("ImageLoad.Command = %q, want %q", cfg.ImageLoad.Command, want)
-	}
-	if cfg.ImageLoad.Parallel() {
-		t.Error("allowParallel: false should serialize loads, got Parallel() = true")
-	}
-}
-
-// Loads run concurrently by default — the field is omitted on the common
-// concurrency-safe loaders (registry push, shared daemon), and only k3d-style
-// importers opt out with allowParallel: false.
-func TestParse_ImageLoadDefaultsParallel(t *testing.T) {
-	yml := `
-allowedContexts: [k3d-dev]
-imageLoad:
-  command: 'for i in $KSYNC_IMAGES; do docker push "$i"; done'
-apps:
-  - path: apps/api-b
-`
-	cfg, err := Parse([]byte(yml), "/cfg")
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if !cfg.ImageLoad.Parallel() {
-		t.Error("omitted allowParallel should default to parallel, got Parallel() = false")
 	}
 }
 

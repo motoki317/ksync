@@ -83,11 +83,10 @@ allowedContexts:
   # - k3s-*                      # any per-worktree microVM context
 
 # Optional. Only for clusters whose image store is separate from your docker
-# daemon (k3d, kind, a remote cluster). command runs once per build batch with
-# $KSYNC_IMAGES set. Leave it out for Docker Desktop. See "Building images".
+# daemon (k3d, kind, a remote cluster). command runs with $KSYNC_IMAGES set to
+# the images to load. Leave it out for Docker Desktop. See "Building images".
 # imageLoad:
 #   command: k3d image import --cluster dev $KSYNC_IMAGES
-#   allowParallel: false   # k3d image import is not concurrency-safe
 
 apps:
   # The smallest possible app: only a path.
@@ -113,8 +112,7 @@ The fields, one by one:
 | Field | Required | Meaning |
 |---|---|---|
 | `allowedContexts` | yes | The kubectl contexts ksync may target (≥1). The run uses the current-context or `--context`; it must match an entry here (each a shell-style glob, e.g. `k3s-*`), else it is refused. |
-| `imageLoad.command` | no | Shell command that makes freshly built images visible to the cluster (k3d/kind/remote). Runs once per build batch with `$KSYNC_IMAGES` set (and `$KSYNC_IMAGE` to the first). See "Making built images visible". |
-| `imageLoad.allowParallel` | no | Whether load commands may run concurrently (default `true`). Set `false` for a command that is not concurrency-safe against one cluster — notably `k3d image import`. See "Making built images visible". |
+| `imageLoad.command` | no | Shell command that makes freshly built images visible to the cluster (k3d/kind/remote). Runs with `$KSYNC_IMAGES` set to the newline-separated refs to load (and `$KSYNC_IMAGE` to the first). Loads never overlap, and images that finish while one runs are coalesced into the next invocation. See "Making built images visible". |
 | `buildGroups` | no | Named bulk-build commands several `build` entries can share, so one `docker buildx bake`/compile produces many images. See "Build groups". |
 | `apps[].path` | yes | Directory with a kustomization file. Relative paths are resolved from the config file's directory. |
 | `apps[].name` | no | Name of the app. Default: the directory name. Used in commands (`ksync sync api-b`), in logs, and as the tracking label value. |
@@ -401,27 +399,30 @@ from there, so nothing else is needed. But k3d and kind keep their own image sto
 node, and a remote cluster cannot see your daemon at all — a freshly built `ksync-<hash>` tag
 never reaches them, and the pod fails to start.
 
-For those, set `imageLoad.command`: a command ksync runs once per build batch, with
-`$KSYNC_IMAGES` set to the newline-separated built references (`<image>:ksync-<hash>`) and
-`$KSYNC_IMAGE` to the first of them. It is the mirror image of a build `command` — a build
-*produces* the refs, `imageLoad` *consumes* them.
+For those, set `imageLoad.command`: a command ksync runs with `$KSYNC_IMAGES` set to the
+newline-separated built references (`<image>:ksync-<hash>`) to load, and `$KSYNC_IMAGE` to the
+first of them. It is the mirror image of a build `command` — a build *produces* the refs,
+`imageLoad` *consumes* them.
 
 ```yaml
 # k3d (imports every image of the batch in one call):
 imageLoad:
   command: k3d image import --cluster dev $KSYNC_IMAGES
-  allowParallel: false        # k3d image import is not concurrency-safe — see below
 # kind:
 imageLoad:
   command: kind load docker-image --name dev $KSYNC_IMAGES
+# k3s (save the batch and import it into containerd's k8s.io namespace in one go):
+imageLoad:
+  command: docker save $KSYNC_IMAGES | k3s ctr -n k8s.io images import -
 # remote cluster that pulls from a registry your manifests point at:
 imageLoad:
   command: for i in $KSYNC_IMAGES; do docker push "$i"; done
 ```
 
-Use `$KSYNC_IMAGES` (plural) so a build group's images import together; `$KSYNC_IMAGE` (the
-first ref) still works for the single-image case. `$KSYNC_IMAGES` is newline-separated, so an
-unquoted use word-splits into one argument per image.
+Use `$KSYNC_IMAGES` (plural) so several images import together; `$KSYNC_IMAGE` (the first ref)
+still works for the single-image case. `$KSYNC_IMAGES` is newline-separated, so an unquoted use
+word-splits into one argument per image. A command that cannot take many images at once should
+loop over `$KSYNC_IMAGES` itself (the `docker push` line above).
 
 **One config, several clusters — `$KSYNC_CONTEXT`.** When `allowedContexts` lists more than one
 cluster, the load step must do different things per target: nothing for a shared-daemon Docker
@@ -432,7 +433,6 @@ instead of needing a per-cluster file:
 ```yaml
 allowedContexts: [docker-desktop, k3d-dev]
 imageLoad:
-  allowParallel: false
   command: |
     [ "$KSYNC_CONTEXT" = "docker-desktop" ] && exit 0   # shared daemon — nothing to do
     k3d image import --cluster dev $KSYNC_IMAGES         # separate store — import
@@ -447,23 +447,25 @@ waiting for a ksync release. The load runs only when an image is actually (re)bu
 fast manifest-only loop never pays for it. With k3d/kind, set the pods' `imagePullPolicy` to
 `Never` or `IfNotPresent` so the kubelet uses the imported image instead of trying to pull it.
 
-**Concurrency — `allowParallel`.** ksync builds apps in parallel, and by default each app's load
-runs as soon as its build finishes, concurrently with the others. That is correct for a registry
-push (registries handle simultaneous pushes of distinct images) and irrelevant for the
-shared-daemon case. It is **not** safe for `k3d image import`: k3d stages every import through one
-shared per-cluster "tools" node and a tarball named only to the second in a shared volume, then
-deletes them on cleanup — so two imports overlapping in time clobber each other and silently
-import nothing, leaving pods in `ErrImageNeverPull` behind a green ✓. Set `allowParallel: false`
-for such a command; ksync then serializes the load step (builds still run in parallel). On a
-single-image edit there is nothing to serialize, so this only affects a cold multi-image
-`sync`/`watch`.
+**Concurrency: serialized and coalesced.** ksync builds apps in parallel, but the load step never
+overlaps — two `imageLoad` commands never run against one cluster at once. This is because some
+importers corrupt under concurrency: `k3d image import` stages every import through one shared
+per-cluster "tools" node and a tarball named only to the second in a shared volume, then deletes
+them on cleanup, so two imports overlapping in time clobber each other and silently import nothing,
+leaving pods in `ErrImageNeverPull` behind a green ✓. Serializing is safe for every loader, so you
+write no flag.
 
-One cost to know: `k3d image import` (and `kind load`) transfer a *whole image tarball* per call —
-a few seconds each (measured ~3.3s for a ~120 MB image; `k3d image import --mode direct` shaves it
-to ~2.8s). It re-sends every layer even when only the top one changed, because a tarball has no
-notion of "already present". Editing one service rebuilds and imports just that one image — fast.
-A cold `watch` start that builds many images imports them one after another (serialized for k3d),
-so first convergence on a big project takes a little longer; steady-state editing does not.
+To keep that from being slow, ksync **coalesces**: while one load runs, images from other builds
+that finish in the meantime queue up, and the next load carries the whole queue in its
+`$KSYNC_IMAGES` — one `k3d image import a b c` instead of three separate imports. This matters
+because the per-call cost dominates: `k3d image import` (and `kind load`) transfer a *whole image
+tarball* and spin up a tools node per call — a few seconds regardless of image count (measured
+~3.3s for a ~120 MB image; `k3d image import --mode direct` shaves it to ~2.8s), re-sending every
+layer because a tarball has no notion of "already present". Editing one service rebuilds and
+imports just that one image — fast. A cold `watch`/`sync` that builds many images amortizes the
+fixed cost by batching whatever has piled up into each import, so first convergence is faster than
+one-import-per-image would be; steady-state single-edit loops have nothing to batch and are
+unaffected.
 
 #### k3d fast-path: push to a registry instead of importing
 
@@ -474,7 +476,6 @@ rebuild moves one layer:
 
 ```yaml
 # imageLoad: retag each built ref to the local registry and push it.
-# A registry push is concurrency-safe, so allowParallel stays at its default (true).
 imageLoad:
   command: |
     for ref in $KSYNC_IMAGES; do

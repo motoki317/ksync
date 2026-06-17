@@ -251,7 +251,7 @@ func runSync(args []string) error {
 	defer cleanup()
 	r := render.New(renderOpts)
 	prog := newProgress(os.Stderr, out, apps)
-	buildFn := makeBuildFunc(cfg, prog, kubeContext)
+	buildFn := makeBuildFunc(ctx, cfg, prog, kubeContext)
 	// A whole-stack run gets a plan up front, the summary block pinned live to
 	// the bottom (updating as apps finish), and the same block committed on
 	// completion; a single-app run already says it all in its one line.
@@ -610,7 +610,7 @@ func runWatch(args []string) error {
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
 		Render:      renderOpts,
-		Build:       makeBuildFunc(cfg, prog, kubeContext),
+		Build:       makeBuildFunc(ctx, cfg, prog, kubeContext),
 		Overrides:   overrides,
 		Log:         log,
 		Report:      reporter.report,
@@ -855,7 +855,12 @@ func (p *progress) finish(app string, info *ui.CommitInfo) {
 // pipeline; the verbose command log is shown only when the command fails. The
 // load step is a no-op unless the config sets imageLoad (daemon-shared clusters
 // need nothing).
-func makeBuildFunc(cfg *config.Config, prog *progress, kubeContext string) loop.BuildFunc {
+// runCtx governs the load step's lifetime: loads coalesce across apps, so a
+// single coalesced invocation carries images from several apps and must outlive
+// any one app's build phase — it should abort only when the whole run does (Ctrl-C),
+// not when one app's build errors and cancels that app's per-build context. Builds
+// keep the per-app context they are passed.
+func makeBuildFunc(runCtx context.Context, cfg *config.Config, prog *progress, kubeContext string) loop.BuildFunc {
 	groupCmd := make(map[string]string, len(cfg.BuildGroups))
 	for _, g := range cfg.BuildGroups {
 		groupCmd[g.Name] = g.Command
@@ -869,10 +874,9 @@ func makeBuildFunc(cfg *config.Config, prog *progress, kubeContext string) loop.
 	var mu sync.Mutex
 	imported := map[string]bool{}
 	// One Loader shared across the parallel per-app builds. It serializes loads
-	// unless the config marks the command concurrency-safe (allowParallel) —
-	// k3d image import, the unsafe default case, races on a shared tools node +
-	// tarball and silently drops images (see build.Loader).
-	loader := &build.Loader{Command: cfg.ImageLoad.Command, Parallel: cfg.ImageLoad.Parallel(), KubeContext: kubeContext}
+	// (k3d image import and friends are not concurrency-safe) and coalesces images
+	// that finish while a load runs into the next invocation (see build.Loader).
+	loader := &build.Loader{Command: cfg.ImageLoad.Command, KubeContext: kubeContext}
 	return func(ctx context.Context, app string, builds []config.Build) ([]string, error) {
 		if len(builds) == 0 {
 			return nil, nil
@@ -912,7 +916,7 @@ func makeBuildFunc(cfg *config.Config, prog *progress, kubeContext string) loop.
 			mu.Unlock()
 			if len(fresh) > 0 {
 				stage := pipe.Import(label)
-				err := loader.Load(ctx, stage, fresh)
+				err := loader.Load(runCtx, stage, fresh)
 				stage.Done(err)
 				if err != nil {
 					return nil, err

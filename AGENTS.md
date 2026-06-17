@@ -46,19 +46,21 @@ re-litigate only with new evidence):
   the run targets the current-context or `--context`, but it must match an entry; entries are
   shell-style globs (`path.Match`, e.g. `k3s-*` for per-worktree microVMs), a plain name matches
   exactly; `SelectContext` enforces this, so one config can serve several interchangeable dev
-  clusters yet never act on an unlisted one), optional top-level `imageLoad` (`command` + `allowParallel`, for separate-image-store
-  clusters; `allowParallel` defaults true, set false for non-concurrency-safe loaders like
-  `k3d image import`), per-app default namespace (ArgoCD destination.namespace parity), `needs`
+  clusters yet never act on an unlisted one), optional top-level `imageLoad` (just `command`, for
+  separate-image-store clusters; loads are always serialized and coalesced — see `internal/build`),
+  per-app default namespace (ArgoCD destination.namespace parity), `needs`
   DAG, per-app `build` entries (image/context + optional name/dockerfile/watch/watchIgnore/command —
   `name` defaults to the image's last path segment, unique within an app, labels the image in the
   watch confirmation prompt); `SortByNeeds`.
 - `internal/build` — source→image: docker build (or the `command` escape hatch producing
   `$KSYNC_IMAGE`), content-addressed dev tags `ksync-<12 hex of image ID>` (no persisted
   build state; `--provenance=false` keeps IDs deterministic), `.dockerignore`-scoped watch
-  derivation (WatchScope), and `Loader` (the `imageLoad` hook: runs the command per build batch
-  with `$KSYNC_IMAGES` set, for k3d/kind `image import` / registry push; serializes its calls
-  unless `Parallel`, since k3d image import is not concurrency-safe). See ADRs
-  20260612-build-integration, 20260613-image-load-hook, and 20260615-imageload-concurrency.
+  derivation (WatchScope), and `Loader` (the `imageLoad` hook: runs the command with `$KSYNC_IMAGES`
+  set, for k3d/kind `image import` / k3s `ctr import` / registry push; always serializes its calls
+  since k3d image import is not concurrency-safe, and **coalesces** — images that finish while a load
+  runs are batched into the next invocation, so a bulk-capable command amortizes its per-call cost).
+  See ADRs 20260612-build-integration, 20260613-image-load-hook, 20260615-imageload-concurrency, and
+  20260617-imageload-batching.
 - `internal/render` — in-process kustomize (krusty) replicating
   `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
   binary is enforced by test. `SetImages` (the build-tag injection path) also rewrites an

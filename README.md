@@ -32,7 +32,6 @@ Declare your apps in a `ksync.yaml`:
 context: docker-desktop        # the ONLY kubectl context ksync will touch
 # imageLoad:                   # only for k3d/kind/remote (separate image store)
 #   command: k3d image import --cluster dev $KSYNC_IMAGES
-#   allowParallel: false       # k3d image import is not concurrency-safe
 apps:
   - path: apps/shop
   - name: api-b

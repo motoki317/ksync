@@ -146,40 +146,79 @@ func TestLoader_SerializesConcurrentLoads(t *testing.T) {
 	}
 }
 
-// With Parallel set (a concurrency-safe loader: registry push, kind load), Load
-// must NOT serialize. The fake exec signals entry then blocks until released, so
-// all n calls have to be in flight at once; a serializing impl would let only
-// one enter and this would time out.
-func TestLoader_ParallelRunsConcurrently(t *testing.T) {
-	const n = 4
-	entered := make(chan struct{}, n)
+// Loads that arrive while one is in flight coalesce: the next invocation carries
+// every queued ref in a single command, instead of one command per load — what
+// recovers the throughput full serialization costs (one k3d import of N images,
+// not N imports). White-box: the internal queue is the synchronization point, so
+// the test waits for all stragglers to park rather than relying on a fixed sleep.
+func TestLoader_CoalescesQueuedLoads(t *testing.T) {
+	started := make(chan struct{})
 	release := make(chan struct{})
-	exec := func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
-		entered <- struct{}{}
-		<-release
+	var mu sync.Mutex
+	var waves [][]string // the $KSYNC_IMAGES of each invocation
+	exec := func(_ context.Context, _ string, env []string, _ []string, _, _ io.Writer) error {
+		mu.Lock()
+		first := len(waves) == 0
+		waves = append(waves, imagesEnv(env))
+		mu.Unlock()
+		if first {
+			close(started)
+			<-release // hold the first load so the others pile up behind it
+		}
 		return nil
 	}
-	l := &Loader{Command: "docker push $KSYNC_IMAGES", Exec: exec, Parallel: true}
+	l := &Loader{Command: "k3d image import $KSYNC_IMAGES", Exec: exec}
 
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
+	load := func(ref string) {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			ref := fmt.Sprintf("img-%d:ksync-%012d", i, i)
 			if err := l.Load(context.Background(), io.Discard, []string{ref}); err != nil {
-				t.Errorf("Load: %v", err)
+				t.Errorf("Load(%s): %v", ref, err)
 			}
-		}(i)
+		}()
 	}
-	timeout := time.After(2 * time.Second)
-	for i := 0; i < n; i++ {
-		select {
-		case <-entered:
-		case <-timeout:
-			t.Fatalf("only %d/%d loads ran concurrently; Parallel not honored (serialized)", i, n)
+
+	load("a:ksync-000000000001")
+	<-started // the leader holds the load slot
+
+	queued := []string{"b:ksync-000000000002", "c:ksync-000000000003", "d:ksync-000000000004"}
+	for _, r := range queued {
+		load(r)
+	}
+	for { // wait until all three have parked behind the leader, so they drain as one wave
+		l.mu.Lock()
+		n := len(l.queue)
+		l.mu.Unlock()
+		if n == len(queued) {
+			break
 		}
+		time.Sleep(time.Millisecond)
 	}
 	close(release)
 	wg.Wait()
+
+	if len(waves) != 2 {
+		t.Fatalf("invocations = %d, want 2 (leader + one coalesced wave)", len(waves))
+	}
+	if want := []string{"a:ksync-000000000001"}; !slices.Equal(waves[0], want) {
+		t.Errorf("first invocation refs = %v, want %v", waves[0], want)
+	}
+	got := slices.Clone(waves[1])
+	slices.Sort(got)
+	if !slices.Equal(got, queued) {
+		t.Errorf("coalesced invocation refs = %v, want %v (all queued, one command)", got, queued)
+	}
+}
+
+// imagesEnv extracts the newline-separated $KSYNC_IMAGES the Loader set.
+func imagesEnv(env []string) []string {
+	const prefix = "KSYNC_IMAGES="
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, prefix); ok {
+			return strings.Split(v, "\n")
+		}
+	}
+	return nil
 }

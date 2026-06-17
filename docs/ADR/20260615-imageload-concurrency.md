@@ -1,7 +1,12 @@
 # imageLoad concurrency: serialize unsafe loaders, structured config
 
 Date: 2026-06-15
-Status: accepted
+Status: superseded by [20260617-imageload-batching](20260617-imageload-batching.md)
+
+> Superseded 2026-06-17: `allowParallel` is gone. Loads are now **always** serialized (no knob)
+> and **coalesced** — images that finish while a load runs batch into the next invocation. The
+> `imageLoad` field is back to just `{ command }`. The analysis below (why k3d image import
+> corrupts under concurrency) still holds and is the reason serialization is unconditional.
 
 ## Context
 
