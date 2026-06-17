@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -39,6 +40,7 @@ func runImages(args []string) error {
 	fs := flag.NewFlagSet("images", flag.ContinueOnError)
 	live := fs.Bool("live", false, "also include images of running pods in the apps' namespaces (captures operator-derived images, e.g. ECK Elasticsearch, that rendered manifests never name)")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps to render concurrently (0 = one worker per app)")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -64,16 +66,37 @@ func runImages(args []string) error {
 	}
 	defer cleanup()
 	r := render.New(renderOpts)
-	namespaces := map[string]struct{}{}
-	for _, app := range apps {
+	// Render apps concurrently (the slow part is a helm dry-run per chart
+	// release); merge the per-app results sequentially afterward so the imageSet
+	// needs no locking.
+	type appResult struct {
+		refs       []string
+		namespaces []string
+	}
+	rendered, err := renderConcurrently(apps, *maxParallel, func(app config.App) (appResult, error) {
 		res, err := r.Render(app.Path)
 		if err != nil {
-			return fmt.Errorf("app %s: %w", app.Name, err)
+			return appResult{}, fmt.Errorf("app %s: %w", app.Name, err)
 		}
-		for _, ref := range res.Images() {
+		ns := map[string]struct{}{}
+		collectNamespaces(ns, res.Objects, app.Namespace)
+		nsList := make([]string, 0, len(ns))
+		for n := range ns {
+			nsList = append(nsList, n)
+		}
+		return appResult{refs: res.Images(), namespaces: nsList}, nil
+	})
+	if err != nil {
+		return err
+	}
+	namespaces := map[string]struct{}{}
+	for _, ar := range rendered {
+		for _, ref := range ar.refs {
 			images.add(ref)
 		}
-		collectNamespaces(namespaces, res.Objects, app.Namespace)
+		for _, n := range ar.namespaces {
+			namespaces[n] = struct{}{}
+		}
 	}
 
 	if *live {

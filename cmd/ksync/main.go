@@ -146,6 +146,7 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 func runRender(args []string) error {
 	fs := flag.NewFlagSet("render", flag.ContinueOnError)
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps to render concurrently (0 = one worker per app)")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -165,23 +166,72 @@ func runRender(args []string) error {
 	}
 	defer cleanup()
 	r := render.New(renderOpts)
-	for i, app := range apps {
+	// Render and serialize concurrently — each is independent, and both the
+	// per-chart helm dry-runs and the YAML marshal are the per-app cost.
+	yamls, err := renderConcurrently(apps, *maxParallel, func(app config.App) ([]byte, error) {
 		res, err := r.Render(app.Path)
 		if err != nil {
-			return fmt.Errorf("app %s: %w", app.Name, err)
-		}
-		if i > 0 {
-			fmt.Println("---")
+			return nil, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 		yml, err := res.YAML()
 		if err != nil {
-			return fmt.Errorf("app %s: %w", app.Name, err)
+			return nil, fmt.Errorf("app %s: %w", app.Name, err)
+		}
+		return yml, nil
+	})
+	if err != nil {
+		return err
+	}
+	for i, yml := range yamls {
+		if i > 0 {
+			fmt.Println("---")
 		}
 		if _, err := os.Stdout.Write(yml); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// renderConcurrently runs fn over apps with bounded concurrency, returning the
+// results in app order. Per-app rendering shells out to helm once per chart
+// release and each release waits on a live-cluster dry-run, so the work is
+// I/O-bound, overlaps well, and the wall-clock floor is the slowest single app
+// (rendering 20+ apps one at a time is what made `render`/`images` take ~10s).
+// The Renderer is concurrency-safe — the watch/sync loop already renders apps
+// in parallel this way. maxParallel <= 0 means one worker per app.
+func renderConcurrently[T any](apps []config.App, maxParallel int, fn func(config.App) (T, error)) ([]T, error) {
+	out := make([]T, len(apps))
+	errs := make([]error, len(apps))
+	if maxParallel <= 0 || maxParallel > len(apps) {
+		maxParallel = len(apps)
+	}
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	for i := range apps {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			v, err := fn(apps[i])
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			out[i] = v
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }
 
 // setupLogging builds ksync's two loggers and silences the Kubernetes client
