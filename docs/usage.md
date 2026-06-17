@@ -737,6 +737,13 @@ avoid the small per-render cluster round-trip. Offline, the output is the same b
 `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone <dir>` produces (verified
 by tests); charts that require `lookup` will not render.
 
+`render` and `images` render the selected apps **concurrently** (`-max-parallel`, default the
+host's CPU cores; `0` runs one worker per app). Each chart release inflates with a live-cluster
+`helm` dry-run, so rendering is I/O-bound and apps overlap; the wall-clock is bounded by the
+slowest single app rather than the sum (rendering a many-app config one at a time is otherwise the
+dominant cost). The output is unaffected — `render` still emits apps in config order, `images`
+is still a sorted set.
+
 ### `ksync images` — list the images the apps deploy
 
 ```bash
