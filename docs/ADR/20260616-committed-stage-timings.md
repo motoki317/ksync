@@ -1,7 +1,7 @@
 # Freeze the per-app stage tree on commit
 
 Date: 2026-06-16
-Status: accepted
+Status: accepted (Decision bullet 2 amended by ADR 20260618-group-total-and-deploy-line)
 
 ## Context
 

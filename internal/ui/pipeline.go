@@ -83,6 +83,14 @@ func (s *Stage) SetTail(line string) {
 	s.mu.Unlock()
 }
 
+// getState reads the stage's lifecycle state under its lock — used by the
+// pipeline's collapse decision, which must tell a started deploy from a pending one.
+func (s *Stage) getState() stageState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
 // Write captures a command's output and feeds its latest non-empty line to the
 // live row. It never blocks the command and never errors.
 func (s *Stage) Write(p []byte) (int, error) {
@@ -150,17 +158,18 @@ func (s *Stage) plainResult(err error, d time.Duration) string {
 	return fmt.Sprintf("%s %s %s  %s\n", mark, s.icon, s.heading(), Elapsed(s.pipe.c, d))
 }
 
-// Pipeline is one app's live progress group: a header line (app name) with its
-// build, import, and deploy stages as indented rows beneath it. Several
-// pipelines animate at once (apps sync concurrently); liveTerm renders them as
-// one block. A pipeline with only a deploy stage (an app with no builds) and no
-// forced expansion collapses to a single line, so infra apps stay compact while
-// build apps show the full tree.
+// Pipeline is one app's live progress group: a header line (app name plus the
+// group's total wall-clock) with its build, import, and deploy stages as indented
+// rows beneath it. Several pipelines animate at once (apps sync concurrently);
+// liveTerm renders them as one block. A pipeline that has only a deploy stage
+// collapses to a single line — an app with no builds, or a build app whose images
+// were all overridden so it never built — so infra and override-only apps stay
+// compact while apps that actually build show the full tree.
 type Pipeline struct {
 	w      io.Writer
 	c      Colors
 	app    string
-	expand bool // app has builds: always show the tree, never collapse
+	expand bool // app has builds: hold the tree open (pending deploy row) until builds begin
 	tty    bool
 	now    func() time.Time
 
@@ -235,11 +244,12 @@ type CommitInfo struct {
 }
 
 // Finish commits the group in place of the live one and removes it from the
-// block. A build app keeps its full stage tree frozen — every build/import row
-// and the deploy row retain their final time — so the per-stage timings survive
-// the run; a build-less app collapses to one deploy line. Off a terminal it
-// prints only that single line (the build/import stages already streamed their
-// own result lines as they finished).
+// block. An app that built keeps its full stage tree frozen — every build/import
+// row and the deploy row retain their final time, the header its group total — so
+// the per-stage timings survive the run; a deploy-only app (no builds, or all
+// overridden) collapses to one deploy line. Off a terminal it prints only that
+// single line (the build/import stages already streamed their own result lines as
+// they finished).
 func (p *Pipeline) Finish(info CommitInfo) {
 	block := p.committed(info)
 	if p.tty {
@@ -259,12 +269,13 @@ func (p *Pipeline) Discard() {
 }
 
 // committed renders the frozen committed block: the per-resource failure/degraded
-// lines first, then a build app's full stage tree (so each stage's final time is
-// preserved) or a build-less app's single deploy line. Off a terminal it is
-// always the single line — the build/import rows already printed as they ran.
+// lines first, then — when the app actually built — its full stage tree (so each
+// stage's final time is preserved) or, for a deploy-only app, its single deploy
+// line. Off a terminal it is always the single line — the build/import rows
+// already printed as they ran.
 func (p *Pipeline) committed(info CommitInfo) string {
 	lines := append([]string{}, info.Above...)
-	if p.tty && p.expand {
+	if p.tty && p.hasBuildStages() {
 		lines = append(lines, p.committedTree(info)...)
 	} else {
 		lines = append(lines, p.committedLine(info))
@@ -272,9 +283,10 @@ func (p *Pipeline) committed(info CommitInfo) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// committedTree freezes a build app's group: the app header, then each stage as a
-// row carrying its final symbol and elapsed (the deploy row also the apply
-// summary), ordered build→import→deploy and column-aligned like the live tree.
+// committedTree freezes a build app's group: the app header (with the group's
+// total wall-clock), then each stage as a row carrying its final symbol and
+// elapsed (the deploy row also the apply summary), ordered build→import→deploy and
+// column-aligned like the live tree.
 func (p *Pipeline) committedTree(info CommitInfo) []string {
 	p.mu.Lock()
 	stages := make([]*Stage, len(p.stages))
@@ -289,7 +301,11 @@ func (p *Pipeline) committedTree(info CommitInfo) []string {
 		}
 	}
 	out := make([]string, 0, len(stages)+1)
-	out = append(out, p.c.Bold(p.app))
+	header := p.c.Bold(p.app)
+	if d := groupSpan(stages, p.now()); d > 0 {
+		header += "  " + Elapsed(p.c, d)
+	}
+	out = append(out, header)
 	for _, s := range stages {
 		out = append(out, p.committedRow(s, info, labelW))
 	}
@@ -333,9 +349,11 @@ func committedLabel(s *Stage) string {
 	return s.label
 }
 
-// committedLine renders a build-less app's single committed line, reading the
-// deploy stage's own elapsed (the apply + health-gate time) so the number is that
-// stage's, not the app's end-to-end wall clock.
+// committedLine renders a deploy-only app's single committed line — a build-less
+// app, or a build app whose images were all overridden so it never built. It reads
+// the deploy stage's own elapsed (the apply + health-gate time) so the number is
+// that stage's, not the app's end-to-end wall clock, and leads with the "Deploy"
+// kind word so it reads consistently with the deploy row of a build app's tree.
 func (p *Pipeline) committedLine(info CommitInfo) string {
 	var elapsed time.Duration
 	if p.deploy != nil {
@@ -345,24 +363,29 @@ func (p *Pipeline) committedLine(info CommitInfo) string {
 		}
 		p.deploy.mu.Unlock()
 	}
-	return DeployLine(p.c, p.app, info.Summary, info.Symbol, elapsed, info.NameW)
+	return DeployLine(p.c, p.app, "Deploy", info.Summary, info.Symbol, elapsed, info.NameW)
 }
 
 // DeployLine renders one app's committed deploy line — the single-row form used
-// for a build-less app and by `ksync destroy`: a health symbol, the 🚢 icon, the
-// app name (padded to nameW so a run's lines align), the dim apply summary, and
-// the elapsed time (omitted when zero). It carries no "Deploy" kind word: the
-// icon and the "N applied" summary already say what happened and the app is the
-// subject, so the committed line never collides with the in-pipeline Deploy stage.
-func DeployLine(c Colors, app, summary, symbol string, elapsed time.Duration, nameW int) string {
+// for a deploy-only app and by `ksync destroy`: a health symbol, the 🚢 icon, an
+// optional kind word ("Deploy"), the app name (padded to nameW so a run's lines
+// align), the dim apply summary, and the elapsed time (omitted when zero). kind is
+// the title shown beside the icon; the sync path passes "Deploy" so a deploy-only
+// line matches the in-tree deploy row, while `ksync destroy` passes "" (it is not
+// a deploy — its icon and summary already say what happened).
+func DeployLine(c Colors, app, kind, summary, symbol string, elapsed time.Duration, nameW int) string {
 	if symbol == "" {
 		symbol = c.Green("✓")
+	}
+	line := fmt.Sprintf("%s %s", symbol, IconDeploy)
+	if kind != "" {
+		line += " " + kind
 	}
 	name := c.Bold(app)
 	if pad := nameW - displayWidth(app); pad > 0 {
 		name += strings.Repeat(" ", pad)
 	}
-	line := fmt.Sprintf("%s %s %s", symbol, IconDeploy, name)
+	line += " " + name
 	if summary != "" {
 		line += "  " + summary
 	}
@@ -378,6 +401,55 @@ func (p *Pipeline) refresh() {
 	}
 }
 
+// groupSpan is the whole group's wall-clock duration: from the earliest stage
+// start to the latest stage end, or to now while any stage still runs. It is the
+// span, not the sum of the rows — builds overlap, so "sistema took N" is the
+// elapsed wall clock across the tree, not the addition of its stage times.
+// Returns 0 when every stage is still pending (nothing has started to time).
+// Each stage is read under its own lock; the caller passes the stage snapshot.
+func groupSpan(stages []*Stage, now time.Time) time.Duration {
+	var start, end time.Time
+	running := false
+	for _, s := range stages {
+		s.mu.Lock()
+		st, en, state := s.start, s.end, s.state
+		s.mu.Unlock()
+		if state == statePending {
+			continue
+		}
+		if start.IsZero() || st.Before(start) {
+			start = st
+		}
+		if state == stateRunning {
+			running = true
+		} else if en.After(end) {
+			end = en
+		}
+	}
+	if start.IsZero() {
+		return 0
+	}
+	if running || end.Before(start) {
+		end = now
+	}
+	return end.Sub(start)
+}
+
+// hasBuildStages reports whether any build or import row exists — i.e. the app
+// actually built this run. A build app whose images were all supplied as overrides
+// runs no build, so it has only the deploy stage and commits as the single deploy
+// line rather than a one-child tree.
+func (p *Pipeline) hasBuildStages() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, s := range p.stages {
+		if s.phase != phaseDeploy {
+			return true
+		}
+	}
+	return false
+}
+
 // lines renders the group for the given spinner frame: a single collapsed line
 // for a deploy-only app, else an app header with its stages sorted by phase as
 // indented rows. Called from the ticker goroutine, so it locks the pipeline and
@@ -389,8 +461,15 @@ func (p *Pipeline) lines(frame rune) []string {
 	copy(stages, p.stages)
 	sort.SliceStable(stages, func(i, j int) bool { return stages[i].phase < stages[j].phase })
 
-	if !p.expand && len(stages) == 1 {
-		return []string{p.collapsedLine(stages[0], frame)}
+	// Collapse to one line when the deploy is the only stage: always for a
+	// build-less app, and for a build app once its deploy has started while still
+	// alone (its builds were all overridden, so no build/import rows will appear).
+	// While the deploy is still pending, a build app keeps the pending deploy row
+	// under its header so the upcoming work stays visible until builds begin.
+	if len(stages) == 1 && stages[0].phase == phaseDeploy {
+		if !p.expand || stages[0].getState() != statePending {
+			return []string{p.collapsedLine(stages[0], frame)}
+		}
 	}
 
 	// Align the meta column: pad every label to the widest in the group.
@@ -401,7 +480,11 @@ func (p *Pipeline) lines(frame rune) []string {
 		}
 	}
 	out := make([]string, 0, len(stages)+1)
-	out = append(out, fmt.Sprintf("%s %s", p.c.Cyan(string(frame)), p.c.Bold(p.app)))
+	header := fmt.Sprintf("%s %s", p.c.Cyan(string(frame)), p.c.Bold(p.app))
+	if d := groupSpan(stages, p.now()); d > 0 {
+		header += "  " + Elapsed(p.c, d)
+	}
+	out = append(out, header)
 	for _, s := range stages {
 		out = append(out, p.stageRow(s, frame, labelW))
 	}

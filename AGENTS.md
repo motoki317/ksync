@@ -76,19 +76,24 @@ re-litigate only with new evidence):
   single-line records (a quiet variant drops Info/V noise; used for the engine and the routed
   klog/client-go stream), color helpers (NO_COLOR + TTY aware), and the live terminal block
   (`console`) — a set of per-app `Pipeline`s, each grouping its named **🔨 Build → 📦 Import →
-  🚢 Deploy** stages (not-yet-reached stages shown as pending `○`; a deploy-only app collapses to
-  one line) with a pinned Summary footer, height-clamped so concurrent groups never overflow.
-  Each build/import command's output is collapsed to one live line per stage; the full log shows
-  only on failure. On commit a build app **freezes its whole stage tree** (every build/import/deploy
-  row keeps its own final time) instead of collapsing to the deploy line, so per-stage timings
-  survive the run; a build-less app commits one `🚢 <app>  N applied  <time>` line (no redundant
-  "Deploy" word — the committed deploy time is the deploy stage's own, via `ui.CommitInfo`). Off a
-  terminal the block is inert (plain per-stage and per-app lines). Also the **watch confirmation
+  🚢 Deploy** stages under a header that carries the app name and the **group's total wall-clock**
+  (the span across its stages, not the sum — builds overlap), not-yet-reached stages shown as
+  pending `○`, with a pinned Summary footer, height-clamped so concurrent groups never overflow. A
+  **deploy-only** pipeline collapses to one line — an app with no builds, *or* a build app whose
+  images were all supplied as overrides so it never built (collapses once its deploy starts, having
+  no build/import rows to come). Each build/import command's output is collapsed to one live line
+  per stage; the full log shows only on failure. On commit a build app **freezes its whole stage
+  tree** (every build/import/deploy row keeps its own final time, the header its group total)
+  instead of collapsing, so per-stage timings survive the run; a deploy-only app commits one
+  `🚢 Deploy <app>  N applied  <time>` line (the "Deploy" word matches the in-tree deploy row; the
+  committed deploy time is the deploy stage's own, via `ui.CommitInfo`). `ui.DeployLine`'s `kind`
+  arg carries that word — sync passes "Deploy", `ksync destroy` passes "" (it is not a deploy). Off
+  a terminal the block is inert (plain per-stage and per-app lines). Also the **watch confirmation
   picker** (`prompt.go`): a two-step interactive gate (single-select Build all / Select which to
   build / Skip, then an arrow-key + spacebar multi-select), a pure `buildPrompt` model (unit-tested
   via key events) behind a thin raw-mode driver (`ConfirmBuilds`) that runs only while the loop is
-  idle. See ADRs 20260615-grouped-pipeline-progress, 20260616-committed-stage-timings, and
-  20260616-manual-build-gate.
+  idle. See ADRs 20260615-grouped-pipeline-progress, 20260616-committed-stage-timings,
+  20260616-manual-build-gate, and 20260618-group-total-and-deploy-line.
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.

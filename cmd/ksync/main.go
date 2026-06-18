@@ -895,7 +895,7 @@ func (p *progress) finish(app string, info *ui.CommitInfo) {
 		for _, ln := range info.Above {
 			b.WriteString(ln + "\n")
 		}
-		b.WriteString(ui.DeployLine(p.colors, app, info.Summary, info.Symbol, 0, info.NameW) + "\n")
+		b.WriteString(ui.DeployLine(p.colors, app, "Deploy", info.Summary, info.Symbol, 0, info.NameW) + "\n")
 		ui.WriteLine(p.w, b.String())
 	}
 }
@@ -1124,11 +1124,12 @@ func applyParts(c ui.Colors, s loop.SyncStats) (summary, symbol string) {
 }
 
 // appSyncLine renders one app's completed-sync status line via the shared
-// ui.DeployLine layout — used by `ksync destroy`, which has no pipeline. took,
-// when > 0, is appended; a zero duration omits it.
+// ui.DeployLine layout — used by `ksync destroy`, which has no pipeline. It passes
+// no kind word: destroy is not a deploy, and its 🚢 icon and summary already say
+// what happened. took, when > 0, is appended; a zero duration omits it.
 func appSyncLine(c ui.Colors, app string, s loop.SyncStats, took time.Duration, nameW int) string {
 	summary, symbol := applyParts(c, s)
-	return ui.DeployLine(c, app, summary, symbol, took, nameW)
+	return ui.DeployLine(c, app, "", summary, symbol, took, nameW)
 }
 
 // nameColWidth is the app-name column width for the streamed per-app summary

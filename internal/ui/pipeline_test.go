@@ -112,8 +112,10 @@ func TestPipeline_ExpandNeverCollapses(t *testing.T) {
 }
 
 // Off a terminal, build/import stages print plain result lines (their only
-// record) but the deploy is silent — its committed summary already reports the
-// app, so a pipe shows one line per app, not two.
+// record) but the deploy stage is silent — its committed summary already reports
+// the app, so a pipe shows one line per app, not two. The committed line itself
+// does carry the "Deploy" word; the silence is that the stage adds no line of its
+// own before the commit.
 func TestPipeline_NonTTYBuildPrintsDeploySilent(t *testing.T) {
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
@@ -125,16 +127,19 @@ func TestPipeline_NonTTYBuildPrintsDeploySilent(t *testing.T) {
 	d.Start()
 	clk.add(500 * time.Millisecond)
 	d.Done(nil)
-	p.Finish(CommitInfo{Summary: "3 applied", Symbol: "✓"})
 
-	out := buf.String()
-	if !strings.Contains(out, "Build img") {
-		t.Errorf("non-tty build should print a plain result line, got %q", out)
+	// Before the commit, the build has streamed its own result line but the deploy
+	// stage has added none — its committed summary is its only record off a terminal.
+	mid := buf.String()
+	if !strings.Contains(mid, "Build img") {
+		t.Errorf("non-tty build should print a plain result line, got %q", mid)
 	}
-	if strings.Contains(out, "Deploy ns-system") {
-		t.Errorf("non-tty deploy must be silent (the summary is its record), got %q", out)
+	if strings.Contains(mid, IconDeploy) || strings.Contains(mid, "Deploy") {
+		t.Errorf("non-tty deploy stage must stay silent until commit, got %q", mid)
 	}
-	if !strings.Contains(out, "3 applied") {
+
+	p.Finish(CommitInfo{Summary: "3 applied", Symbol: "✓"})
+	if out := buf.String(); !strings.Contains(out, "3 applied") {
 		t.Errorf("Finish should print the committed summary, got %q", out)
 	}
 }
@@ -158,8 +163,11 @@ func TestPipeline_CommittedTreeKeepsStageTimes(t *testing.T) {
 	d.Done(nil)
 
 	lines := p.committedTree(CommitInfo{Summary: "21 applied", Symbol: "✓"})
-	if lines[0] != "ns-system" {
-		t.Errorf("first committed line should be the app header, got %q", lines[0])
+	// The header is the app name followed by the group's total wall-clock: builds
+	// overlap, so the span runs from the first build start to the deploy end
+	// (0→80→88→200s here = 3m20s), not the sum of the rows.
+	if !strings.HasPrefix(lines[0], "ns-system") || !strings.Contains(lines[0], "3m20s") {
+		t.Errorf("header should be the app name with the group total 3m20s, got %q", lines[0])
 	}
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, IconBuild) || !strings.Contains(joined, "img") || !strings.Contains(joined, "1m20s") {
@@ -173,11 +181,11 @@ func TestPipeline_CommittedTreeKeepsStageTimes(t *testing.T) {
 	}
 }
 
-// A build-less app commits one deploy line — the app is the subject, the 🚢 icon
-// and the "N applied" summary say what happened — so the line carries no "Deploy"
-// word that would collide with the in-pipeline Deploy stage. The time shown is
-// the deploy stage's own, not an end-to-end wall clock.
-func TestPipeline_CommittedLineDropsDeployWord(t *testing.T) {
+// A deploy-only app commits one line that leads with the "Deploy" kind word — so
+// it reads consistently with the deploy row of a build app's tree — names the app,
+// and carries its apply summary. The time shown is the deploy stage's own, not an
+// end-to-end wall clock.
+func TestPipeline_CommittedLineCarriesDeployWord(t *testing.T) {
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
 	p := newPipe(&buf, "db", false, clk)
@@ -187,11 +195,56 @@ func TestPipeline_CommittedLineDropsDeployWord(t *testing.T) {
 	d.Done(nil)
 
 	line := p.committedLine(CommitInfo{Summary: "40 applied", Symbol: "✓"})
-	if !strings.Contains(line, IconDeploy) || !strings.Contains(line, "db") || !strings.Contains(line, "40 applied") || !strings.Contains(line, "32s") {
-		t.Errorf("committed line should name the app with its apply summary and time, got %q", line)
+	if !strings.Contains(line, IconDeploy) || !strings.Contains(line, "Deploy") || !strings.Contains(line, "db") {
+		t.Errorf("committed line should lead with the 🚢 icon, the Deploy word, and the app, got %q", line)
 	}
-	if strings.Contains(strings.ToLower(line), "deploy") {
-		t.Errorf("committed deploy-only line must not carry the Deploy word, got %q", line)
+	if !strings.Contains(line, "40 applied") || !strings.Contains(line, "32s") {
+		t.Errorf("committed line should carry the apply summary and the deploy stage's own time, got %q", line)
+	}
+}
+
+// The live tree header carries the group's running total — the wall-clock span
+// across its stages — so the whole app's elapsed is visible at a glance, not only
+// the per-stage rows.
+func TestPipeline_LiveHeaderShowsGroupTotal(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "sistema", true, clk)
+	p.Deploy()
+	p.Build("ui") // running from t=0
+	clk.add(12 * time.Second)
+
+	header := p.lines('⠹')[0]
+	if !strings.Contains(header, "sistema") || !strings.Contains(header, "12s") {
+		t.Errorf("live header should show the app and its running group total, got %q", header)
+	}
+}
+
+// A build app whose images were all supplied as overrides never builds, so only
+// the deploy stage exists. While the deploy is pending it keeps its header row
+// (the upcoming work shows), but once the deploy starts it collapses to a single
+// line and commits as one deploy line — never a one-child tree.
+func TestPipeline_OverrideOnlyDeployCollapses(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "duo", true, clk) // expand: has builds in config, all overridden this run
+	d := p.Deploy()
+
+	if got := p.lines('⠼'); len(got) != 2 {
+		t.Fatalf("a pending deploy-only build app keeps its header row, got %q", got)
+	}
+	d.Start()
+	clk.add(37 * time.Second)
+	d.Done(nil)
+	if got := p.lines('⠼'); len(got) != 1 {
+		t.Fatalf("a started deploy-only build app collapses to one line, got %q", got)
+	}
+	if p.hasBuildStages() {
+		t.Errorf("an app that only deployed should report no build stages")
+	}
+	line := p.committedLine(CommitInfo{Summary: "6 applied", Symbol: "✓"})
+	if !strings.Contains(line, "Deploy") || !strings.Contains(line, "duo") || !strings.Contains(line, "6 applied") {
+		t.Errorf("override-only app should commit as a single Deploy line, got %q", line)
 	}
 }
 
