@@ -646,9 +646,9 @@ func runWatch(args []string) error {
 	var gate *loop.Gate
 	if !*auto && interactiveTerminal() {
 		gate = newBuildGate(ctx, cancel, os.Stderr, out)
-		log.Info("watching; on change you'll be asked what to rebuild — Ctrl-C to quit")
+		log.Info("Watching; on change you'll be asked what to rebuild — Ctrl-C to quit")
 	} else {
-		log.Info("watching; rebuilding automatically on change — Ctrl-C to quit")
+		log.Info("Watching; rebuilding automatically on change — Ctrl-C to quit")
 	}
 
 	// Frame the startup convergence like a `ksync sync` run — a Plan, a live

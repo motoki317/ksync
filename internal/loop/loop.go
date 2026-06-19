@@ -194,7 +194,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			}
 			scope, err := build.WatchScope(app.Build[j])
 			if err != nil {
-				log.Error(err, "deriving build watch scope; watching without ignore rules", "app", app.Name, "image", app.Build[j].Image)
+				log.Error(err, "Deriving build watch scope; watching without ignore rules", "app", app.Name, "image", app.Build[j].Image)
 			}
 			states[j].scope = scope
 		}
@@ -222,7 +222,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		roots := []string{app.Path}
 		deps, err := watch.DependencyRoots(app.Path)
 		if err != nil {
-			log.Error(err, "deriving dependency roots; watching the app dir only", "app", app.Name)
+			log.Error(err, "Deriving dependency roots; watching the app dir only", "app", app.Name)
 		}
 		appRoots[i] = watch.AppRoots{App: app.Name, Roots: append(roots, deps...)}
 	}
@@ -334,7 +334,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	refreshWatch := func() {
 		mapping = watch.NewMapping(mappingEntries())
 		if err := watcher.SetRoots(watchRoots()); err != nil {
-			log.Error(err, "re-deriving watch roots")
+			log.Error(err, "Re-deriving watch roots")
 		}
 	}
 
@@ -514,7 +514,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			for _, a := range apps {
 				deploySched.MarkDirty(a.Name, now)
 			}
-			log.Info("manual resync requested", "apps", len(apps))
+			log.Info("Manual resync requested", "apps", len(apps))
 		case dec := <-gateDecisions:
 			now := time.Now()
 			prompting = false
@@ -572,7 +572,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				promptDeadline = now.Add(opts.Debounce)
 			}
 		case err := <-watcher.Errors:
-			log.Error(err, "watch error")
+			log.Error(err, "Watch error")
 		case r := <-buildResults:
 			building[r.app] = false
 			states := builds[r.app]
@@ -668,20 +668,20 @@ func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render
 	started := time.Now()
 	res, err := rn.renderer.Render(app.Path)
 	if err != nil {
-		rn.log.Error(err, "render failed", "app", app.Name)
+		rn.log.Error(err, "Render failed", "app", app.Name)
 		rn.onError(app.Name, err)
 		return deployResult{app: app.Name}
 	}
 	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {
-			rn.log.Error(err, "injecting image refs failed", "app", app.Name)
+			rn.log.Error(err, "Injecting image refs failed", "app", app.Name)
 			rn.onError(app.Name, err)
 			return deployResult{app: app.Name}
 		}
 	}
 	stats, err := rn.syncFn(ctx, app.Name, res.Objects)
 	if err != nil {
-		rn.log.Error(err, "sync failed", "app", app.Name)
+		rn.log.Error(err, "Sync failed", "app", app.Name)
 		rn.onError(app.Name, err)
 		return deployResult{app: app.Name}
 	}
@@ -709,7 +709,7 @@ func (rn *runner) reportSync(app string, stats SyncStats, took time.Duration) {
 		kv = append(kv, "degraded", stats.Degraded)
 	}
 	kv = append(kv, "took", ui.Duration(took))
-	rn.log.Info("synced", kv...)
+	rn.log.Info("Synced", kv...)
 }
 
 // BuildAll builds every batch of app's dirty entries (todo), up to maxParallel

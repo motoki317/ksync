@@ -65,7 +65,7 @@ func imageOverrides(cfg *config.Config, flagVals []string, log logr.Logger) (map
 	}
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
-		log.Info("ignoring image overrides with no matching build entry", "images", strings.Join(unknown, ", "))
+		log.Info("Ignoring image overrides with no matching build entry", "images", strings.Join(unknown, ", "))
 	}
 	return out, nil
 }
