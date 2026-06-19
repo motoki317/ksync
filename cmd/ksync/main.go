@@ -727,7 +727,7 @@ func (g *buildGate) ask(pending []loop.PendingItem) {
 			if len(pending) == 1 {
 				plural = ""
 			}
-			ui.WriteLine(g.w, g.out.Dim(fmt.Sprintf("— skipped (%d change%s still pending; edit to re-prompt)", len(pending), plural))+"\n")
+			ui.WriteLine(ui.SectionLog, g.w, g.out.Dim(fmt.Sprintf("— skipped (%d change%s still pending; edit to re-prompt)", len(pending), plural))+"\n")
 		}
 		select {
 		case g.decisions <- loop.Decision{Selected: chosen}:
@@ -819,7 +819,9 @@ func (r *watchReporter) onIdle(took time.Duration) {
 	if r.multi {
 		printSummaryBlock(r.w, summaryLines(r.out, r.total, synced, agg, degraded, took, true))
 	}
-	r.log.Info("finished, watching for changes")
+	// The console sets this log line one blank apart from the Summary (or, for a
+	// single-app watch, from the pipeline) above it — see ui.Section.
+	r.log.Info("Finished, watching for changes")
 }
 
 // stop removes the live footer; idempotent, so the deferred call after the loop
@@ -896,7 +898,7 @@ func (p *progress) finish(app string, info *ui.CommitInfo) {
 			b.WriteString(ln + "\n")
 		}
 		b.WriteString(ui.DeployLine(p.colors, app, "Deploy", info.Summary, info.Symbol, 0, info.NameW) + "\n")
-		ui.WriteLine(p.w, b.String())
+		ui.WriteLine(ui.SectionPipeline, p.w, b.String())
 	}
 }
 
@@ -1095,7 +1097,7 @@ func failureLines(c ui.Colors, results []common.ResourceSyncResult, degraded []s
 // printSummary writes one app's summary block above any live block (destroy has
 // no pipeline of its own to commit).
 func printSummary(w io.Writer, c ui.Colors, app string, results []common.ResourceSyncResult, degraded []string, took time.Duration, nameW int) {
-	ui.WriteLine(w, summaryBlock(c, app, results, degraded, took, nameW))
+	ui.WriteLine(ui.SectionPipeline, w, summaryBlock(c, app, results, degraded, took, nameW))
 }
 
 // applyParts renders the dim apply summary ("21 applied, 2 pruned, …") and the
@@ -1149,19 +1151,20 @@ func nameColWidth(apps []config.App) int {
 }
 
 // printPlan opens a whole-stack sync with a titled overview: how many apps, the
-// target context, and the app names — so the developer sees the scope before
-// the per-app lines start streaming. The trailing blank line sets it apart from
-// the streamed log that follows.
+// target context, and the app names — so the developer sees the scope before the
+// per-app lines start streaming. It emits only the block's own lines; the console
+// sets it apart from the surrounding sections (the log above, the pipelines below)
+// by the Plan section kind.
 func printPlan(w io.Writer, c ui.Colors, apps []config.App, kubeContext string) {
 	names := make([]string, len(apps))
 	for i, a := range apps {
 		names[i] = a.Name
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n%s\n", c.Bold("Plan"))
+	fmt.Fprintf(&b, "%s\n", c.Bold("Plan"))
 	fmt.Fprintf(&b, "  %s %s %s\n", fmt.Sprintf("%d apps", len(apps)), c.Dim("→"), c.Bold(kubeContext))
-	fmt.Fprintf(&b, "  %s\n\n", c.Dim(strings.Join(names, " ")))
-	ui.WriteLine(w, b.String())
+	fmt.Fprintf(&b, "  %s\n", c.Dim(strings.Join(names, " ")))
+	ui.WriteLine(ui.SectionPlan, w, b.String())
 }
 
 // summaryLines renders the titled run-summary block (vitest-style right-aligned
@@ -1196,10 +1199,10 @@ func summaryLines(c ui.Colors, total, synced int, agg loop.SyncStats, degradedAp
 			width = len(ln.label)
 		}
 	}
-	// Lead with a blank line so the block is set off from the log above it — both
-	// while pinned live (this footer) and when committed (printSummaryBlock), so
-	// the spacing is identical in both states.
-	lines := []string{"", c.Bold("Summary")}
+	// No leading blank: the console sets the Summary apart from the section above
+	// it — the live footer is spaced from the items by the block's own separator
+	// (drawBlock), the committed block by its Summary section kind.
+	lines := []string{c.Bold("Summary")}
 	for _, ln := range rows {
 		// Right-align the label (padding added before color-wrapping, so the
 		// columns line up regardless of escape codes), value after a 2-space gap.
@@ -1208,9 +1211,9 @@ func summaryLines(c ui.Colors, total, synced int, agg loop.SyncStats, degradedAp
 	return lines
 }
 
-// printSummaryBlock commits the final summary block to scrollback. The leading
-// blank line comes from summaryLines, matching the live footer that was just
-// cleared.
+// printSummaryBlock commits the final summary block to scrollback as the Summary
+// section, so the console sets it one blank line apart from the pipelines above
+// and the watching-for-changes log below.
 func printSummaryBlock(w io.Writer, lines []string) {
-	ui.WriteLine(w, strings.Join(lines, "\n")+"\n")
+	ui.WriteLine(ui.SectionSummary, w, strings.Join(lines, "\n")+"\n")
 }

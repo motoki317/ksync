@@ -52,7 +52,7 @@ func TestConsole_LinePrintsAboveBlock(t *testing.T) {
 	c := newConsole(&buf)
 	c.addItem(&buf, cols80, bigRows, item("build duo"))
 	buf.Reset() // ignore the initial paint; focus on what line() emits
-	c.line(&buf, "✓ postgres  0 applied\n")
+	c.line(SectionLog, &buf, "✓ postgres  0 applied\n")
 	c.stopTicker()
 
 	got := buf.String()
@@ -91,7 +91,7 @@ func TestConsole_FinishPrintsDoneAndKeepsOthers(t *testing.T) {
 func TestConsole_LinePlainWhenNoBlock(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	c.line(&buf, "✓ postgres  0 applied\n")
+	c.line(SectionLog, &buf, "✓ postgres  0 applied\n")
 	if got := buf.String(); got != "✓ postgres  0 applied\n" {
 		t.Errorf("plain line should not be decorated, got %q", got)
 	}
@@ -126,7 +126,7 @@ func TestConsole_LineAboveFooterOnly(t *testing.T) {
 	c := newConsole(&buf)
 	c.setFooter(&buf, cols80, bigRows, func() []string { return []string{"Summary", "  Apps  0/4 synced"} })
 	buf.Reset()
-	c.line(&buf, "✓ postgres  0 applied\n")
+	c.line(SectionLog, &buf, "✓ postgres  0 applied\n")
 	c.stopTicker()
 
 	got := buf.String()
@@ -166,7 +166,8 @@ func TestConsole_DrawBlockClampsToWidth(t *testing.T) {
 // cursor-up erase math.
 func TestConsole_ClampsToHeight(t *testing.T) {
 	var buf bytes.Buffer
-	// 5 rows of budget (height 6 - 1); footer takes 2, marker 1, so 2 item rows fit.
+	// 5 rows of budget (height 6 - 1); the footer takes 3 (its separator blank,
+	// Summary, the Apps row) and the marker 1, so 1 item row fits.
 	c := &console{w: &buf, cols: cols80, rows: func() int { return 6 }}
 	for i := 0; i < 6; i++ {
 		c.items = append(c.items, item("group-"+string(rune('a'+i))))
@@ -180,7 +181,7 @@ func TestConsole_ClampsToHeight(t *testing.T) {
 	if strings.Count(got, "\n") != 4 { // 5 lines => 4 newlines between them
 		t.Errorf("block should be clamped to 5 rows, got:\n%q", got)
 	}
-	if !strings.Contains(got, "… 4 more") {
+	if !strings.Contains(got, "… 5 more") {
 		t.Errorf("elision marker should report the dropped groups, got:\n%q", got)
 	}
 	if !strings.Contains(got, "Summary") || !strings.Contains(got, "Apps  0/6") {
@@ -202,7 +203,7 @@ func TestConsole_ConcurrentChurnIsRaceFree(t *testing.T) {
 			it := item("build x")
 			c.addItem(&buf, cols80, bigRows, it)
 			for j := 0; j < 50; j++ {
-				c.line(&buf, "LINE\n")
+				c.line(SectionLog, &buf, "LINE\n")
 			}
 			c.finishItem(it, "✓ build x\n")
 		}()

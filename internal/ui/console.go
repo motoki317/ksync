@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,6 +38,24 @@ const cursorUp = "\x1b[1A"
 // absorbs both so a line can never wrap.
 const liveMargin = 2
 
+// Section labels the kind of output a committed write belongs to, so the console
+// can keep distinct sections (a Plan, the streamed pipelines, the run Summary, a
+// log line) set apart by exactly one blank line without any caller hand-rolling
+// the spacing. The console inserts a separating blank whenever consecutive writes
+// carry different kinds — the one place that owns inter-section spacing, so it is
+// consistent and a new kind of output is separated automatically. The zero value
+// (sectionNone) means nothing has been written yet, so the top of output has no
+// leading blank.
+type Section int
+
+const (
+	sectionNone Section = iota
+	SectionLog
+	SectionPlan
+	SectionSummary
+	SectionPipeline
+)
+
 // blockItem is one unit of the live block: it renders to one or more complete
 // lines for the given spinner frame (not width-limited — the console clamps each
 // line when painting). A pipeline (a per-app progress group) is the only
@@ -55,8 +74,26 @@ type console struct {
 	footer func() []string // optional pinned block (the live run summary), rendered below the items
 	shown  int             // how many block lines are currently on screen
 	frame  int             // spinner frame index, advanced by the ticker
+
+	lastKind  Section // section of the last committed write, for inter-section spacing
+	lastBlank bool    // the last committed write ended in a blank line (no separator due)
+
 	ticker *time.Ticker
 	stop   chan struct{}
+}
+
+// needSep reports whether a separating blank line is due before a section of the
+// given kind: only when something of a different kind was already written and the
+// previous write did not itself end in a blank line — so separators never double
+// up and the very top of output carries none. Caller holds mu.
+func (c *console) needSep(kind Section) bool {
+	return c.lastKind != sectionNone && c.lastKind != kind && !c.lastBlank
+}
+
+// endsWithBlankLine reports whether s (a complete write, trailing newline included)
+// leaves the cursor on a blank line — i.e. its last rendered line is empty.
+func endsWithBlankLine(s string) bool {
+	return s == "\n" || strings.HasSuffix(s, "\n\n")
 }
 
 // attach binds the output stream and its size sources the first time the block
@@ -107,10 +144,26 @@ func (c *console) addItem(w io.Writer, cols, rows func() int, it blockItem) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attach(w, cols, rows)
+	if c.blockEmpty() {
+		c.beginBlock()
+	}
 	c.eraseBlock()
 	c.items = append(c.items, it)
 	c.drawBlock()
 	c.ensureTicker()
+}
+
+// beginBlock separates a freshly starting live block (the first pipeline group or
+// the run-summary footer) from the previous section, treating the whole block as
+// one Pipeline section. Caller holds mu, the block is currently empty, and c.w is
+// bound (attach ran). It emits only the permanent leading blank; drawBlock paints
+// the transient lines just after. Marking the section here means the block's own
+// commits (item done-lines) do not separate from one another.
+func (c *console) beginBlock() {
+	if c.needSep(SectionPipeline) {
+		_, _ = io.WriteString(c.w, "\n")
+	}
+	c.lastKind, c.lastBlank = SectionPipeline, true
 }
 
 // finishItem removes a live group, printing its committed summary above whatever
@@ -120,7 +173,11 @@ func (c *console) finishItem(it blockItem, doneLine string) {
 	defer c.mu.Unlock()
 	c.eraseBlock()
 	if doneLine != "" {
+		if c.needSep(SectionPipeline) {
+			_, _ = io.WriteString(c.w, "\n")
+		}
 		_, _ = io.WriteString(c.w, doneLine)
+		c.lastKind, c.lastBlank = SectionPipeline, endsWithBlankLine(doneLine)
 	}
 	for i, x := range c.items {
 		if x == it {
@@ -156,6 +213,9 @@ func (c *console) setFooter(w io.Writer, cols, rows func() int, render func() []
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attach(w, cols, rows)
+	if c.blockEmpty() {
+		c.beginBlock()
+	}
 	c.eraseBlock()
 	c.footer = render
 	c.drawBlock()
@@ -176,18 +236,31 @@ func (c *console) clearFooter() {
 	}
 }
 
-// line writes one complete status line (s includes its trailing newline) above
-// the live block: erase the block, write the line, repaint the block. With no
-// block active it is a plain write — so piped/redirected output stays clean.
-func (c *console) line(w io.Writer, s string) {
+// line writes one complete status line (s includes its trailing newline) of the
+// given section to permanent scrollback, above any live block.
+func (c *console) line(kind Section, w io.Writer, s string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.blockEmpty() {
-		_, _ = io.WriteString(w, s)
-		return
+	c.commit(kind, w, s)
+}
+
+// commit writes s above the live block — erase the block, separate from the prior
+// section if the kind changed, write the line, repaint the block — recording the
+// section so the next write knows whether a blank is due. With no block active it
+// is the same logic over a no-op erase/repaint, so piped/redirected output stays
+// clean (just the optional separating blank between differing sections). Caller
+// holds mu. w is the target only before any block has bound c.w (pure-log runs).
+func (c *console) commit(kind Section, w io.Writer, s string) {
+	target := c.w
+	if target == nil {
+		target = w
 	}
 	c.eraseBlock()
-	_, _ = io.WriteString(c.w, s)
+	if c.needSep(kind) {
+		_, _ = io.WriteString(target, "\n")
+	}
+	_, _ = io.WriteString(target, s)
+	c.lastKind, c.lastBlank = kind, endsWithBlankLine(s)
 	c.drawBlock()
 }
 
@@ -215,7 +288,12 @@ func (c *console) drawBlock() {
 	}
 	var footerLines []string
 	if c.footer != nil {
-		footerLines = c.footer()
+		// A blank row sets the pinned footer (the run summary) apart from the live
+		// item lines above it; with no items the block-start blank already does.
+		if len(itemLines) > 0 {
+			footerLines = append(footerLines, "")
+		}
+		footerLines = append(footerLines, c.footer()...)
 	}
 	lines := clampRows(itemLines, footerLines, c.rowBudget())
 	budget := c.budget()
@@ -289,8 +367,9 @@ func (c *console) animate(tk *time.Ticker, stop chan struct{}) {
 	}
 }
 
-// WriteLine writes one complete line to w (newline included), coordinated with
-// any in-flight progress so status lines print cleanly above the live block.
+// WriteLine writes one complete line to w (newline included) as a section of the
+// given kind, coordinated with any in-flight progress so status lines print
+// cleanly above the live block and consecutive sections stay one blank line apart.
 // The command layer uses it for the plan and run-summary lines it prints while
 // pipelines may be animating.
-func WriteLine(w io.Writer, s string) { liveTerm.line(w, s) }
+func WriteLine(kind Section, w io.Writer, s string) { liveTerm.line(kind, w, s) }

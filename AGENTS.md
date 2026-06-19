@@ -88,12 +88,19 @@ re-litigate only with new evidence):
   `🚢 Deploy <app>  N applied  <time>` line (the "Deploy" word matches the in-tree deploy row; the
   committed deploy time is the deploy stage's own, via `ui.CommitInfo`). `ui.DeployLine`'s `kind`
   arg carries that word — sync passes "Deploy", `ksync destroy` passes "" (it is not a deploy). Off
-  a terminal the block is inert (plain per-stage and per-app lines). Also the **watch confirmation
-  picker** (`prompt.go`): a two-step interactive gate (single-select Build all / Select which to
-  build / Skip, then an arrow-key + spacebar multi-select), a pure `buildPrompt` model (unit-tested
-  via key events) behind a thin raw-mode driver (`ConfirmBuilds`) that runs only while the loop is
-  idle. See ADRs 20260615-grouped-pipeline-progress, 20260616-committed-stage-timings,
-  20260616-manual-build-gate, and 20260618-group-total-and-deploy-line.
+  a terminal the block is inert (plain per-stage and per-app lines). The console also owns
+  **inter-section spacing**: every committed write is tagged with a `ui.Section` (Log/Plan/Summary/
+  Pipeline) and the console emits exactly one blank line at each kind change — so a new kind of output
+  is separated automatically and producers carry no hand-rolled blanks (ADR
+  20260619-section-output-spacing). Also the **watch confirmation
+  picker** (`prompt.go`): a single-view interactive gate — a **Rebuild all** master checkbox
+  (cursor default, selected) over one spacebar-toggle row per change; Enter on the default rebuilds
+  all (one keystroke), toggling an item narrows to just that subset (the master turns off; items
+  render dim/implied while it is on), and an empty selection skips (no Skip row — clear the master,
+  then Enter). A pure `buildPrompt` model (unit-tested via key events) sits behind a thin raw-mode
+  driver (`ConfirmBuilds`) that runs only while the loop is idle. See ADRs
+  20260615-grouped-pipeline-progress, 20260616-committed-stage-timings, 20260616-manual-build-gate,
+  20260618-group-total-and-deploy-line, and 20260619-single-view-build-picker.
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.

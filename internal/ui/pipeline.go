@@ -126,13 +126,13 @@ func (s *Stage) Done(err error) {
 	// On failure, surface the full captured output above the block in both modes
 	// so the developer (or a CI log) sees what broke, not just the ✗.
 	if err != nil && out != "" {
-		liveTerm.line(s.pipe.w, fmt.Sprintf("%s\n%s\n", s.pipe.c.Dim("─── "+s.heading()+" output ───"), out))
+		liveTerm.line(SectionPipeline, s.pipe.w, fmt.Sprintf("%s\n%s\n", s.pipe.c.Dim("─── "+s.heading()+" output ───"), out))
 	}
 	if !s.pipe.tty {
 		// The deploy is silent on a pipe (its committed summary already reports the
 		// app); build/import lines are not — they are the only record of that work.
 		if !s.silent {
-			liveTerm.line(s.pipe.w, s.plainResult(err, elapsed))
+			liveTerm.line(SectionPipeline, s.pipe.w, s.plainResult(err, elapsed))
 		}
 		return
 	}
@@ -256,7 +256,7 @@ func (p *Pipeline) Finish(info CommitInfo) {
 		liveTerm.finishItem(p, block)
 		return
 	}
-	liveTerm.line(p.w, block)
+	liveTerm.line(SectionPipeline, p.w, block)
 }
 
 // Discard removes the live group without committing a summary — used when a run

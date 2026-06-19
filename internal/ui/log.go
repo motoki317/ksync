@@ -130,7 +130,7 @@ func (s *Sink) write(symbol, msg string, kv []any, isError bool) {
 	// Through liveTerm so a status line erases any in-flight build spinner before
 	// printing, and so all sinks (and the command-layer summaries) serialize on
 	// one lock — keeping every record line-atomic without a per-sink mutex.
-	liveTerm.line(s.w, b.String())
+	liveTerm.line(SectionLog, s.w, b.String())
 }
 
 // formatPairs renders the merged WithName/WithValues context and the call's
