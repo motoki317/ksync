@@ -592,7 +592,7 @@ func runWatch(args []string) error {
 	}
 
 	// A cancelable context derived from the signal context, so the confirmation
-	// picker can quit the run on Ctrl-C/q (in raw mode the terminal delivers no
+	// picker can quit the run on Ctrl-C (in raw mode the terminal delivers no
 	// SIGINT, so the picker calls cancel itself).
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -686,7 +686,7 @@ func interactiveTerminal() bool {
 // buildGate drives the interactive confirmation picker for the watch loop. Its
 // Ask launches one picker goroutine — the loop guarantees no overlap by issuing
 // exactly one prompt at a time — which reads the user's choice via
-// ui.ConfirmBuilds and reports it on Decisions; a quit (Ctrl-C / q) cancels the
+// ui.ConfirmBuilds and reports it on Decisions; a quit (Ctrl-C) cancels the
 // run instead (in raw mode the terminal sends no SIGINT).
 type buildGate struct {
 	ctx       context.Context

@@ -32,32 +32,28 @@ const (
 	keySpace
 	keyEnter
 	keyAll  // toggle every checkbox (the 'a' key)
-	keyQuit // q / Ctrl-C: abort the whole watch
+	keyQuit // Ctrl-C / Ctrl-D: abort the whole watch
 )
 
-// The top single-select menu, shown first. The cursor defaults to Build all, so
-// a developer who just wants everything rebuilt confirms with one Enter.
-const (
-	topBuildAll = iota
-	topSelect
-	topSkip
-)
-
-var topMenu = []string{"Build all", "Select which to build", "Skip"}
-
-// buildPrompt is the pure state machine behind the two-step confirmation picker:
-// a top menu (Build all · Select which to build · Skip), then — only if Select —
-// an arrow-key, space-to-toggle multi-select over the changed items. It holds no
-// terminal state; handle() advances it from a keyEvent and render() returns the
-// lines to paint, so the decision logic is tested without a real terminal.
+// buildPrompt is the pure state machine behind the single-view confirmation
+// picker: one "Rebuild all" master checkbox above one row per changed item. The
+// cursor defaults to the master with all on, so a developer who wants everything
+// rebuilt confirms with one Enter; toggling an item narrows the selection to just
+// the picked subset. It holds no terminal state — handle() advances it from a
+// keyEvent and render() returns the lines to paint — so the decision logic is
+// tested without a real terminal.
+//
+// Selection is a mode, not a tri-state: `all` true means every item (rendered
+// implied), and toggling an item flips to an explicit `checked` set. This is what
+// lets Space on an item while "Rebuild all" is on mean "only this one" rather than
+// "all but this one" — the developer who wants a single image picks it directly.
 type buildPrompt struct {
 	c     Colors
 	items []PromptItem
 
-	step      int // 0 = top menu, 1 = multi-select
-	topCursor int
-	cursor    int
-	checked   []bool
+	cursor  int    // 0 = the Rebuild-all master, 1..len(items) = item rows
+	all     bool   // every item selected via the master (checked is then ignored)
+	checked []bool // the explicit per-item set, meaningful only when all is false
 
 	done  bool
 	build bool // act on selected() (false = skip, build nothing)
@@ -65,74 +61,64 @@ type buildPrompt struct {
 }
 
 func newBuildPrompt(c Colors, items []PromptItem) *buildPrompt {
-	return &buildPrompt{c: c, items: items, checked: make([]bool, len(items))}
+	return &buildPrompt{c: c, items: items, all: true, checked: make([]bool, len(items))}
 }
 
-// handle advances the model by one keystroke.
+// handle advances the model by one keystroke. The cursor ranges over row 0 (the
+// Rebuild-all master) through len(items); Space toggles the row under the cursor
+// and Enter confirms the current selection — building all, the chosen subset, or
+// (nothing selected) nothing at all.
 func (m *buildPrompt) handle(k keyEvent) {
-	if k == keyQuit {
+	switch k {
+	case keyQuit:
 		m.quit, m.done = true, true
-		return
-	}
-	if m.step == 0 {
-		m.handleMenu(k)
-		return
-	}
-	m.handleSelect(k)
-}
-
-func (m *buildPrompt) handleMenu(k keyEvent) {
-	switch k {
-	case keyUp:
-		if m.topCursor > 0 {
-			m.topCursor--
-		}
-	case keyDown:
-		if m.topCursor < len(topMenu)-1 {
-			m.topCursor++
-		}
-	case keyEnter:
-		switch m.topCursor {
-		case topBuildAll:
-			for i := range m.checked {
-				m.checked[i] = true
-			}
-			m.build, m.done = true, true
-		case topSelect:
-			m.step = 1 // start with nothing checked: the developer picks the subset
-		case topSkip:
-			m.done = true
-		}
-	}
-}
-
-func (m *buildPrompt) handleSelect(k keyEvent) {
-	switch k {
 	case keyUp:
 		if m.cursor > 0 {
 			m.cursor--
 		}
 	case keyDown:
-		if m.cursor < len(m.items)-1 {
+		if m.cursor < len(m.items) {
 			m.cursor++
 		}
 	case keySpace:
-		if len(m.checked) > 0 {
-			m.checked[m.cursor] = !m.checked[m.cursor]
-		}
+		m.toggle(m.cursor)
 	case keyAll:
-		all := true
-		for _, ck := range m.checked {
-			all = all && ck
-		}
-		for i := range m.checked {
-			m.checked[i] = !all // all checked → clear; otherwise check every one
-		}
+		m.setAll(!m.all) // a convenience equal to Space on the master row
 	case keyEnter:
-		// Confirming with nothing checked means "build nothing" — the same outcome
-		// as Skip, so an empty selection never starts a no-op build.
-		m.build = m.anyChecked()
+		// Confirming with nothing selected means "build nothing" — the skip path now
+		// that the menu's Skip row is gone, reached by clearing the master (or every
+		// item) before Enter. An empty selection never starts a no-op build.
+		m.build = m.all || m.anyChecked()
 		m.done = true
+	}
+}
+
+// toggle flips the checkbox at the cursor row. Toggling the master (row 0) switches
+// between all-selected and the empty, skip-ready set. Toggling an item while the
+// master is on narrows the selection to just that item, so picking one image never
+// requires first clearing the rest.
+func (m *buildPrompt) toggle(row int) {
+	if row == 0 {
+		m.setAll(!m.all)
+		return
+	}
+	i := row - 1
+	if m.all {
+		m.setAll(false)
+		m.checked[i] = true
+		return
+	}
+	m.checked[i] = !m.checked[i]
+}
+
+// setAll switches the master on or off; turning it off clears the explicit set so
+// the off state is unambiguously empty (the skip-ready state).
+func (m *buildPrompt) setAll(on bool) {
+	m.all = on
+	if !on {
+		for i := range m.checked {
+			m.checked[i] = false
+		}
 	}
 }
 
@@ -145,12 +131,12 @@ func (m *buildPrompt) anyChecked() bool {
 	return false
 }
 
-// selected returns the indices of the checked items (every item for Build all,
-// which checks them all). Empty when the user skipped.
+// selected returns the indices to build: every item when the master is on,
+// otherwise the explicitly checked ones. Empty when the user skipped.
 func (m *buildPrompt) selected() []int {
 	var out []int
-	for i, ck := range m.checked {
-		if ck {
+	for i := range m.items {
+		if m.all || m.checked[i] {
 			out = append(out, i)
 		}
 	}
@@ -158,15 +144,10 @@ func (m *buildPrompt) selected() []int {
 }
 
 // render returns the picker's current lines (no trailing newlines); the driver
-// clamps and paints them.
+// clamps and paints them. The single view is the Rebuild-all master over one row
+// per item — items shown dim/implied while the master is on, carrying their own
+// checkbox once an individual pick turns the master off.
 func (m *buildPrompt) render() []string {
-	if m.step == 0 {
-		return m.renderMenu()
-	}
-	return m.renderSelect()
-}
-
-func (m *buildPrompt) renderMenu() []string {
 	plural := "s"
 	if len(m.items) == 1 {
 		plural = ""
@@ -175,22 +156,7 @@ func (m *buildPrompt) renderMenu() []string {
 		"",
 		m.c.Bold(fmt.Sprintf("%d change%s pending", len(m.items), plural)) + m.c.Dim(" — rebuild & deploy?"),
 		"",
-	}
-	for i, opt := range topMenu {
-		if i == m.topCursor {
-			lines = append(lines, m.c.Cyan("❯ ")+m.c.Bold(opt))
-		} else {
-			lines = append(lines, "  "+opt)
-		}
-	}
-	return append(lines, "", m.c.Dim("↑/↓ move · Enter confirm · q quit"))
-}
-
-func (m *buildPrompt) renderSelect() []string {
-	lines := []string{
-		"",
-		m.c.Bold("Select images to rebuild & deploy") + "  " + m.c.Dim("Space toggle · a all · Enter confirm"),
-		"",
+		m.prefix(0) + m.box(m.all, false) + " " + m.c.Bold("Rebuild all"),
 	}
 	labelW := 0
 	for _, it := range m.items {
@@ -199,29 +165,51 @@ func (m *buildPrompt) renderSelect() []string {
 		}
 	}
 	for i, it := range m.items {
-		box := m.c.Dim("◯")
-		if m.checked[i] {
-			box = m.c.Green("◉")
-		}
-		prefix := "  "
-		if i == m.cursor {
-			prefix = m.c.Cyan("❯ ")
-		}
+		box := m.box(m.all || m.checked[i], m.all) // dim/implied while the master is on
 		label := it.Label + strings.Repeat(" ", labelW-displayWidth(it.Label))
-		row := fmt.Sprintf("%s%s %s %s  %s", prefix, box, it.Icon, label, m.c.Dim(it.Note))
+		body := fmt.Sprintf("%s %s  %s", it.Icon, label, it.Note)
+		if m.all {
+			body = m.c.Dim(body) // the master owns these rows; render them passive
+		} else {
+			body = fmt.Sprintf("%s %s  %s", it.Icon, label, m.c.Dim(it.Note))
+		}
+		row := m.prefix(i+1) + "  " + box + " " + body
 		lines = append(lines, strings.TrimRight(row, " "))
 	}
-	return append(lines, "", m.c.Dim("↑/↓ move · q quit"))
+	return append(lines, "", m.c.Dim("↑/↓ move · Space toggle · Enter confirm"))
 }
 
-// ConfirmBuilds runs the two-step interactive gate on the terminal (reading raw
-// keystrokes from in, painting to out): a Build all / Select / Skip menu with the
-// cursor on Build all, then — only if Select — an arrow-key, space-to-toggle
-// multi-select over items. It returns the chosen item indices, whether to build
-// anything (false = skip), and whether the user asked to quit ksync (Ctrl-C / q).
-// ctx cancellation (e.g. SIGTERM) aborts as a quit. The block is erased before
-// returning, so it leaves no trace behind the build output or the next prompt.
-// The caller guarantees in is a terminal and items is non-empty.
+// prefix is the cursor marker for a row, indenting non-cursor rows to align.
+func (m *buildPrompt) prefix(row int) string {
+	if row == m.cursor {
+		return m.c.Cyan("❯ ")
+	}
+	return "  "
+}
+
+// box renders a checkbox: a filled circle when selected (dim when only implied by
+// the master, green when explicitly chosen), a dim hollow circle when not.
+func (m *buildPrompt) box(filled, implied bool) string {
+	if !filled {
+		return m.c.Dim("◯")
+	}
+	if implied {
+		return m.c.Dim("◉")
+	}
+	return m.c.Green("◉")
+}
+
+// ConfirmBuilds runs the single-view interactive gate on the terminal (reading raw
+// keystrokes from in, painting to out): a Rebuild-all master checkbox (cursor
+// default, on) over one space-to-toggle row per item, where toggling an item
+// narrows to that subset. It returns the chosen item indices, whether to build
+// anything (false = skip, reached by clearing the selection), and whether the user
+// asked to quit ksync (Ctrl-C). ctx cancellation (e.g. SIGTERM) aborts as a quit
+// where the terminal supports read deadlines; where it does not (a macOS tty), the
+// blocked read wakes on the next keystroke instead, so an idle prompt honors SIGTERM
+// only once a key is pressed — Ctrl-C is itself a keystroke (raw mode delivers no
+// SIGINT) and always works. The block is erased before returning, so it leaves no trace behind
+// the build output or the next prompt. in is guaranteed a terminal, items non-empty.
 func ConfirmBuilds(ctx context.Context, in *os.File, out io.Writer, c Colors, items []PromptItem) (selected []int, build, quit bool) {
 	m := newBuildPrompt(c, items)
 	fd := int(in.Fd())
@@ -236,7 +224,7 @@ func ConfirmBuilds(ctx context.Context, in *os.File, out io.Writer, c Colors, it
 	// Discard anything typed before the prompt opened — a stray Enter or arrow the
 	// developer hit while the loop sat idle in cooked mode is queued on stdin, and
 	// the first raw read would otherwise consume it and (an Enter on the default
-	// Build-all cursor) confirm the prompt before it is even seen.
+	// Rebuild-all selection) confirm the prompt before it is even seen.
 	flushInput(in)
 
 	budget := cols(fd) - liveMargin
@@ -303,26 +291,37 @@ func erasePrev(n int) string {
 	return b.String()
 }
 
-// flushDrain bounds how long flushInput waits to confirm the input queue is
-// empty. Already-buffered bytes are returned immediately (the deadline only
-// trips when a read would block), so this is a one-time cost paid once at
-// prompt-open with no buffered input — imperceptible to the developer.
+// flushDrain bounds how long the deadline-based branch of flushInput waits to
+// confirm the input queue is empty. Already-buffered bytes are returned
+// immediately (the deadline only trips when a read would block), so this is a
+// one-time cost paid once at prompt-open with no buffered input — imperceptible.
 const flushDrain = 20 * time.Millisecond
 
-// flushInput drains and discards input already queued on in before the picker
-// took the terminal. It reads under a short future deadline (not a past one,
-// which can race the deadline timer and skip buffered bytes) until a read would
-// block, throwing away whatever it finds. Real terminals support read deadlines;
-// if in does not, the first read simply blocks until a keypress — no worse than
-// the read loop that follows, which depends on the same mechanism.
+// flushInput drains and discards input already queued on in before the picker took
+// the terminal, so a stray Enter or arrow typed while the loop sat idle in cooked
+// mode cannot confirm the default the instant the prompt opens.
+//
+// os.File read deadlines are not universal: a real terminal — notably every macOS
+// tty — reports "file type does not support deadline" from SetReadDeadline. With no
+// deadline, in.Read blocks until a keypress, so a drain loop that relies on it hangs
+// forever and swallows every keystroke, Ctrl-C included (the freeze this fixes). So
+// probe the deadline first; when it is unsupported, fall back to a non-blocking
+// syscall drain that returns immediately on an empty queue. (The main read loop
+// below still uses the deadline only as a best-effort wakeup; without it a blocked
+// read wakes on the next keypress, which is harmless for an idle prompt.)
 func flushInput(in *os.File) {
+	if err := in.SetReadDeadline(time.Now().Add(flushDrain)); err != nil {
+		drainTTY(in)
+		return
+	}
 	buf := make([]byte, 256)
 	for {
-		_ = in.SetReadDeadline(time.Now().Add(flushDrain))
 		n, err := in.Read(buf)
 		if err != nil || n == 0 {
+			_ = in.SetReadDeadline(time.Time{}) // clear the drain deadline
 			return
 		}
+		_ = in.SetReadDeadline(time.Now().Add(flushDrain))
 	}
 }
 
@@ -336,7 +335,8 @@ func allIndices(n int) []int {
 
 // decodeKeys turns a slice of raw terminal bytes into key events, recognizing the
 // arrow escape sequences (ESC [ A/B), Enter, Space, 'a', vim j/k, and the quit
-// keys (q, Ctrl-C, Ctrl-D). Unknown bytes are ignored.
+// keys (Ctrl-C, Ctrl-D). Unknown bytes are ignored. 'q' is intentionally not a
+// quit key — it is a plausible future filter keystroke, and Ctrl-C already aborts.
 func decodeKeys(b []byte) []keyEvent {
 	var keys []keyEvent
 	for i := 0; i < len(b); i++ {
@@ -361,7 +361,7 @@ func decodeKeys(b []byte) []keyEvent {
 			keys = append(keys, keyUp)
 		case 'j':
 			keys = append(keys, keyDown)
-		case 'q', 'Q', 0x03, 0x04: // q, Ctrl-C, Ctrl-D
+		case 0x03, 0x04: // Ctrl-C, Ctrl-D
 			keys = append(keys, keyQuit)
 		}
 	}

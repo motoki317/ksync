@@ -25,7 +25,8 @@ func feed(m *buildPrompt, keys ...keyEvent) {
 	}
 }
 
-// The top menu starts on Build all, so a single Enter selects every change.
+// The cursor starts on the Rebuild-all master with all selected, so a single Enter
+// selects every change.
 func TestBuildPrompt_BuildAllIsTheDefault(t *testing.T) {
 	m := newBuildPrompt(Colors{}, items3())
 	feed(m, keyEnter)
@@ -37,10 +38,11 @@ func TestBuildPrompt_BuildAllIsTheDefault(t *testing.T) {
 	}
 }
 
-// Skip (third menu row) finishes without building anything.
+// Clearing the master (Space on the default row) leaves nothing selected, so the
+// next Enter skips — the two-key skip that replaces the removed Skip menu row.
 func TestBuildPrompt_SkipBuildsNothing(t *testing.T) {
 	m := newBuildPrompt(Colors{}, items3())
-	feed(m, keyDown, keyDown, keyEnter) // Build all → Select → Skip
+	feed(m, keySpace, keyEnter) // Space on Rebuild all (→ off), then confirm
 	if !m.done || m.build {
 		t.Fatalf("Skip should finish without building, got done=%v build=%v", m.done, m.build)
 	}
@@ -49,43 +51,42 @@ func TestBuildPrompt_SkipBuildsNothing(t *testing.T) {
 	}
 }
 
-// "Select which to build" opens the multi-select with nothing checked; Space
-// toggles individual rows and Enter confirms exactly that subset.
+// Toggling an item while the master is on narrows the selection to just that item;
+// further Space toggles are additive, and Enter confirms exactly that subset.
 func TestBuildPrompt_SelectSubset(t *testing.T) {
 	m := newBuildPrompt(Colors{}, items3())
-	// Build all → Select, enter multi-select.
-	feed(m, keyDown, keyEnter)
-	if m.step != 1 {
-		t.Fatalf("Select should enter the multi-select step, got step=%d", m.step)
-	}
-	// Check item 0 (cursor starts there), move to item 2 and check it; leave 1 off.
-	feed(m, keySpace, keyDown, keyDown, keySpace, keyEnter)
+	// Down to item 0 and pick it (turns the master off, leaving only item 0), then
+	// down to item 2 and add it; leave item 1 off.
+	feed(m, keyDown, keySpace, keyDown, keyDown, keySpace, keyEnter)
 	if !m.done || !m.build {
 		t.Fatalf("a non-empty subset should build, got done=%v build=%v", m.done, m.build)
+	}
+	if m.all {
+		t.Errorf("picking an item should turn the master off")
 	}
 	if got := m.selected(); !slices.Equal(got, []int{0, 2}) {
 		t.Errorf("selected = %v, want [0 2] (the two toggled rows)", got)
 	}
 }
 
-// In the multi-select, 'a' checks all when any is unchecked and clears all when
-// every row is already checked.
+// 'a' toggles the master like Space on its row: from the default (all on) it clears
+// to nothing, and again restores all.
 func TestBuildPrompt_ToggleAll(t *testing.T) {
 	m := newBuildPrompt(Colors{}, items3())
-	feed(m, keyDown, keyEnter, keyAll) // into multi-select, then select all
-	if got := m.selected(); !slices.Equal(got, []int{0, 1, 2}) {
-		t.Fatalf("'a' should check all, got %v", got)
-	}
-	feed(m, keyAll) // toggle again clears all
+	feed(m, keyAll) // all on → off
 	if got := m.selected(); len(got) != 0 {
-		t.Errorf("'a' on an all-checked list should clear it, got %v", got)
+		t.Fatalf("'a' on the default (all on) should clear it, got %v", got)
+	}
+	feed(m, keyAll) // off → all
+	if got := m.selected(); !slices.Equal(got, []int{0, 1, 2}) {
+		t.Errorf("'a' should restore all, got %v", got)
 	}
 }
 
-// Confirming the multi-select with nothing checked is the same as Skip.
+// Toggling an item on and back off leaves an empty explicit set, so Enter skips.
 func TestBuildPrompt_EmptySelectionIsSkip(t *testing.T) {
 	m := newBuildPrompt(Colors{}, items3())
-	feed(m, keyDown, keyEnter, keyEnter) // Select, then confirm with none checked
+	feed(m, keyDown, keySpace, keySpace, keyEnter) // pick item 0, unpick it, confirm
 	if !m.done || m.build {
 		t.Errorf("an empty selection must not build, got done=%v build=%v", m.done, m.build)
 	}
@@ -100,29 +101,26 @@ func TestBuildPrompt_Quit(t *testing.T) {
 	}
 }
 
-// The menu marks the cursor row and lists every option; the multi-select shows
-// each item's icon, label, and note.
+// The single view points the cursor at the Rebuild-all master and lists every
+// item's icon, label, and note below it; turning the master off shows a hollow box
+// for an unpicked row and a filled one for the picked row.
 func TestBuildPrompt_Render(t *testing.T) {
 	m := newBuildPrompt(Colors{}, items3())
-	menu := strings.Join(m.render(), "\n")
-	if !strings.Contains(menu, "❯ Build all") {
-		t.Errorf("menu should point the cursor at Build all, got:\n%s", menu)
+	view := strings.Join(m.render(), "\n")
+	if !strings.Contains(view, "❯ ◉ Rebuild all") {
+		t.Errorf("view should point the cursor at the Rebuild-all master, got:\n%s", view)
 	}
-	for _, want := range []string{"Select which to build", "Skip", "3 changes pending"} {
-		if !strings.Contains(menu, want) {
-			t.Errorf("menu missing %q, got:\n%s", want, menu)
+	for _, want := range []string{"3 changes pending", IconBuild, "web", "worker", IconDeploy, "shop", "manifests only"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view missing %q, got:\n%s", want, view)
 		}
 	}
-	feed(m, keyDown, keyEnter) // into multi-select
-	sel := strings.Join(m.render(), "\n")
-	for _, want := range []string{IconBuild, "web", "worker", IconDeploy, "shop", "manifests only", "◯"} {
-		if !strings.Contains(sel, want) {
-			t.Errorf("multi-select missing %q, got:\n%s", want, sel)
+	feed(m, keyDown, keySpace) // pick item 0: master off, item 0 filled, others hollow
+	picked := strings.Join(m.render(), "\n")
+	for _, want := range []string{"◯", "◉"} {
+		if !strings.Contains(picked, want) {
+			t.Errorf("explicit selection missing %q, got:\n%s", want, picked)
 		}
-	}
-	feed(m, keySpace) // check the cursor row
-	if checked := strings.Join(m.render(), "\n"); !strings.Contains(checked, "◉") {
-		t.Errorf("a checked row should show ◉, got:\n%s", checked)
 	}
 }
 
@@ -203,7 +201,7 @@ func TestDecodeKeys(t *testing.T) {
 		{"toggle all", []byte{'a'}, []keyEvent{keyAll}},
 		{"vim down/up", []byte{'j', 'k'}, []keyEvent{keyDown, keyUp}},
 		{"ctrl-c", []byte{0x03}, []keyEvent{keyQuit}},
-		{"q", []byte{'q'}, []keyEvent{keyQuit}},
+		{"q is not quit", []byte{'q'}, nil},
 		{"two arrows in one read", []byte{0x1b, '[', 'B', 0x1b, '[', 'B'}, []keyEvent{keyDown, keyDown}},
 		{"ignored bytes", []byte{'z', '5'}, nil},
 	}
