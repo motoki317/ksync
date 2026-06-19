@@ -58,9 +58,13 @@ type PendingItem struct {
 }
 
 // Decision is the user's answer to one gate prompt: the items to build and deploy
-// now. An empty Selected means skip — build nothing and keep watching.
+// now. An empty Selected means skip — build nothing and keep watching. Reask is
+// the picker reporting it was aborted (the loop asked it to, because more changes
+// arrived while it was open): no decision was made, and the loop re-asks with the
+// now-larger pending set. Reask and Selected are mutually exclusive.
 type Decision struct {
 	Selected []PendingItem
+	Reask    bool
 }
 
 // Gate makes the watch loop ask before acting on incremental changes instead of
@@ -70,8 +74,16 @@ type Decision struct {
 // async picker, and exactly one prompt is outstanding at a time (the loop calls
 // Ask again only after a Decision). A nil Gate keeps the classic auto-rebuild
 // behavior, which is also the fallback when stdin is not an interactive terminal.
+//
+// Abort tells the in-flight prompt to stop: the loop calls it when fresh changes
+// land while a prompt is open, so the picker tears down and the loop re-asks with
+// the full set (the user sees every pending app, not just those dirty when the
+// prompt first opened). The aborted picker reports Decision{Reask: true} rather
+// than a selection. Abort is a no-op when no prompt is outstanding; optional (a
+// gate without it simply never refreshes an open prompt).
 type Gate struct {
 	Ask       func([]PendingItem)
+	Abort     func()
 	Decisions <-chan Decision
 }
 
@@ -349,6 +361,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	pendingBuilds := make(map[string]map[int]bool) // app -> dirty build-entry set
 	pendingDeploy := make(map[string]bool)         // app -> manifest-only redeploy pending
 	prompting := false                             // a prompt is outstanding (awaiting a Decision)
+	abortPending := false                          // changes arrived during a prompt; abort & re-ask once the burst settles
 	dismissed := false                             // user skipped; do not re-ask until a new change
 	var promptDeadline time.Time                   // debounce: prompt only after the change burst settles
 
@@ -492,12 +505,22 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		}
 
 		maybePrompt(now)
+		// Changes landed while a prompt was open: once their burst settles, abort the
+		// stale prompt so the loop re-asks (gateDecisions delivers Reask) with the full
+		// pending set — the user sees every app, not just those dirty when it opened.
+		if prompting && abortPending && !now.Before(promptDeadline) {
+			abortPending = false
+			if gate.Abort != nil {
+				gate.Abort()
+			}
+		}
 
 		var timerC <-chan time.Time
 		deadline, ok := earliestDeadline(buildSched, deploySched)
 		// When the gate is armed and idle, also wake at the prompt deadline so the
-		// menu appears once a change burst settles, even with no scheduler work due.
-		if gate != nil && !prompting && !dismissed && !pendingEmpty() && gateIdle() {
+		// menu appears once a change burst settles, even with no scheduler work due —
+		// and likewise when a prompt is open with changes to fold in (the abort above).
+		if gate != nil && !dismissed && !pendingEmpty() && gateIdle() && (!prompting || abortPending) {
 			if !ok || promptDeadline.Before(deadline) {
 				deadline, ok = promptDeadline, true
 			}
@@ -518,6 +541,14 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		case dec := <-gateDecisions:
 			now := time.Now()
 			prompting = false
+			abortPending = false
+			if dec.Reask {
+				// The prompt was aborted to fold in changes that arrived while it was
+				// open: act on nothing, leave the pending set intact, and let maybePrompt
+				// re-ask immediately (the burst already settled to trigger the abort).
+				log.V(1).Info("build prompt re-asked with updated changes")
+				break
+			}
 			if len(dec.Selected) == 0 {
 				// Skip: keep the pending set but stop asking until a new change.
 				dismissed = true
@@ -570,6 +601,11 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				// the debounce so a burst coalesces into one menu.
 				dismissed = false
 				promptDeadline = now.Add(opts.Debounce)
+				// If a prompt is already open, it is now stale — mark it for abort so
+				// the loop re-asks with this change included once the burst settles.
+				if prompting {
+					abortPending = true
+				}
 			}
 		case err := <-watcher.Errors:
 			log.Error(err, "Watch error")

@@ -98,9 +98,14 @@ re-litigate only with new evidence):
   all (one keystroke), toggling an item narrows to just that subset (the master turns off; items
   render dim/implied while it is on), and an empty selection skips (no Skip row — clear the master,
   then Enter). A pure `buildPrompt` model (unit-tested via key events) sits behind a thin raw-mode
-  driver (`ConfirmBuilds`) that runs only while the loop is idle. See ADRs
+  driver (`ConfirmBuilds`) that runs only while the loop is idle. The driver **polls** the terminal
+  non-blocking (`pollReader`; no tty supports a read deadline) so it reacts between keystrokes: an
+  `abort` channel lets the loop **refresh an open prompt** when fresh changes land — it tears down and
+  re-asks with the larger pending set (the picker reports `aborted`, the gate a `Decision{Reask}`) — and
+  ctx/SIGTERM is honored within a poll tick, not only on the next key. See ADRs
   20260615-grouped-pipeline-progress, 20260616-committed-stage-timings, 20260616-manual-build-gate,
-  20260618-group-total-and-deploy-line, and 20260619-single-view-build-picker.
+  20260618-group-total-and-deploy-line, 20260619-single-view-build-picker, and
+  20260619-refresh-open-build-prompt.
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.
@@ -131,7 +136,11 @@ re-litigate only with new evidence):
   **manual gate** (`Options.Gate`): instead of scheduling, they accumulate into a pending set and,
   once idle, the loop asks which images/apps to rebuild via the `internal/ui` picker, acting only on
   the returned `Decision` — startup convergence is ungated; the gate intercepts only `watcher.Events`
-  (ADR 20260616-manual-build-gate). On settling back to idle after doing work — the initial
+  (ADR 20260616-manual-build-gate). A change arriving **while a prompt is open** folds in: the loop
+  flags it, and once the burst settles calls `Gate.Abort` to refresh the prompt — the picker re-asks
+  with the full pending set (`Decision{Reask}`) so the user sees every edited app, not just those
+  dirty when it opened (ADR 20260619-refresh-open-build-prompt). On settling back to idle after doing
+  work — the initial
   convergence and every later rebuild batch — an `Options.OnIdle(took)` hook fires once; the command
   layer (`watchReporter`) turns it into a committed per-batch **Summary** and a `finished, watching
   for changes` log line (a change merely held/skipped by the gate runs no work, so it never fires).

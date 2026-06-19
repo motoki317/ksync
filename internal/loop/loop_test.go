@@ -689,18 +689,44 @@ func TestRun_DependentBuildsWhileDependencyDeploys(t *testing.T) {
 type fakeGate struct {
 	mu      sync.Mutex
 	asks    [][]PendingItem
+	aborts  int
 	decided chan Decision
+	done    chan struct{} // closed on cleanup; releases a blocked abort send
 }
 
-func newFakeGate() *fakeGate { return &fakeGate{decided: make(chan Decision)} }
+func newFakeGate() *fakeGate {
+	return &fakeGate{decided: make(chan Decision), done: make(chan struct{})}
+}
 
-func (g *fakeGate) gate() *Gate { return &Gate{Ask: g.ask, Decisions: g.decided} }
+func (g *fakeGate) gate() *Gate { return &Gate{Ask: g.ask, Abort: g.abort, Decisions: g.decided} }
 
 func (g *fakeGate) ask(items []PendingItem) {
 	g.mu.Lock()
 	g.asks = append(g.asks, items)
 	g.mu.Unlock()
 }
+
+// abort mimics the real gate: an aborted picker reports Reask, asynchronously since
+// the loop calls Abort from its own goroutine and reads decided in its select.
+func (g *fakeGate) abort() {
+	g.mu.Lock()
+	g.aborts++
+	g.mu.Unlock()
+	go func() {
+		select {
+		case g.decided <- Decision{Reask: true}:
+		case <-g.done:
+		}
+	}()
+}
+
+func (g *fakeGate) abortCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.aborts
+}
+
+func (g *fakeGate) close() { close(g.done) }
 
 func (g *fakeGate) askCount() int {
 	g.mu.Lock()
@@ -856,6 +882,75 @@ func TestRun_GateSubsetLeavesRemainderPending(t *testing.T) {
 	if got := builder.builds(); got != 3 {
 		t.Errorf("the unselected image built without being chosen: builds=%d, want 3", got)
 	}
+
+	cancel()
+	<-done
+}
+
+// A change that lands while a prompt is already open must fold into it: the loop
+// aborts the stale prompt and re-asks with the new item included, so the developer
+// sees every pending app rather than only those dirty when the prompt first opened.
+// Regression: the second app's edit was silently held until the first was rebuilt.
+func TestRun_GateFoldsNewChangeIntoOpenPrompt(t *testing.T) {
+	tmp := t.TempDir()
+	appA := buildApp(t, tmp)
+	appA.Build[0].Name = "api-b"
+	// A second, independent build app with its own source dir, so each app is
+	// edited separately (multiBuildApp shares one source, dirtying every image).
+	srcB := filepath.Join(tmp, "srcB")
+	writeFile(t, filepath.Join(srcB, "Dockerfile"), "FROM scratch\n")
+	writeFile(t, filepath.Join(srcB, "main.go"), "package main\n")
+	writeFile(t, filepath.Join(tmp, "app2", "kustomization.yaml"), "resources:\n  - api-c.yaml\n")
+	writeFile(t, filepath.Join(tmp, "app2", "api-c.yaml"), oneDeploymentYAML("api-c"))
+	appB := config.App{
+		Name: "app2",
+		Path: filepath.Join(tmp, "app2"),
+		Build: []config.Build{{
+			Image: "api-c", Name: "api-c", Context: srcB, Dockerfile: filepath.Join(srcB, "Dockerfile"),
+		}},
+	}
+
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	g := newFakeGate()
+	defer g.close()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{appA, appB}, sink.sync, Options{Debounce: 20 * time.Millisecond, MaxParallel: 4, Build: builder.build, Gate: g.gate()})
+	}()
+	// Startup converges both apps.
+	waitFor(t, func() bool { return builder.builds() == 2 && len(sink.synced()) == 2 })
+
+	// Edit app A's source → the gate opens, asking for app1 only.
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // A\n")
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	if items := g.lastAsk(); len(items) != 1 || items[0].App != "app1" {
+		t.Fatalf("first ask = %+v, want one item for app1", items)
+	}
+
+	// While that prompt is open, edit app B's source. The loop must abort the open
+	// prompt and re-ask with BOTH apps folded in.
+	writeFile(t, filepath.Join(srcB, "main.go"), "package main // B\n")
+	waitFor(t, func() bool { return len(g.lastAsk()) == 2 })
+	if g.abortCount() == 0 {
+		t.Errorf("the open prompt should have been aborted to refresh it")
+	}
+	apps := map[string]bool{}
+	for _, it := range g.lastAsk() {
+		apps[it.App] = true
+	}
+	if !apps["app1"] || !apps["app2"] {
+		t.Fatalf("re-ask = %+v, want both app1 and app2", g.lastAsk())
+	}
+	// Nothing built for the held changes yet — still awaiting a decision.
+	if got := builder.builds(); got != 2 {
+		t.Fatalf("a held change built before any decision: builds=%d, want 2", got)
+	}
+
+	// Decide on the full set → both rebuild.
+	g.decided <- Decision{Selected: g.lastAsk()}
+	waitFor(t, func() bool { return builder.builds() == 4 })
 
 	cancel()
 	<-done

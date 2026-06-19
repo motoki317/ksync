@@ -694,11 +694,14 @@ type buildGate struct {
 	w         io.Writer // stderr: where the picker draws and skip notes print
 	out       ui.Colors
 	decisions chan loop.Decision
+
+	mu    sync.Mutex
+	abort chan struct{} // per-prompt; closed by Abort to refresh the open picker
 }
 
 func newBuildGate(ctx context.Context, cancel context.CancelFunc, w io.Writer, out ui.Colors) *loop.Gate {
 	g := &buildGate{ctx: ctx, cancel: cancel, w: w, out: out, decisions: make(chan loop.Decision)}
-	return &loop.Gate{Ask: g.ask, Decisions: g.decisions}
+	return &loop.Gate{Ask: g.ask, Abort: g.abortPrompt, Decisions: g.decisions}
 }
 
 func (g *buildGate) ask(pending []loop.PendingItem) {
@@ -710,10 +713,23 @@ func (g *buildGate) ask(pending []loop.PendingItem) {
 			items[i] = ui.PromptItem{Icon: ui.IconBuild, Label: p.Label, Note: p.App}
 		}
 	}
+	abort := make(chan struct{})
+	g.mu.Lock()
+	g.abort = abort
+	g.mu.Unlock()
 	go func() {
-		selected, build, quit := ui.ConfirmBuilds(g.ctx, os.Stdin, g.w, g.out, items)
+		selected, build, quit, aborted := ui.ConfirmBuilds(g.ctx, abort, os.Stdin, g.w, g.out, items)
 		if quit {
 			g.cancel()
+			return
+		}
+		if aborted {
+			// The loop asked to refresh: report Reask so it re-asks with the now-larger
+			// pending set, acting on nothing here.
+			select {
+			case g.decisions <- loop.Decision{Reask: true}:
+			case <-g.ctx.Done():
+			}
 			return
 		}
 		var chosen []loop.PendingItem
@@ -734,6 +750,19 @@ func (g *buildGate) ask(pending []loop.PendingItem) {
 		case <-g.ctx.Done():
 		}
 	}()
+}
+
+// abortPrompt closes the in-flight prompt's abort channel so ConfirmBuilds returns
+// aborted; the gate then reports Reask. Idempotent per prompt (the channel is
+// cleared once closed), and a no-op when no prompt is open.
+func (g *buildGate) abortPrompt() {
+	g.mu.Lock()
+	ch := g.abort
+	g.abort = nil
+	g.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
 }
 
 // watchReporter renders the watch loop's per-app sync lines and frames each

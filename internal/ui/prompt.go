@@ -199,25 +199,35 @@ func (m *buildPrompt) box(filled, implied bool) string {
 	return m.c.Green("◉")
 }
 
+// pollInterval is how often the picker re-reads the terminal for keystrokes while
+// idle (no key queued), between which it also checks ctx and the abort signal. Far
+// below human reaction time, so navigation feels instant; the loop is otherwise
+// asleep, so the cost is negligible.
+const pollInterval = 25 * time.Millisecond
+
 // ConfirmBuilds runs the single-view interactive gate on the terminal (reading raw
 // keystrokes from in, painting to out): a Rebuild-all master checkbox (cursor
 // default, on) over one space-to-toggle row per item, where toggling an item
 // narrows to that subset. It returns the chosen item indices, whether to build
-// anything (false = skip, reached by clearing the selection), and whether the user
-// asked to quit ksync (Ctrl-C). ctx cancellation (e.g. SIGTERM) aborts as a quit
-// where the terminal supports read deadlines; where it does not (a macOS tty), the
-// blocked read wakes on the next keystroke instead, so an idle prompt honors SIGTERM
-// only once a key is pressed — Ctrl-C is itself a keystroke (raw mode delivers no
-// SIGINT) and always works. The block is erased before returning, so it leaves no trace behind
-// the build output or the next prompt. in is guaranteed a terminal, items non-empty.
-func ConfirmBuilds(ctx context.Context, in *os.File, out io.Writer, c Colors, items []PromptItem) (selected []int, build, quit bool) {
+// anything (false = skip, reached by clearing the selection), whether the user
+// asked to quit ksync (Ctrl-C), and whether the prompt was aborted by the loop
+// (abort closed — fresh changes arrived, so the loop will re-ask with the larger
+// set). The four outcomes are mutually exclusive; an aborted prompt acted on
+// nothing. ctx cancellation (e.g. SIGTERM) and abort are honored within
+// pollInterval on a terminal (the read fd is polled non-blocking, since no tty
+// supports read deadlines); off unix the read blocks, so both are honored only
+// once a key is pressed — Ctrl-C is itself a keystroke (raw mode delivers no
+// SIGINT) and always works. The block is erased before returning, so it leaves no
+// trace behind the build output or the next prompt. in is guaranteed a terminal,
+// items non-empty.
+func ConfirmBuilds(ctx context.Context, abort <-chan struct{}, in *os.File, out io.Writer, c Colors, items []PromptItem) (selected []int, build, quit, aborted bool) {
 	m := newBuildPrompt(c, items)
 	fd := int(in.Fd())
 	old, err := term.MakeRaw(fd)
 	if err != nil {
 		// Cannot take the terminal — fail safe to Build all rather than silently
 		// dropping the changes the developer is waiting on.
-		return allIndices(len(items)), true, false
+		return allIndices(len(items)), true, false, false
 	}
 	defer func() { _ = term.Restore(fd, old) }()
 
@@ -244,19 +254,76 @@ func ConfirmBuilds(ctx context.Context, in *os.File, out io.Writer, c Colors, it
 	}
 
 	paint()
+	if read, restore, perr := pollReader(fd); perr == nil {
+		defer restore() // back to blocking before term.Restore; never leak O_NONBLOCK
+		aborted = pollLoop(ctx, abort, read, m, paint)
+	} else {
+		aborted = blockingLoop(ctx, abort, in, m, paint)
+	}
+	_, _ = io.WriteString(out, erasePrev(shown))
+	switch {
+	case aborted:
+		return nil, false, false, true
+	case m.quit:
+		return nil, false, true, false
+	default:
+		return m.selected(), m.build, false, false
+	}
+}
+
+// pollLoop drives the picker on a terminal: poll the non-blocking fd for keys and,
+// when nothing is queued, wait one tick while watching ctx and abort. Returns true
+// when abort fired (the loop wants to re-ask), leaving m untouched.
+func pollLoop(ctx context.Context, abort <-chan struct{}, read func([]byte) (int, error), m *buildPrompt, paint func()) bool {
 	buf := make([]byte, 32)
 	for !m.done {
-		_ = in.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		n, rerr := in.Read(buf)
+		n, rerr := read(buf)
 		if rerr != nil {
-			if os.IsTimeout(rerr) {
-				if ctx.Err() != nil {
-					m.quit, m.done = true, true
+			m.quit, m.done = true, true // EOF or read error: abort safely
+			break
+		}
+		if n > 0 {
+			for _, k := range decodeKeys(buf[:n]) {
+				m.handle(k)
+				if m.done {
 					break
 				}
-				continue
 			}
+			if !m.done {
+				paint()
+			}
+			continue // drain a key burst before sleeping
+		}
+		select {
+		case <-ctx.Done():
+			m.quit, m.done = true, true
+		case <-abort:
+			return true
+		case <-time.After(pollInterval):
+		}
+	}
+	return false
+}
+
+// blockingLoop drives the picker where non-blocking polling is unavailable (off
+// unix): a plain blocking read, with ctx and abort honored only once a key arrives
+// (the read cannot be interrupted there). Returns true when abort fired.
+func blockingLoop(ctx context.Context, abort <-chan struct{}, in *os.File, m *buildPrompt, paint func()) bool {
+	buf := make([]byte, 32)
+	for !m.done {
+		n, rerr := in.Read(buf)
+		if rerr != nil {
 			m.quit, m.done = true, true // EOF or read error: abort safely
+			break
+		}
+		select {
+		case <-ctx.Done():
+			m.quit, m.done = true, true
+		case <-abort:
+			return true
+		default:
+		}
+		if m.done {
 			break
 		}
 		for _, k := range decodeKeys(buf[:n]) {
@@ -269,11 +336,7 @@ func ConfirmBuilds(ctx context.Context, in *os.File, out io.Writer, c Colors, it
 			paint()
 		}
 	}
-	_, _ = io.WriteString(out, erasePrev(shown))
-	if m.quit {
-		return nil, false, true
-	}
-	return m.selected(), m.build, false
+	return false
 }
 
 // erasePrev returns the control sequence that clears the n lines just painted,

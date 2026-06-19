@@ -149,12 +149,105 @@ func TestConfirmBuilds_NonTerminalFallsBackToBuildAll(t *testing.T) {
 	defer func() { _ = w.Close() }()
 
 	var out bytes.Buffer
-	sel, build, quit := ConfirmBuilds(context.Background(), r, &out, Colors{}, items3())
-	if !build || quit {
-		t.Fatalf("non-terminal should fall back to build-all, got build=%v quit=%v", build, quit)
+	sel, build, quit, aborted := ConfirmBuilds(context.Background(), nil, r, &out, Colors{}, items3())
+	if !build || quit || aborted {
+		t.Fatalf("non-terminal should fall back to build-all, got build=%v quit=%v aborted=%v", build, quit, aborted)
 	}
 	if !slices.Equal(sel, []int{0, 1, 2}) {
 		t.Errorf("fallback should select every item, got %v", sel)
+	}
+}
+
+// noData is a read that never yields a key, so pollLoop reaches its idle select
+// each iteration — the path where ctx and abort are honored on a real terminal.
+func noData([]byte) (int, error) { return 0, nil }
+
+// A closed abort channel makes pollLoop return aborted without any keystroke — the
+// crux of the fix: a prompt left open on a tty refreshes when fresh changes land,
+// which on a tty (no read deadline) can only happen between polls, not on a read.
+func TestPollLoop_AbortReturnsWithoutKeystroke(t *testing.T) {
+	abort := make(chan struct{})
+	close(abort)
+	m := newBuildPrompt(Colors{}, items3())
+	if got := pollLoop(context.Background(), abort, noData, m, func() {}); !got {
+		t.Fatalf("closed abort should return aborted=true")
+	}
+	if m.done {
+		t.Errorf("an aborted prompt must not be marked done/decided")
+	}
+}
+
+// ctx cancellation ends the prompt as a quit (not an abort), again without a key —
+// so SIGTERM during an idle prompt is honored within a poll tick on a tty.
+func TestPollLoop_CtxCancelQuits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m := newBuildPrompt(Colors{}, items3())
+	if got := pollLoop(ctx, make(chan struct{}), noData, m, func() {}); got {
+		t.Errorf("ctx cancel is a quit, not an abort")
+	}
+	if !m.quit || !m.done {
+		t.Errorf("ctx cancel should quit, got quit=%v done=%v", m.quit, m.done)
+	}
+}
+
+// A keystroke read through pollLoop drives the model: Enter on the default confirms
+// build-all, and the loop returns not-aborted.
+func TestPollLoop_HandlesKeystroke(t *testing.T) {
+	sent := false
+	read := func(buf []byte) (int, error) {
+		if !sent {
+			sent = true
+			return copy(buf, []byte{'\r'}), nil // Enter
+		}
+		return 0, nil
+	}
+	m := newBuildPrompt(Colors{}, items3())
+	if got := pollLoop(context.Background(), make(chan struct{}), read, m, func() {}); got {
+		t.Errorf("a confirm is not an abort")
+	}
+	if !m.done || !m.build {
+		t.Errorf("Enter on the default should confirm build-all, got done=%v build=%v", m.done, m.build)
+	}
+}
+
+// pollReader yields queued bytes and reports an empty queue as (0, nil) rather than
+// blocking — the non-blocking read the poll loop needs where no tty supports a read
+// deadline. Tested on a pipe (where SetNonblock works) so it needs no real tty.
+func TestPollReader_NonBlocking(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
+
+	read, restore, err := pollReader(int(r.Fd()))
+	if err != nil {
+		t.Skipf("non-blocking reads unsupported on this platform: %v", err)
+	}
+	defer restore()
+
+	buf := make([]byte, 16)
+	if n, err := read(buf); n != 0 || err != nil {
+		t.Errorf("empty queue should read (0, nil), got n=%d err=%v", n, err)
+	}
+	if _, err := w.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	// The byte may not be visible on the very next syscall; poll briefly.
+	var got string
+	for i := 0; i < 100 && got == ""; i++ {
+		if n, err := read(buf); err != nil {
+			t.Fatalf("read after write: %v", err)
+		} else if n > 0 {
+			got = string(buf[:n])
+		} else {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if got != "hi" {
+		t.Errorf("queued bytes should read back, got %q", got)
 	}
 }
 
