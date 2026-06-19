@@ -33,25 +33,29 @@ apps:
 }
 
 func TestSelectContext(t *testing.T) {
-	cfg := &Config{AllowedContexts: []string{"docker-desktop", "k3d-dev", "k3s-*"}}
 	cases := []struct {
-		name              string
-		override, current string
-		want              string
-		wantErr           string
+		name     string
+		allowed  []string
+		override string
+		want     string
+		wantErr  string
 	}{
-		{name: "current in allowlist", current: "k3d-dev", want: "k3d-dev"},
-		{name: "override wins over current", override: "docker-desktop", current: "k3d-dev", want: "docker-desktop"},
-		{name: "glob matches current", current: "k3s-feature-a", want: "k3s-feature-a"},
-		{name: "glob matches override", override: "k3s-feature-b", current: "k3d-dev", want: "k3s-feature-b"},
-		{name: "glob is anchored, no partial match", current: "prod-k3s-x", wantErr: `current kubectl context "prod-k3s-x" is not in allowedContexts`},
-		{name: "override not allowed", override: "prod-cluster", current: "k3d-dev", wantErr: `--context "prod-cluster" is not in allowedContexts`},
-		{name: "current not allowed", current: "prod-cluster", wantErr: `current kubectl context "prod-cluster" is not in allowedContexts`},
-		{name: "nothing selected", wantErr: "no kubectl context selected"},
+		// No override: a lone concrete entry is the target; ksync never reads the
+		// host current-context, so nothing else is consulted.
+		{name: "single literal auto-selected", allowed: []string{"docker-desktop"}, want: "docker-desktop"},
+		// No override but ambiguous: fail closed rather than guess a cluster.
+		{name: "multiple contexts fail closed", allowed: []string{"docker-desktop", "k3d-dev"}, wantErr: "allowedContexts lists 2 contexts"},
+		{name: "single glob has no concrete target", allowed: []string{"k3s-*"}, wantErr: "is a glob"},
+		// Override disambiguates, but must still match an entry.
+		{name: "override picks among many", allowed: []string{"docker-desktop", "k3d-dev"}, override: "k3d-dev", want: "k3d-dev"},
+		{name: "override matches glob", allowed: []string{"docker-desktop", "k3s-*"}, override: "k3s-feature-b", want: "k3s-feature-b"},
+		{name: "override anchored, no partial match", allowed: []string{"k3s-*"}, override: "prod-k3s-x", wantErr: `--context "prod-k3s-x" is not in allowedContexts`},
+		{name: "override not allowed", allowed: []string{"docker-desktop", "k3d-dev"}, override: "prod-cluster", wantErr: `--context "prod-cluster" is not in allowedContexts`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := cfg.SelectContext(c.override, c.current)
+			cfg := &Config{AllowedContexts: c.allowed}
+			got, err := cfg.SelectContext(c.override)
 			if c.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, c.wantErr)

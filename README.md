@@ -29,7 +29,7 @@ What ksync is **not**:
 Declare your apps in a `ksync.yaml`:
 
 ```yaml
-context: docker-desktop        # the ONLY kubectl context ksync will touch
+allowedContexts: [docker-desktop]   # the only context ksync may touch; a sole entry is auto-targeted
 # imageLoad:                   # only for k3d/kind/remote (separate image store)
 #   command: k3d image import --cluster dev $KSYNC_IMAGES
 apps:

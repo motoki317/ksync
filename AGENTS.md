@@ -49,10 +49,12 @@ re-litigate only with new evidence):
   at deploy; an override for an image no app builds is dropped with a note. This is what lets a
   wrapper own image resolution and call ksync as the deploy engine (ADR 20260616-image-override).
 - `internal/config` — ksync.yaml model: app list, `allowedContexts` allowlist (the safety model —
-  the run targets the current-context or `--context`, but it must match an entry; entries are
-  shell-style globs (`path.Match`, e.g. `k3s-*` for per-worktree microVMs), a plain name matches
-  exactly; `SelectContext` enforces this, so one config can serve several interchangeable dev
-  clusters yet never act on an unlisted one), optional top-level `imageLoad` (just `command`, for
+  ksync never reads the host current-context (a shared, host-global setting); `SelectContext`
+  auto-targets the **sole** concrete entry, else (≥2 entries, or a single glob) requires `--context`
+  and fails closed without it; an `--context` must still match an entry; entries are shell-style
+  globs (`path.Match`, e.g. `k3s-*` for per-worktree microVMs — always needing `--context`), a plain
+  name matches exactly; so one config can serve several interchangeable dev clusters yet never act on
+  an unlisted one (ADR 20260619-context-auto-select)), optional top-level `imageLoad` (just `command`, for
   separate-image-store clusters; loads are always serialized and coalesced — see `internal/build`),
   per-app default namespace (ArgoCD destination.namespace parity), `needs`
   DAG, per-app `build` entries (image/context + optional name/dockerfile/watch/watchIgnore/command —

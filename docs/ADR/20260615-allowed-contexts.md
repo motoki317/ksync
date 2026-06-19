@@ -26,6 +26,9 @@ resolve the *actual* target at run time.
   <name>` flag. Either way the chosen context **must be a member of `allowedContexts`**, or the
   run is refused with an error naming the allowed set. `config.SelectContext(override, current)` is
   the pure gate; `engine.CurrentContext()` reads the current-context for it.
+  *(Superseded 2026-06-19 by [20260619-context-auto-select](20260619-context-auto-select.md): the
+  current-context default is removed — a sole concrete entry is auto-targeted, ambiguity requires
+  `--context`, and `engine.CurrentContext()` is deleted. The allowlist gate itself is unchanged.)*
 - This **preserves the safety property** the old model had — ksync can still only ever act on a
   context the config explicitly lists, so a stray current-context pointing at production is
   rejected, not silently used — while letting one config serve several dev clusters. The allowlist

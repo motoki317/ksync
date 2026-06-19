@@ -107,20 +107,17 @@ func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, []string, erro
 }
 
 // resolveContext picks the kubectl context a run targets — the explicit
-// --context override, else the kubeconfig's current-context — and enforces
-// ksync.yaml's allowedContexts. This is the safety gate: a current-context
-// pointing at a cluster the config does not list is refused, not used.
+// --context override, else the sole allowedContexts entry when the config names
+// exactly one concrete context. ksync never reads the kubeconfig current-context
+// (see config.SelectContext); an ambiguous allowlist with no --context is refused
+// rather than guessed.
 func resolveContext(cfg *config.Config, override string) (string, error) {
-	current, err := engine.CurrentContext()
-	if err != nil {
-		return "", err
-	}
-	return cfg.SelectContext(override, current)
+	return cfg.SelectContext(override)
 }
 
 // contextFlag registers the shared --context flag on a subcommand's flag set.
 func contextFlag(fs *flag.FlagSet) *string {
-	return fs.String("context", "", "kubectl context to target; must be listed in allowedContexts (default: current-context)")
+	return fs.String("context", "", "kubectl context to target; must be listed in allowedContexts (default: the sole allowedContexts entry, when exactly one)")
 }
 
 // parseInterspersed parses fs allowing flags and positional args (app names) in

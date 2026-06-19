@@ -66,17 +66,21 @@ A full example:
 
 ```yaml
 # The kubectl contexts ksync is allowed to use. Required, at least one.
-# ksync targets your current kubectl context (or `--context <name>`), but it
-# MUST match one of these — anything else is refused. So one config can serve
-# several interchangeable dev clusters (here Docker Desktop and a local k3d)
-# while never touching the wrong cluster by accident. To switch targets, either
-# `kubectl config use-context …` or pass `ksync sync --context …`.
+# ksync does NOT read your current kubectl context (a host-global setting your
+# other shells share). When this lists exactly one concrete context, ksync
+# targets it automatically. When it lists several — or a single glob — the
+# target is ambiguous, so you must pick one with `ksync sync --context <name>`;
+# without it the run is refused rather than guessing a cluster. Either way the
+# `--context` you pass must match an entry here, so one config can serve several
+# interchangeable dev clusters (here Docker Desktop and a local k3d) while never
+# touching the wrong cluster by accident.
 #
 # Each entry is a shell-style glob (`*`, `?`, `[…]`); a plain name matches
 # exactly. A glob covers a family of clusters whose names you don't know up
 # front — e.g. per-worktree microVMs `k3s-feature-a`, `k3s-feature-b`, … all
-# matched by `k3s-*`. Globs only widen the allowlist, so keep them tight: `*`
-# would match every context and defeat the safety gate.
+# matched by `k3s-*` (these always need `--context`, having no single concrete
+# name). Globs only widen the allowlist, so keep them tight: `*` would match
+# every context and defeat the safety gate.
 allowedContexts:
   - docker-desktop
   - k3d-dev
@@ -111,7 +115,7 @@ The fields, one by one:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `allowedContexts` | yes | The kubectl contexts ksync may target (≥1). The run uses the current-context or `--context`; it must match an entry here (each a shell-style glob, e.g. `k3s-*`), else it is refused. |
+| `allowedContexts` | yes | The kubectl contexts ksync may target (≥1). ksync ignores your current-context: a single concrete entry is targeted automatically, otherwise (several entries, or a glob like `k3s-*`) you pass `--context`, which must match an entry here. |
 | `imageLoad.command` | no | Shell command that makes freshly built images visible to the cluster (k3d/kind/remote). Runs with `$KSYNC_IMAGES` set to the newline-separated refs to load (and `$KSYNC_IMAGE` to the first). Loads never overlap, and images that finish while one runs are coalesced into the next invocation. See "Making built images visible". |
 | `buildGroups` | no | Named bulk-build commands several `build` entries can share, so one `docker buildx bake`/compile produces many images. See "Build groups". |
 | `apps[].path` | yes | Directory with a kustomization file. Relative paths are resolved from the config file's directory. |
@@ -438,8 +442,9 @@ imageLoad:
     k3d image import --cluster dev $KSYNC_IMAGES         # separate store — import
 ```
 
-Now `ksync sync` (current context `docker-desktop`) skips the import, and `ksync sync --context
-k3d-dev` runs it — same config, same images.
+With two entries the target is ambiguous, so each run names one: `ksync sync --context
+docker-desktop` skips the import, and `ksync sync --context k3d-dev` runs it — same config, same
+images.
 
 ksync stays out of the way here on purpose: it has no built-in idea of "k3d" or "kind", so the
 `command` above is exactly what runs — and any other tool or transport works the same way without
@@ -831,13 +836,15 @@ If your charts rely on hooks behaving exactly like `helm install`, check this li
 
 ## Safety model
 
-- ksync talks only to a context matching `ksync.yaml`'s `allowedContexts`. It targets your
-  current kubectl context (or `--context <name>`), but refuses to run if that context matches no
-  allowlist entry — so a config checked into a repo can never point a teammate's ksync at an
-  unlisted cluster (production, a colleague's cluster), even if their current-context happens to
-  select it. The allowlist is what lets one config serve several interchangeable dev clusters.
-  Entries are shell-style globs (`k3s-*`), which only ever widen the set — keep them tight, since
-  `*` matches every context and so disables this gate.
+- ksync talks only to a context in `ksync.yaml`'s `allowedContexts`, and it ignores your kubeconfig
+  current-context entirely (that host-global setting belongs to your other shells, not to ksync).
+  A single concrete entry is targeted automatically; with several entries or a glob you pass
+  `--context <name>`, which must itself match an entry, and a run that cannot resolve a single
+  target is refused rather than guessing. So a config checked into a repo can never point a
+  teammate's ksync at an unlisted cluster (production, a colleague's cluster), whatever their
+  current-context happens to select. The allowlist is what lets one config serve several
+  interchangeable dev clusters. Entries are shell-style globs (`k3s-*`), which only ever widen the
+  set — keep them tight, since `*` matches every context and so disables this gate.
 - Prune and destroy only touch resources labeled with `ksync.dev/app`.
 - `destroy` requires `-yes`.
 
