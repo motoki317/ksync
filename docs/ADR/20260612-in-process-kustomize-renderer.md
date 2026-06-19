@@ -38,7 +38,10 @@ invocation:
 - No subprocess spawn per render; the renderer version is fixed by `go.mod`, immune to PATH
   drift across machines.
 - M2's image-tag injection can run as an in-process `images` transformer on the rendered
-  result instead of mutating overlay files on disk.
+  result instead of mutating overlay files on disk. It honors the kustomization's
+  `configurations:` image field specs in addition to the builtin ones, so a dev tag reaches
+  CRD-embedded image paths (e.g. an argo WorkflowTemplate) exactly as `kustomize build` would
+  for the same config — the reference manifests rely on this for the linear-workflow CRDs.
 - Any drift between the pinned module and the reference binary fails CI-visible tests
   immediately.
 

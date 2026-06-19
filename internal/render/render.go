@@ -7,14 +7,18 @@ package render
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/kustomize/api/filters/imagetag"
+	"sigs.k8s.io/kustomize/api/konfig"
 	"sigs.k8s.io/kustomize/api/krusty"
 	"sigs.k8s.io/kustomize/api/resmap"
 	"sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
+	"sigs.k8s.io/yaml"
 )
 
 // Image is one image override, with kustomize `images:` field semantics.
@@ -25,6 +29,11 @@ type Image = types.Image
 // the recursive containers/initContainers filter below they make SetImages
 // behave exactly like an `images:` entry in the kustomization. Replicated
 // because kustomize keeps the canonical list in an internal package.
+//
+// A kustomization may extend these through its `configurations:` files (see
+// configImageFieldSpecs); SetImages appends those so a built image is rewritten
+// at non-standard paths too — e.g. an argo WorkflowTemplate's
+// spec/templates/container/image — matching kustomize's own images transformer.
 var imageFieldSpecs = types.FsSlice{
 	{Path: "spec/containers[]/image", CreateIfNotPresent: true},
 	{Path: "spec/initContainers[]/image", CreateIfNotPresent: true},
@@ -47,6 +56,11 @@ type Result struct {
 	// engine.
 	Objects []*unstructured.Unstructured
 	resMap  resmap.ResMap
+	// extraImageFieldSpecs are the image field specs the kustomization declares
+	// via `configurations:` (beyond the builtin imageFieldSpecs). Captured at
+	// Render time, where the kustomization directory is known, and applied by
+	// SetImages so dynamic dev tags reach the extra paths.
+	extraImageFieldSpecs types.FsSlice
 }
 
 // YAML serializes the multi-document build output, byte-identical to what
@@ -63,14 +77,20 @@ func (res *Result) YAML() ([]byte, error) {
 // kustomization, but in-process so the working tree is never mutated. This is
 // how locally built dev tags are injected before sync.
 func (res *Result) SetImages(images []Image) error {
+	// Builtin specs plus whatever the kustomization's `configurations:` add, so
+	// CRD-embedded image paths (e.g. argo WorkflowTemplate) are rewritten too.
+	fieldSpecs := imageFieldSpecs
+	if len(res.extraImageFieldSpecs) > 0 {
+		fieldSpecs = append(append(types.FsSlice{}, imageFieldSpecs...), res.extraImageFieldSpecs...)
+	}
 	for _, img := range images {
 		// The two filters of kustomize's builtin images transformer: the
-		// recursive containers/initContainers walk, then the fixed field
-		// specs (which also cover pod-level OCI volume images).
+		// recursive containers/initContainers walk, then the field specs (which
+		// also cover pod-level OCI volume images and any configurations: paths).
 		if err := res.resMap.ApplyFilter(imagetag.LegacyFilter{ImageTag: img}); err != nil {
 			return fmt.Errorf("setting image %s: %w", img.Name, err)
 		}
-		if err := res.resMap.ApplyFilter(imagetag.Filter{ImageTag: img, FsSlice: imageFieldSpecs}); err != nil {
+		if err := res.resMap.ApplyFilter(imagetag.Filter{ImageTag: img, FsSlice: fieldSpecs}); err != nil {
 			return fmt.Errorf("setting image %s: %w", img.Name, err)
 		}
 	}
@@ -194,7 +214,76 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rendering %s: %w", dir, err)
 	}
-	return &Result{Objects: objs, resMap: resMap}, nil
+	extra, err := configImageFieldSpecs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("rendering %s: %w", dir, err)
+	}
+	return &Result{Objects: objs, resMap: resMap, extraImageFieldSpecs: extra}, nil
+}
+
+// configImageFieldSpecs returns the image field specs the kustomization at dir
+// declares through its `configurations:` files — the mechanism kustomize's
+// images transformer uses to reach image fields the builtin specs miss, such as
+// an argo WorkflowTemplate's spec/templates/container/image. SetImages appends
+// them so locally built dev tags are injected there too, keeping parity with
+// `kustomize build` on the same kustomization.
+//
+// It reads only the top-level kustomization's configurations, matching the
+// dev/prod shape where each per-app kustomization references a shared config
+// file; specs contributed by a base or component are not collected.
+func configImageFieldSpecs(dir string) (types.FsSlice, error) {
+	kfile, err := findKustomization(dir)
+	if err != nil {
+		return nil, err
+	}
+	if kfile == "" {
+		// Render already built dir, so a kustomization exists; missing here only
+		// under an unrecognized name. Stay silent — the builtin specs still apply.
+		return nil, nil
+	}
+	data, err := os.ReadFile(kfile)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", kfile, err)
+	}
+	var kust struct {
+		Configurations []string `json:"configurations"`
+	}
+	if err := yaml.Unmarshal(data, &kust); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", kfile, err)
+	}
+	var specs types.FsSlice
+	for _, rel := range kust.Configurations {
+		p := filepath.Join(dir, rel)
+		cfg, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("reading transformer config %s: %w", p, err)
+		}
+		var tc struct {
+			Images types.FsSlice `json:"images"`
+		}
+		if err := yaml.Unmarshal(cfg, &tc); err != nil {
+			return nil, fmt.Errorf("parsing transformer config %s: %w", p, err)
+		}
+		specs = append(specs, tc.Images...)
+	}
+	return specs, nil
+}
+
+// findKustomization returns the path of the kustomization file in dir, or ""
+// if none of the recognized names is present.
+func findKustomization(dir string) (string, error) {
+	for _, name := range konfig.RecognizedKustomizationFileNames() {
+		p := filepath.Join(dir, name)
+		switch _, err := os.Stat(p); {
+		case err == nil:
+			return p, nil
+		case os.IsNotExist(err):
+			continue
+		default:
+			return "", fmt.Errorf("locating kustomization in %s: %w", dir, err)
+		}
+	}
+	return "", nil
 }
 
 func objectsFromResMap(resMap resmap.ResMap) ([]*unstructured.Unstructured, error) {

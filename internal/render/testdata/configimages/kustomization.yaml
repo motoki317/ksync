@@ -1,0 +1,6 @@
+resources:
+  - deployment.yaml
+  - workflowtemplate.yaml
+
+configurations:
+  - kustomize-config.yaml

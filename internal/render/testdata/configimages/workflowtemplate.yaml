@@ -1,0 +1,15 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: api-b-job
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      container:
+        image: example.com/team-a/api-b:main
+        command: [run]
+    - name: other
+      container:
+        image: example.com/shop/proxy:v1
+        command: [run]

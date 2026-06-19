@@ -199,6 +199,45 @@ func TestSetImages_Digest(t *testing.T) {
 	}
 }
 
+// SetImages honors image field specs the kustomization adds through
+// `configurations:`, so a built image is rewritten at a path the builtin specs
+// miss — here an argo WorkflowTemplate's spec/templates[].container.image — while
+// a builtin Deployment path is still rewritten and an unrelated image is left
+// alone. This is the parity that lets dev tags reach CRD-embedded images.
+func TestSetImages_ConfigurationsFieldSpec(t *testing.T) {
+	res, err := New(Options{}).Render("testdata/configimages")
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if err := res.SetImages([]Image{{Name: "example.com/team-a/api-b", NewTag: "ksync-012301230123"}}); err != nil {
+		t.Fatalf("SetImages: %v", err)
+	}
+	want := "example.com/team-a/api-b:ksync-012301230123"
+
+	deploy := findObject(t, res.Objects, "Deployment", "api-b")
+	containers, _, _ := unstructured.NestedSlice(deploy.Object, "spec", "template", "spec", "containers")
+	if got, _ := containers[0].(map[string]any)["image"].(string); got != want {
+		t.Errorf("Deployment image = %q, want %q (builtin field spec)", got, want)
+	}
+
+	wf := findObject(t, res.Objects, "WorkflowTemplate", "api-b-job")
+	templates, found, err := unstructured.NestedSlice(wf.Object, "spec", "templates")
+	if err != nil || !found {
+		t.Fatalf("WorkflowTemplate templates: found=%v err=%v", found, err)
+	}
+	image := func(tmpl any) string {
+		c, _ := tmpl.(map[string]any)["container"].(map[string]any)
+		s, _ := c["image"].(string)
+		return s
+	}
+	if got := image(templates[0]); got != want {
+		t.Errorf("WorkflowTemplate matched image = %q, want %q (configurations: field spec)", got, want)
+	}
+	if got := image(templates[1]); got != "example.com/shop/proxy:v1" {
+		t.Errorf("unrelated WorkflowTemplate image = %q, must stay untouched", got)
+	}
+}
+
 func TestForceLocalImagePullPolicy(t *testing.T) {
 	container := func(image, policy string) map[string]any {
 		c := map[string]any{"name": "c", "image": image}
