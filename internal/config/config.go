@@ -5,6 +5,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -46,7 +47,17 @@ type Config struct {
 	// BuildGroup). Optional; a config can build every image individually.
 	BuildGroups []BuildGroup `json:"buildGroups,omitempty"`
 	Apps        []App        `json:"apps"`
+
+	// baseDir is the absolute directory of the config file, the value of the
+	// ${KSYNC_WORKDIR} patch anchor. Set by Parse; read via Dir.
+	baseDir string
 }
+
+// Dir is the absolute directory of the loaded config file. It is what the
+// ${KSYNC_WORKDIR} anchor in a patch resolves to, so an app.patches value can
+// name a path relative to the worktree (which differs per deploy environment:
+// a microVM mount vs a host checkout) without hardcoding either.
+func (c *Config) Dir() string { return c.baseDir }
 
 // ImageLoad is the hook that makes freshly built images visible to a cluster
 // with a separate image store. Command runs via `sh -c` with $KSYNC_IMAGES set
@@ -104,6 +115,40 @@ type App struct {
 	// build's watched sources change, ksync rebuilds the image and injects
 	// the new tag into the rendered manifests before syncing.
 	Build []Build `json:"build,omitempty"`
+	// Patches are post-render JSON6902 patches applied to this app's rendered
+	// objects, before image injection and apply. They set deploy-environment
+	// fields the committed kustomization cannot carry — a hostPath that differs
+	// between clusters — keeping the kustomization a pure kustomize file. See
+	// Patch and ADR 20260623-post-render-patches.
+	Patches []Patch `json:"patches,omitempty"`
+}
+
+// PatchTarget identifies the single rendered object a Patch applies to, by
+// literal (non-regex) GVK + name, optionally pinned to a namespace. Kind and
+// Name are required; an empty Group, Version, or Namespace matches any. The
+// match must be exactly one object (zero or several is an error), so the target
+// names one resource unambiguously. Namespace matches the object's rendered
+// metadata.namespace — not an app-level default namespace, which is only
+// applied later at sync time.
+type PatchTarget struct {
+	Group     string `json:"group,omitempty"`
+	Version   string `json:"version,omitempty"`
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// Patch is one post-render RFC 6902 (JSON patch) operation set applied to the
+// object named by Target. Patch is the inline patch — a YAML or JSON list of
+// ops. A `value` string may contain ${VAR} references, expanded at sync time
+// from the process environment plus the built-in ${KSYNC_WORKDIR} (the config
+// file's directory); an undefined variable fails the sync. Expansion touches
+// only `value` strings, never `path`/`from`/`op`. This is ksync's own DSL (it
+// lives in ksync.yaml, never in a kustomization), so the manifests stay pure
+// kustomize while environment-specific fields resolve per run.
+type Patch struct {
+	Target PatchTarget `json:"target"`
+	Patch  string      `json:"patch"`
 }
 
 // Build declares one locally built image. Design rationale:
@@ -227,6 +272,7 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
 		return nil, err
 	}
+	cfg.baseDir = baseDir
 
 	var errs []error
 	if len(cfg.AllowedContexts) == 0 {
@@ -268,6 +314,11 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 			if msgs := validation.IsDNS1123Label(app.Namespace); len(msgs) > 0 {
 				errs = append(errs, fmt.Errorf("apps[%d] (%s): namespace %q is not a valid namespace name: %s",
 					i, app.Name, app.Namespace, strings.Join(msgs, "; ")))
+			}
+		}
+		for j, p := range app.Patches {
+			if err := p.Validate(); err != nil {
+				errs = append(errs, fmt.Errorf("apps[%d] (%s) patches[%d]: %w", i, app.Name, j, err))
 			}
 		}
 		if names[app.Name] {
@@ -580,6 +631,99 @@ func imageBaseName(image string) string {
 		image = image[:i]
 	}
 	return image
+}
+
+// rfc6902Ops is the set of RFC 6902 (JSON patch) operations.
+var rfc6902Ops = map[string]bool{"add": true, "remove": true, "replace": true, "move": true, "copy": true, "test": true}
+
+// Validate checks a patch's structure at config-load time: the target names a
+// kind and name, and the inline patch parses as a non-empty list of well-formed
+// RFC 6902 operations. It deliberately does NOT resolve ${VAR} (needs the
+// runtime environment) or match the target (needs the rendered objects); both
+// are checked when the app is synced, so an undefined variable or a zero/multi
+// match fails only the run that actually renders this app.
+func (p Patch) Validate() error {
+	if strings.TrimSpace(p.Target.Kind) == "" {
+		return errors.New("target.kind is required")
+	}
+	if strings.TrimSpace(p.Target.Name) == "" {
+		return errors.New("target.name is required")
+	}
+	if p.Target.Namespace != "" {
+		if msgs := validation.IsDNS1123Label(p.Target.Namespace); len(msgs) > 0 {
+			return fmt.Errorf("target.namespace %q is not a valid namespace name: %s", p.Target.Namespace, strings.Join(msgs, "; "))
+		}
+	}
+	ops, err := decodePatchOps(p.Patch)
+	if err != nil {
+		return err
+	}
+	if len(ops) == 0 {
+		return errors.New("patch has no operations")
+	}
+	for i, op := range ops {
+		if err := validatePatchOp(op); err != nil {
+			return fmt.Errorf("op[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// decodePatchOps parses an inline RFC 6902 patch (YAML or JSON) into its op
+// list. Each op stays a raw-message map so a present value — including an
+// explicit null, which is valid for add/replace/test — is distinguishable from
+// a missing one.
+func decodePatchOps(patch string) ([]map[string]json.RawMessage, error) {
+	j, err := yaml.YAMLToJSON([]byte(patch))
+	if err != nil {
+		return nil, fmt.Errorf("patch is not valid YAML/JSON: %w", err)
+	}
+	var ops []map[string]json.RawMessage
+	if err := json.Unmarshal(j, &ops); err != nil {
+		return nil, fmt.Errorf("patch must be a list of RFC 6902 operations: %w", err)
+	}
+	return ops, nil
+}
+
+func validatePatchOp(op map[string]json.RawMessage) error {
+	var name string
+	if raw, ok := op["op"]; ok {
+		_ = json.Unmarshal(raw, &name)
+	}
+	if !rfc6902Ops[name] {
+		return fmt.Errorf("unknown op %q (want add/remove/replace/move/copy/test)", name)
+	}
+	if err := requireJSONPointer(op, "path"); err != nil {
+		return err
+	}
+	switch name {
+	case "add", "replace", "test":
+		if _, ok := op["value"]; !ok {
+			return fmt.Errorf("%q requires a value", name)
+		}
+	case "move", "copy":
+		if err := requireJSONPointer(op, "from"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// requireJSONPointer checks op[field] is a present RFC 6901 JSON pointer — the
+// empty string (the whole document) or a string starting with "/".
+func requireJSONPointer(op map[string]json.RawMessage, field string) error {
+	raw, ok := op[field]
+	if !ok {
+		return fmt.Errorf("missing %q", field)
+	}
+	var ptr string
+	if err := json.Unmarshal(raw, &ptr); err != nil {
+		return fmt.Errorf("%q must be a string", field)
+	}
+	if ptr != "" && !strings.HasPrefix(ptr, "/") {
+		return fmt.Errorf("%q %q is not a JSON pointer (must be empty or start with /)", field, ptr)
+	}
+	return nil
 }
 
 func resolveAgainst(base, p string) string {

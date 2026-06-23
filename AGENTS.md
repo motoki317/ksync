@@ -61,7 +61,10 @@ re-litigate only with new evidence):
   per-app default namespace (ArgoCD destination.namespace parity), `needs`
   DAG, per-app `build` entries (image/context + optional name/dockerfile/watch/watchIgnore/command —
   `name` defaults to the image's last path segment, unique within an app, labels the image in the
-  watch confirmation prompt); `SortByNeeds`.
+  watch confirmation prompt); per-app `patches` (post-render JSON6902 patches — target by literal
+  GVK+name(+ns), inline RFC6902 ops, op `value`s may use `${VAR}`; the DSL home for
+  deploy-environment fields the kustomization can't carry, see render below and ADR
+  20260623-post-render-patches); `Config.Dir` (the `${KSYNC_WORKDIR}` anchor); `SortByNeeds`.
 - `internal/build` — source→image: docker build (or the `command` escape hatch producing
   `$KSYNC_IMAGE`), content-addressed dev tags `ksync-<12 hex of image ID>` (no persisted
   build state; `--provenance=false` keeps IDs deterministic), `.dockerignore`-scoped watch
@@ -76,6 +79,15 @@ re-litigate only with new evidence):
   binary is enforced by test. `SetImages` (the build-tag injection path) also rewrites an
   explicit `imagePullPolicy: Always` to `IfNotPresent` for images ksync builds — the
   content-addressed local tag exists in no registry, so `Always` would force a doomed pull.
+  `ApplyPatches` is the post-render patch path (sibling of SetImages, applied **before** it in
+  render/sync/watch/images): each `config.Patch` matches **exactly one** rendered object by literal
+  GVK+name(+ns) — fail-closed on 0/≥2, not kustomize's regex `Selector` — and applies its inline
+  RFC6902 ops via a single-resource `patchjson6902.Filter`, refreshing `Objects` so `YAML()` and
+  `Objects` never drift. `${VAR}` in op `value`s is expanded by a narrow custom scanner (`${NAME}`
+  and `$$`→`$` only, fail-closed on undefined) over the process env plus the built-in
+  `${KSYNC_WORKDIR}` = config dir; expansion touches only `value` strings (`NewVarLookup` builds the
+  resolver). Because ksync runs next to the cluster, `${HOME}` self-resolves to the cluster host's
+  home, so a wrapper needs no per-environment plumbing (ADR 20260623-post-render-patches).
 - `internal/ui` — human-facing output: a `logr.LogSink` that renders clean, colored,
   single-line records (a quiet variant drops Info/V noise; used for the engine and the routed
   klog/client-go stream), color helpers (NO_COLOR + TTY aware), and the live terminal block

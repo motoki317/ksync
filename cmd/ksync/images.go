@@ -66,6 +66,7 @@ func runImages(args []string) error {
 	}
 	defer cleanup()
 	r := render.New(renderOpts)
+	lookup := render.NewVarLookup(cfg.Dir())
 	// Render apps concurrently (the slow part is a helm dry-run per chart
 	// release); merge the per-app results sequentially afterward so the imageSet
 	// needs no locking.
@@ -76,6 +77,11 @@ func runImages(args []string) error {
 	rendered, err := renderConcurrently(apps, *maxParallel, func(app config.App) (appResult, error) {
 		res, err := r.Render(app.Path)
 		if err != nil {
+			return appResult{}, fmt.Errorf("app %s: %w", app.Name, err)
+		}
+		// A patch could change an image ref, so apply before reading the image set
+		// — otherwise `images` would report a ref sync does not deploy.
+		if err := res.ApplyPatches(app.Patches, lookup); err != nil {
 			return appResult{}, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 		ns := map[string]struct{}{}

@@ -94,7 +94,10 @@ type Options struct {
 	RetryBase   time.Duration // default 1s
 	RetryMax    time.Duration // default 2m
 	Render      render.Options
-	Build       BuildFunc // required when any app declares builds (that aren't all overridden)
+	// WorkDir is the config file's directory, the value of the ${KSYNC_WORKDIR}
+	// anchor when expanding an app's patch values (see config.Patch).
+	WorkDir string
+	Build   BuildFunc // required when any app declares builds (that aren't all overridden)
 	// Overrides pins externally-supplied image refs instead of building them: a
 	// build entry whose Image is a key here is never built (its source changes are
 	// not watched) and the given ref is injected at deploy in place of a built
@@ -329,6 +332,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 
 	rn := &runner{
 		renderer: renderer,
+		lookup:   render.NewVarLookup(opts.WorkDir),
 		syncFn:   syncFn,
 		report:   opts.Report,
 		onError:  opts.OnError,
@@ -689,6 +693,7 @@ func unbuilt(todo []int, built map[int]string) []int {
 // thread half a dozen parameters; the loop builds it once and reuses it.
 type runner struct {
 	renderer *render.Renderer
+	lookup   func(string) (string, bool)
 	syncFn   SyncFunc
 	report   func(app string, stats SyncStats, took time.Duration)
 	onError  func(app string, err error)
@@ -705,6 +710,13 @@ func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render
 	res, err := rn.renderer.Render(app.Path)
 	if err != nil {
 		rn.log.Error(err, "Render failed", "app", app.Name)
+		rn.onError(app.Name, err)
+		return deployResult{app: app.Name}
+	}
+	// Patches before image injection (deploy-environment fields the kustomization
+	// can't carry); SetImages must win on the built dev tag.
+	if err := res.ApplyPatches(app.Patches, rn.lookup); err != nil {
+		rn.log.Error(err, "Applying patches failed", "app", app.Name)
 		rn.onError(app.Name, err)
 		return deployResult{app: app.Name}
 	}

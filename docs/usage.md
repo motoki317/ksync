@@ -123,6 +123,7 @@ The fields, one by one:
 | `apps[].namespace` | no | Default namespace for resources that do not set one (like ArgoCD's `destination.namespace`). ksync creates this namespace if it does not exist. |
 | `apps[].needs` | no | Apps that must sync **and become Healthy** before this one starts. ksync checks that there is no cycle. |
 | `apps[].build` | no | Images to build from local source code. See "Building images from source" below. |
+| `apps[].patches` | no | Post-render edits to one rendered object, for fields that differ per environment. See "Per-environment patches". |
 
 Unknown fields are an error. This protects you from typos: `need:` instead of `needs:` fails
 loudly instead of being ignored.
@@ -140,6 +141,54 @@ tracking works" below).
 
 Resources that set their own `metadata.namespace` keep it — the default is only for resources
 that have none.
+
+### Per-environment patches
+
+Sometimes a rendered field must differ between environments in a way the kustomization can't carry —
+classically a `hostPath` that points at a host-shared directory whose absolute path depends on *where*
+you run ksync (a microVM mount vs. your real home directory). `patches` lets you set such fields from
+`ksync.yaml` — ksync's own config — so the kustomization stays a plain kustomize file.
+
+Each patch names **one** rendered object and applies an [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902)
+JSON patch to it, *after* render and *before* image injection and apply:
+
+```yaml
+apps:
+  - path: manifest/dev/shop
+    namespace: shop
+    patches:
+      - target: { group: argoproj.io, version: v1alpha1, kind: WorkflowTemplate, name: load-data }
+        patch: |
+          # Guard the array index, then rewrite the path. ${HOME} resolves to the
+          # cluster host's home because ksync runs next to the cluster.
+          - op: test
+            path: /spec/volumes/0/name
+            value: download-cache
+          - op: replace
+            path: /spec/volumes/0/hostPath/path
+            value: ${HOME}/.cache/shop
+      - target: { kind: Deployment, name: api }
+        patch: |
+          - op: replace
+            path: /spec/template/spec/volumes/0/hostPath/path
+            value: ${KSYNC_WORKDIR}/secrets
+```
+
+- **`target`** matches by exact `kind` + `name`, plus `group`/`version`/`namespace` when you set them
+  (an empty one matches any). The match must hit **exactly one** rendered object — zero or several is an
+  error, so a patch can never silently land on the wrong resource. `namespace` matches the object's own
+  `metadata.namespace`, not the app-level default (which is applied later).
+- **`patch`** is an inline list of RFC 6902 ops. Because the patch points into *rendered* output by
+  array index, lead with a `test` op on a nearby stable field (a volume's `name`); if a chart upgrade
+  reorders things, the patch fails loudly instead of editing the wrong element.
+- **`${VAR}`** in an op's `value` is expanded at sync time from the process environment, plus the
+  built-in **`${KSYNC_WORKDIR}`** (the directory of your `ksync.yaml`). An undefined variable fails the
+  sync. `$$` is a literal `$`. Expansion touches only `value`s, never `path`/`from`. ksync runs next to
+  the cluster — inside the VM, or on your host for Docker Desktop — so `${HOME}` is the cluster host's
+  home in each case, with no per-environment setup on your part.
+
+`ksync render` shows the patched output (so it's what `sync` deploys), which means its output depends on
+the environment when a patch uses a variable.
 
 ## Building images from source
 

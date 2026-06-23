@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-app
+  namespace: team-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cache-app
+  template:
+    metadata:
+      labels:
+        app: cache-app
+    spec:
+      containers:
+        - name: cache-app
+          image: registry.example/cache-app:1.0.0
+      volumes:
+        - name: download-cache
+          hostPath:
+            path: /placeholder
+            type: DirectoryOrCreate

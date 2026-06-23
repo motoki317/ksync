@@ -164,11 +164,17 @@ func runRender(args []string) error {
 	}
 	defer cleanup()
 	r := render.New(renderOpts)
+	lookup := render.NewVarLookup(cfg.Dir())
 	// Render and serialize concurrently — each is independent, and both the
 	// per-chart helm dry-runs and the YAML marshal are the per-app cost.
 	yamls, err := renderConcurrently(apps, *maxParallel, func(app config.App) ([]byte, error) {
 		res, err := r.Render(app.Path)
 		if err != nil {
+			return nil, fmt.Errorf("app %s: %w", app.Name, err)
+		}
+		// Apply patches so `render` shows what sync deploys (env-dependent when a
+		// patch value uses ${VAR}).
+		if err := res.ApplyPatches(app.Patches, lookup); err != nil {
 			return nil, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 		yml, err := res.YAML()
@@ -299,6 +305,7 @@ func runSync(args []string) error {
 	}
 	defer cleanup()
 	r := render.New(renderOpts)
+	lookup := render.NewVarLookup(cfg.Dir())
 	prog := newProgress(os.Stderr, out, apps)
 	buildFn := makeBuildFunc(ctx, cfg, prog, kubeContext)
 	// A whole-stack run gets a plan up front, the summary block pinned live to
@@ -342,7 +349,7 @@ func runSync(args []string) error {
 			prog.finish(app.Name, nil)
 			return fmt.Errorf("app %s: build failed: %w", app.Name, bo.err)
 		}
-		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, overrides, *prune, *force, *timeout)
+		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, overrides, lookup, *prune, *force, *timeout)
 		if err != nil {
 			prog.finish(app.Name, nil) // remove the live group; the error is returned and printed at the top level
 			return err
@@ -462,7 +469,7 @@ func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.Build
 // reference images that exist. The deploy row lands in the app's pipeline; the
 // caller commits it after tallying so the live footer's count tracks the
 // committed lines.
-func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, overrides map[string]render.Image, prune, force bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
+func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, overrides map[string]render.Image, lookup func(string) (string, bool), prune, force bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
 	images := make([]render.Image, 0, len(app.Build))
 	for j := range app.Build {
 		if ov, ok := overrides[app.Build[j].Image]; ok {
@@ -473,6 +480,11 @@ func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog
 	}
 	res, err := r.Render(app.Path)
 	if err != nil {
+		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
+	}
+	// Patches before image injection: a patch guards the committed manifest shape,
+	// and SetImages must win on the dev tag and the Always→IfNotPresent fix.
+	if err := res.ApplyPatches(app.Patches, lookup); err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	if len(images) > 0 {
@@ -720,6 +732,7 @@ func runWatch(args []string) error {
 		Debounce:    *debounce,
 		MaxParallel: *maxParallel,
 		Render:      renderOpts,
+		WorkDir:     cfg.Dir(),
 		Build:       makeBuildFunc(ctx, cfg, prog, kubeContext),
 		Log:         log,
 		Report:      reporter.report,
