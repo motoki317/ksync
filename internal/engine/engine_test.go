@@ -213,10 +213,10 @@ func TestUnhealthyLines(t *testing.T) {
 		"metadata":   map[string]any{"name": "settings", "namespace": "team-a"},
 	}}
 
-	lines := unhealthyLines(map[kube.ResourceKey]*unstructured.Unstructured{
+	lines := statusLines(unhealthyStatuses(map[kube.ResourceKey]*unstructured.Unstructured{
 		key("apps", "Deployment", "team-a", "api-b"): stuckDeploy,
 		key("", "ConfigMap", "team-a", "settings"):   configMap,
-	})
+	}))
 
 	if len(lines) != 1 {
 		t.Fatalf("lines = %v, want exactly one (the Deployment; the ConfigMap has no health check)", lines)

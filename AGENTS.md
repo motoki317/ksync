@@ -44,10 +44,12 @@ re-litigate only with new evidence):
   operator-derived ones absent from the manifests (an ECK Elasticsearch's data image from
   `spec.version`) are covered — the set a cache/pre-pull scopes to (ADR 20260617-images-command).
   `override.go` resolves **image overrides** (`--image IMAGE=REF`
-  on sync/watch, or `KSYNC_IMAGE_OVERRIDES`): a supplied ref deploys a pre-built image instead of
+  on **sync only**, or `KSYNC_IMAGE_OVERRIDES`): a supplied ref deploys a pre-built image instead of
   building that `build:` entry — the build (and its `imageLoad`) is skipped and the ref is injected
   at deploy; an override for an image no app builds is dropped with a note. This is what lets a
   wrapper own image resolution and call ksync as the deploy engine (ADR 20260616-image-override).
+  `watch` rejects overrides (it rebuilds from source): no `--image` flag, and a set
+  `KSYNC_IMAGE_OVERRIDES` fails it fast (ADR 20260623-watch-rejects-image-overrides).
 - `internal/config` — ksync.yaml model: app list, `allowedContexts` allowlist (the safety model —
   ksync never reads the host current-context (a shared, host-global setting); `SelectContext`
   auto-targets the **sole** concrete entry, else (≥2 entries, or a single glob) requires `--context`
@@ -122,7 +124,12 @@ re-litigate only with new evidence):
   reference, the latter bare/untracked so prune never touches it; ADR
   20260614-ensure-referenced-namespaces). After apply, a **health gate** blocks until every
   non-hook resource is Healthy (or `--timeout`), so a completed `Sync` means deployed-and-healthy
-  and a `needs` edge waits for the dependency to actually serve (ADR 20260614-sync-health-gate). A
+  and a `needs` edge waits for the dependency to actually serve (ADR 20260614-sync-health-gate);
+  while waiting, `OnWait` reports the not-yet-ready resources (`[]ResourceStatus`, UI-neutral) so the
+  live deploy line can name them, and on `--timeout` it returns a typed `TimeoutError` and
+  `Diagnose` gathers a **bounded** dump — each unhealthy resource's events plus the related pods
+  (found via the cache's `IterateHierarchyV2` ownership walk) with container state and current/
+  previous log tails (ADR 20260623-sync-timeout-diagnostics). A
   no-diff sync skips hooks, **except** a currently-Degraded hook (re-run so a transiently-failed
   PostSync Job self-heals) or `--force` (re-run every hook, ArgoCD manual-sync parity; ADR
   20260616-hook-rerun-on-failure).
@@ -133,7 +140,9 @@ re-litigate only with new evidence):
   until its own build finishes — so an unbuilt tag is never deployed, and `--max-parallel` now bounds
   builds and deploys with independent budgets (ADR 20260616-eager-build-ahead). An entry in
   `Options.Overrides` (a supplied image ref) is never built and its sources are not watched — the ref
-  is injected at deploy (ADR 20260616-image-override). Manifest-only edits
+  is injected at deploy (ADR 20260616-image-override); the loop still supports this, but the `watch`
+  command no longer populates it — overrides are sync-only (ADR 20260623-watch-rejects-image-overrides).
+  Manifest-only edits
   never invoke docker. By default (interactive TTY, no `-auto`) incremental changes pass through a
   **manual gate** (`Options.Gate`): instead of scheduling, they accumulate into a pending set and,
   once idle, the loop asks which images/apps to rebuild via the `internal/ui` picker, acting only on

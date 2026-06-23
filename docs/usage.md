@@ -366,7 +366,7 @@ Sometimes the image already exists and you do not want ksync to build it: a CI a
 service its own way. Give ksync the ref and it deploys that instead of building from source — for
 that image only; the app's other builds are unaffected.
 
-Two equivalent inputs, accepted by `sync` and `watch`:
+Two equivalent inputs, accepted by `sync` (not `watch` — see below):
 
 ```bash
 # Repeatable flag — IMAGE is the build entry's image:, REF is the ref to deploy.
@@ -385,12 +385,16 @@ ksync sync
 - `REF` is a bare tag (`ci-1234`), `:tag`, a full `name:tag`, a digest (`@sha256:…`), or
   `name@digest`. A name that differs from `IMAGE` redirects the registry/repo; otherwise only the
   tag/digest changes. A flag beats the env var for the same image.
-- An overridden image is **not built**, and in `watch` its sources are not watched (a source edit
-  does nothing; a manifest edit still redeploys, re-injecting the ref). Because the build is
-  skipped, the `imageLoad` step is skipped too — **making the supplied image visible to the cluster
-  is the supplier's job** (it is already a registry image the cluster can pull, or you loaded it).
+- An overridden image is **not built**. Because the build is skipped, the `imageLoad` step is
+  skipped too — **making the supplied image visible to the cluster is the supplier's job** (it is
+  already a registry image the cluster can pull, or you loaded it).
 - An override naming an image no app builds is ignored with a note, so a wrapper can hand ksync its
   full set of resolved refs without tracking which ones ksync builds.
+
+**`watch` rejects overrides.** `watch` exists to rebuild the stack from source, which an override
+contradicts, so it does not offer `--image` and **fails fast** if `KSYNC_IMAGE_OVERRIDES` is set
+(rather than silently ignoring it). Use `ksync sync` to deploy a pre-built image. See ADR
+20260623-watch-rejects-image-overrides.
 
 This is what lets a wrapper own image resolution and use ksync purely as the deploy engine: resolve
 every ref (build/pull/pin), make them cluster-visible, then `ksync sync` with the overrides. See
@@ -715,7 +719,11 @@ It takes the same `-timeout` (default `5m`), `-max-parallel`, and `-v` flags as 
 pre-built image instead of building it — see "Using a pre-built image"). The timeout matters
 most here: a one-time sync waits for the app to become healthy, so without it a pod stuck in
 `ErrImagePull` would hang `ksync sync` forever. On timeout the sync fails and names the
-resources that never became healthy, so you know where to look.
+resources that never became healthy, and prints a short diagnostic dump — each unhealthy
+resource's recent events, plus the related pods' container state and current/previous log tails —
+so you can see what wedged it without reaching for `kubectl`. The same dump prints in `watch` when
+a deploy times out. While the health gate waits, the live deploy line names the not-ready
+resources so you see what it is blocked on.
 
 ### `ksync render` — print the YAML
 

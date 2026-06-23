@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -486,18 +487,74 @@ func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog
 	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Force: force, Namespace: app.Namespace, OnWait: deployWait(deploy)})
 	deploy.Done(err)
 	if err != nil {
+		// On a health-gate timeout, dump what wedged the sync. ctx is the parent
+		// (not the timed-out syncCtx), so the diagnostic API reads can still run.
+		reportTimeoutDiagnostics(ctx, eng, prog.w, prog.colors, app.Name, app.Namespace, res.Objects, err)
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	return results, eng.AppDegraded(app.Name, app.Namespace, res.Objects), nil
 }
 
-// deployWait reports the health gate's progress on the app's deploy row: each
-// poll that is still waiting updates the not-ready count. An already-healthy
-// sync never calls back, so the row simply finishes with its elapsed time.
-func deployWait(deploy *ui.Stage) func([]string) {
-	return func(pending []string) {
-		deploy.SetTail(fmt.Sprintf("waiting for health  %d not ready", len(pending)))
+// diagnoseTimeout bounds how long the post-timeout diagnostic gather may take,
+// so a wedged cluster cannot turn a sync timeout into a hang on the dump.
+const diagnoseTimeout = 15 * time.Second
+
+// reportTimeoutDiagnostics, when err is a health-gate timeout, gathers and prints
+// a debug block — the unhealthy resources' events plus related pods' container
+// state and current/previous logs — so the reader can see what wedged the sync
+// at a glance. It runs on parent (not the timed-out sync ctx) bounded by
+// diagnoseTimeout, and writes the block to scrollback as pipeline output rather
+// than through the single-line logger, which cannot carry a multi-line dump.
+func reportTimeoutDiagnostics(parent context.Context, eng *engine.Engine, w io.Writer, out ui.Colors, app, namespace string, objs []*unstructured.Unstructured, err error) {
+	var te *engine.TimeoutError
+	if !errors.As(err, &te) {
+		return
 	}
+	ctx, cancel := context.WithTimeout(parent, diagnoseTimeout)
+	defer cancel()
+	lines := eng.Diagnose(ctx, app, namespace, objs)
+	if len(lines) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString(out.Bold("Diagnostics") + " " + out.Dim("— "+app+" did not become healthy") + "\n")
+	for _, ln := range lines {
+		b.WriteString(ln + "\n")
+	}
+	ui.WriteLine(ui.SectionPipeline, w, b.String())
+}
+
+// deployWait reports the health gate's progress on the app's deploy row: each
+// poll that is still waiting updates the not-ready count and names the first few
+// resources. An already-healthy sync never calls back, so the row simply
+// finishes with its elapsed time.
+func deployWait(deploy *ui.Stage) func([]engine.ResourceStatus) {
+	return func(pending []engine.ResourceStatus) {
+		deploy.SetTail(waitingTail(pending))
+	}
+}
+
+// waitingTail renders the live health-gate line: the not-ready count plus the
+// first few resources by short name (with a "+N" overflow), so the developer
+// sees WHAT the deploy is waiting on without the line growing unbounded.
+func waitingTail(pending []engine.ResourceStatus) string {
+	const show = 3
+	tail := fmt.Sprintf("waiting for health  %d not ready", len(pending))
+	if len(pending) == 0 {
+		return tail
+	}
+	names := make([]string, 0, show)
+	for i, p := range pending {
+		if i >= show {
+			break
+		}
+		names = append(names, p.ShortName())
+	}
+	tail += ": " + strings.Join(names, ", ")
+	if len(pending) > show {
+		tail += fmt.Sprintf(", +%d", len(pending)-show)
+	}
+	return tail
 }
 
 // runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
@@ -572,12 +629,17 @@ func runWatch(args []string) error {
 	auto := fs.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
-	var images stringSlice
-	fs.Var(&images, "image", "deploy a pre-built image instead of building it: IMAGE=REF (repeatable; also via "+overrideEnv+")")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
 		return err
+	}
+	// watch exists to rebuild the stack from source, so an image override (which
+	// deploys a pre-built image instead of building) contradicts its purpose. The
+	// --image flag is not offered here; reject the env form too, fail-fast, rather
+	// than silently ignore a set value (use `ksync sync` to deploy pre-built images).
+	if strings.TrimSpace(os.Getenv(overrideEnv)) != "" {
+		return fmt.Errorf("%s is set, but watch does not accept image overrides: it rebuilds images from source — use `ksync sync` to deploy a pre-built image", overrideEnv)
 	}
 	apps, err := cfg.Select(names)
 	if err != nil {
@@ -597,10 +659,6 @@ func runWatch(args []string) error {
 	defer cancel()
 
 	log, engineLog := setupLogging(*verbose)
-	overrides, err := imageOverrides(cfg, images, log)
-	if err != nil {
-		return err
-	}
 	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
 		return err
@@ -623,8 +681,8 @@ func runWatch(args []string) error {
 	// sync fails and the scheduler retries it with backoff. The deploy row of the
 	// app's pipeline shows the health-gate wait; on success the Report hook
 	// commits the group, on failure the OnError hook removes it.
-	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) (loop.SyncStats, error) {
-		ctx, cancel := withTimeout(ctx, *timeout)
+	syncFn := func(parent context.Context, app string, objs []*unstructured.Unstructured) (loop.SyncStats, error) {
+		ctx, cancel := withTimeout(parent, *timeout)
 		defer cancel()
 		deploy := prog.pipeline(app).Deploy()
 		deploy.Start()
@@ -633,6 +691,10 @@ func runWatch(args []string) error {
 		stats := syncStats(results)
 		if err == nil {
 			stats.Degraded = len(eng.AppDegraded(app, nsByApp[app], objs))
+		} else {
+			// On a health-gate timeout, dump what wedged the sync. parent outlives
+			// this app's deadline, so the diagnostic API reads can still run.
+			reportTimeoutDiagnostics(parent, eng, os.Stderr, out, app, nsByApp[app], objs, err)
 		}
 		return stats, err
 	}
@@ -659,7 +721,6 @@ func runWatch(args []string) error {
 		MaxParallel: *maxParallel,
 		Render:      renderOpts,
 		Build:       makeBuildFunc(ctx, cfg, prog, kubeContext),
-		Overrides:   overrides,
 		Log:         log,
 		Report:      reporter.report,
 		// A build/render failure (or a failed sync) ends the run without a Report;

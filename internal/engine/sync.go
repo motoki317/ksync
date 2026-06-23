@@ -50,7 +50,54 @@ type SyncOptions struct {
 	// is still waiting, with the resources not yet Healthy. It drives a live
 	// "waiting for health" progress line; it is never called once the app has
 	// converged (an already-healthy sync returns without ever invoking it).
-	OnWait func(pending []string)
+	OnWait func(pending []ResourceStatus)
+}
+
+// ResourceStatus is one resource's health as the sync gate sees it — its
+// identity plus a human-readable status and message — in UI-neutral terms (no
+// gitops-engine types), so the command layer can render the live wait line and
+// the timeout diagnostics without importing the engine's health/kube packages.
+type ResourceStatus struct {
+	Group, Kind, Namespace, Name string
+	// Status is the health status name (Progressing/Degraded/Missing/…);
+	// "Missing" means the cache has not observed the resource yet.
+	Status  string
+	Message string
+}
+
+func (r ResourceStatus) key() kube.ResourceKey {
+	return kube.NewResourceKey(r.Group, r.Kind, r.Namespace, r.Name)
+}
+
+// ShortName is the compact "Kind/name" label for the live "waiting for health"
+// line, where the full group/namespace is noise.
+func (r ResourceStatus) ShortName() string { return r.Kind + "/" + r.Name }
+
+// Line is the full "group/Kind/ns/name: Status — message" detail line used in
+// the timeout error and the diagnostics header.
+func (r ResourceStatus) Line() string {
+	k := r.key()
+	line := k.String() + ": " + r.Status
+	if r.Message != "" {
+		line += " — " + r.Message
+	}
+	return line
+}
+
+// TimeoutError reports a sync that did not become healthy before its deadline,
+// naming the resources still not Healthy. The command layer detects it with
+// errors.As to print a diagnostic dump (events + related pods' logs); see
+// Engine.Diagnose.
+type TimeoutError struct {
+	App     string
+	Pending []ResourceStatus
+}
+
+func (e *TimeoutError) Error() string {
+	if len(e.Pending) == 0 {
+		return fmt.Sprintf("sync of %q timed out before converging", e.App)
+	}
+	return fmt.Sprintf("sync of %q timed out; still not healthy:\n  %s", e.App, strings.Join(statusLines(e.Pending), "\n  "))
 }
 
 // Sync makes the cluster state of one app match the given rendered resources,
@@ -237,42 +284,41 @@ func (e *Engine) timeoutError(app string, target []*unstructured.Unstructured, i
 	return notHealthyError(app, e.unhealthyManaged(target, isManaged))
 }
 
-// notHealthyError frames a deadline-exceeded sync, listing what was still not
-// healthy (or a bare message when nothing specific could be named).
-func notHealthyError(app string, lines []string) error {
-	if len(lines) == 0 {
-		return fmt.Errorf("sync of %q timed out before converging", app)
-	}
-	return fmt.Errorf("sync of %q timed out; still not healthy:\n  %s", app, strings.Join(lines, "\n  "))
+// notHealthyError frames a deadline-exceeded sync as a *TimeoutError carrying
+// the resources still not healthy, so the command layer can both print the
+// message and, via errors.As, gather a diagnostic dump for them.
+func notHealthyError(app string, pending []ResourceStatus) error {
+	return &TimeoutError{App: app, Pending: pending}
 }
 
-// pendingHealth returns one line per non-hook target resource that has not yet
+// pendingHealth returns one entry per non-hook target resource that has not yet
 // reached Healthy/Suspended — either the cache has not observed it (just
 // applied) or its health is still Progressing/Degraded/Missing. Empty means the
 // app has converged. Read from the warm cache, so it costs no API calls.
 //
-// It keys on the TARGET set (not the live set unhealthyLines walks) so a
+// It keys on the TARGET set (not the live set unhealthyManaged walks) so a
 // resource the cache has not caught up to yet counts as pending, not as a
 // premature success. Hooks are excluded: a hook Job with a delete policy is
 // removed once it runs, so it is legitimately absent and must never hold the
 // gate open. Kinds without a health check (ConfigMap, Service, CRD, custom
 // resources, …) are ready as soon as they exist.
-func (e *Engine) pendingHealth(target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) []string {
+func (e *Engine) pendingHealth(target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) []ResourceStatus {
 	lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 	if err != nil {
-		// A transient read failure must not be read as convergence; report it so
-		// the gate keeps waiting.
-		return []string{fmt.Sprintf("reading live state: %v", err)}
+		// A transient read failure must not be read as convergence; report it as a
+		// non-empty entry so the gate keeps waiting.
+		return []ResourceStatus{{Name: "live state", Status: "Unknown", Message: fmt.Sprintf("reading live state: %v", err)}}
 	}
-	return pendingLines(target, lives)
+	return pending(target, lives)
 }
 
-// pendingLines is the pure core of pendingHealth: given the target set and the
-// live objects keyed by resource key, return one line per non-hook target that
-// has not reached Healthy/Suspended. Split out so the gate rule — target-keyed,
-// hook-excluded, presence-required — is unit-testable without a cluster cache.
-func pendingLines(target []*unstructured.Unstructured, lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
-	var pending []string
+// pending is the pure core of pendingHealth: given the target set and the live
+// objects keyed by resource key, return one ResourceStatus per non-hook target
+// that has not reached Healthy/Suspended. Split out so the gate rule —
+// target-keyed, hook-excluded, presence-required — is unit-testable without a
+// cluster cache.
+func pending(target []*unstructured.Unstructured, lives map[kube.ResourceKey]*unstructured.Unstructured) []ResourceStatus {
+	var out []ResourceStatus
 	for _, t := range target {
 		if hook.IsHook(t) {
 			continue
@@ -280,24 +326,55 @@ func pendingLines(target []*unstructured.Unstructured, lives map[kube.ResourceKe
 		key := kube.GetResourceKey(t)
 		live := lives[key]
 		if live == nil {
-			pending = append(pending, key.String()+": not yet created")
+			out = append(out, ResourceStatus{
+				Group: key.Group, Kind: key.Kind, Namespace: key.Namespace, Name: key.Name,
+				Status: "Missing", Message: "not yet created",
+			})
 			continue
 		}
-		h, err := health.GetResourceHealth(live, nil)
-		if err != nil || h == nil {
-			continue
+		if rs, ok := unhealthyStatus(key, live); ok {
+			out = append(out, rs)
 		}
-		if h.Status == health.HealthStatusHealthy || h.Status == health.HealthStatusSuspended {
-			continue
-		}
-		line := fmt.Sprintf("%s: %s", key.String(), h.Status)
-		if h.Message != "" {
-			line += " — " + strings.TrimSpace(h.Message)
-		}
-		pending = append(pending, line)
 	}
-	sort.Strings(pending)
-	return pending
+	sortStatuses(out)
+	return out
+}
+
+// pendingLines formats the pending statuses as their detail lines — kept as the
+// unit-test seam for the gate rule (the strings are what TestPendingLines reads).
+func pendingLines(target []*unstructured.Unstructured, lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
+	return statusLines(pending(target, lives))
+}
+
+// unhealthyStatus returns the ResourceStatus for a live object whose health is
+// worse than Healthy/Suspended, or false when it is healthy or has no health
+// check (ConfigMap, Service, …) — those never hold a sync.
+func unhealthyStatus(key kube.ResourceKey, live *unstructured.Unstructured) (ResourceStatus, bool) {
+	h, err := health.GetResourceHealth(live, nil)
+	if err != nil || h == nil {
+		return ResourceStatus{}, false
+	}
+	if h.Status == health.HealthStatusHealthy || h.Status == health.HealthStatusSuspended {
+		return ResourceStatus{}, false
+	}
+	return ResourceStatus{
+		Group: key.Group, Kind: key.Kind, Namespace: key.Namespace, Name: key.Name,
+		Status: string(h.Status), Message: strings.TrimSpace(h.Message),
+	}, true
+}
+
+// sortStatuses orders statuses by their detail line, so output is stable.
+func sortStatuses(ss []ResourceStatus) {
+	sort.Slice(ss, func(i, j int) bool { return ss[i].Line() < ss[j].Line() })
+}
+
+// statusLines renders each status as its detail line, in the slice's order.
+func statusLines(ss []ResourceStatus) []string {
+	lines := make([]string, len(ss))
+	for i, s := range ss {
+		lines[i] = s.Line()
+	}
+	return lines
 }
 
 // hasDegradedHook reports whether any hook in the target set has a live object
@@ -329,16 +406,31 @@ func hasDegradedHook(target []*unstructured.Unstructured, live map[kube.Resource
 	return false
 }
 
-// unhealthyManaged returns one line per managed live resource whose health is
+// unhealthyManaged returns one entry per managed live resource whose health is
 // worse than Healthy/Suspended, sorted for stable output. Kinds without a
 // health check (ConfigMap, Service, …) report no health and are treated as
 // healthy — matching how the sync waves gate.
-func (e *Engine) unhealthyManaged(target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) []string {
+func (e *Engine) unhealthyManaged(target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) []ResourceStatus {
 	lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 	if err != nil {
 		return nil
 	}
-	return unhealthyLines(lives)
+	return unhealthyStatuses(lives)
+}
+
+// unhealthyStatuses describes the live objects worse than Healthy/Suspended, one
+// ResourceStatus each, sorted. It is the struct form of the timeout/diagnostics
+// view — Kinds without a health check are omitted, as the sync waves treat them
+// as immediately healthy.
+func unhealthyStatuses(lives map[kube.ResourceKey]*unstructured.Unstructured) []ResourceStatus {
+	var out []ResourceStatus
+	for key, obj := range lives {
+		if rs, ok := unhealthyStatus(key, obj); ok {
+			out = append(out, rs)
+		}
+	}
+	sortStatuses(out)
+	return out
 }
 
 // AppDegraded returns one line per managed resource of app whose health is
@@ -380,31 +472,6 @@ func degradedLines(lives map[kube.ResourceKey]*unstructured.Unstructured) []stri
 			continue
 		}
 		line := fmt.Sprintf("%s: Degraded", key.String())
-		if h.Message != "" {
-			line += " — " + strings.TrimSpace(h.Message)
-		}
-		lines = append(lines, line)
-	}
-	sort.Strings(lines)
-	return lines
-}
-
-// unhealthyLines describes the live objects that are worse than Healthy (or
-// Suspended, which is intentional), one sorted line each. Kinds without a
-// health check (ConfigMap, Service, …) report no health and are omitted — the
-// sync waves treat them as immediately healthy, so they are never what a sync
-// waits on.
-func unhealthyLines(lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
-	var lines []string
-	for key, obj := range lives {
-		h, err := health.GetResourceHealth(obj, nil)
-		if err != nil || h == nil {
-			continue
-		}
-		if h.Status == health.HealthStatusHealthy || h.Status == health.HealthStatusSuspended {
-			continue
-		}
-		line := fmt.Sprintf("%s: %s", key.String(), h.Status)
 		if h.Message != "" {
 			line += " — " + strings.TrimSpace(h.Message)
 		}
