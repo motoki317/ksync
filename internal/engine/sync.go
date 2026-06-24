@@ -182,6 +182,11 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		syncCtx, cleanup, err := sync.NewSyncContext(revision, recRes, e.cfg, e.cfg, e.kubectl, opts.Namespace, e.clusterCache.GetOpenAPISchema(),
 			sync.WithLogr(e.log),
 			sync.WithPrune(opts.Prune),
+			// Supply health for custom resources gitops-engine cannot assess
+			// (an ECK Elasticsearch), so a sync wave gates on the dependency
+			// actually serving — without it the CR reads healthy on create and a
+			// later-wave consumer races it.
+			sync.WithHealthOverride(resourceHealth),
 			// Production parity: the reference ArgoCD setup applies everything
 			// server-side.
 			sync.WithServerSideApply(true),
@@ -348,13 +353,18 @@ func pendingLines(target []*unstructured.Unstructured, lives map[kube.ResourceKe
 
 // unhealthyStatus returns the ResourceStatus for a live object whose health is
 // worse than Healthy/Suspended, or false when it is healthy or has no health
-// check (ConfigMap, Service, …) — those never hold a sync.
+// check (ConfigMap, Service, …) — those never hold a sync. An assessment error
+// fails closed: it is reported (true) rather than read as healthy, so a resource
+// ksync cannot evaluate holds the gate instead of letting it pass silently.
 func unhealthyStatus(key kube.ResourceKey, live *unstructured.Unstructured) (ResourceStatus, bool) {
-	h, err := health.GetResourceHealth(live, nil)
-	if err != nil || h == nil {
-		return ResourceStatus{}, false
+	h, err := health.GetResourceHealth(live, resourceHealth)
+	if err != nil {
+		return ResourceStatus{
+			Group: key.Group, Kind: key.Kind, Namespace: key.Namespace, Name: key.Name,
+			Status: string(health.HealthStatusUnknown), Message: strings.TrimSpace(err.Error()),
+		}, true
 	}
-	if h.Status == health.HealthStatusHealthy || h.Status == health.HealthStatusSuspended {
+	if h == nil || h.Status == health.HealthStatusHealthy || h.Status == health.HealthStatusSuspended {
 		return ResourceStatus{}, false
 	}
 	return ResourceStatus{
@@ -395,7 +405,7 @@ func hasDegradedHook(target []*unstructured.Unstructured, live map[kube.Resource
 		if obj == nil {
 			continue
 		}
-		h, err := health.GetResourceHealth(obj, nil)
+		h, err := health.GetResourceHealth(obj, resourceHealth)
 		if err != nil || h == nil {
 			continue
 		}
@@ -467,7 +477,7 @@ func (e *Engine) AppDegraded(app, namespace string, objects []*unstructured.Unst
 func degradedLines(lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
 	var lines []string
 	for key, obj := range lives {
-		h, err := health.GetResourceHealth(obj, nil)
+		h, err := health.GetResourceHealth(obj, resourceHealth)
 		if err != nil || h == nil || h.Status != health.HealthStatusDegraded {
 			continue
 		}
