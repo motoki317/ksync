@@ -36,8 +36,13 @@ re-litigate only with new evidence):
 
 ## Repo at a glance
 
-- `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / images / destroy`
-  implemented; `diff` still a stub). `images.go` is the **`ksync images`** command: renders the
+- `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / images / destroy /
+  diff` implemented). `diff.go` is the **`ksync diff`** command: the read-only preview of `sync` —
+  per-resource unified YAML diff against live, build-tag carry-forward, secret masking (ADR
+  20260625-diff-command). `diff` and `sync`/`watch` default to a **server-side dry-run diff** (the
+  apiserver's predicted post-apply object, so a field the cluster defaults or prunes is not seen as
+  drift); `--client-diff` opts back into the in-process client-side diff (ADR
+  20260625-server-side-diff-default). `images.go` is the **`ksync images`** command: renders the
   apps and prints the **canonical** refs (containerd-normalized via `distribution/reference`, so a
   consumer matches the cluster store by string equality) of the images they deploy, excluding
   `build:` repos (local dev tags, never pulled). `--live` also reads running-pod images so
@@ -144,7 +149,14 @@ re-litigate only with new evidence):
   previous log tails (ADR 20260623-sync-timeout-diagnostics). A
   no-diff sync skips hooks, **except** a currently-Degraded hook (re-run so a transiently-failed
   PostSync Job self-heals) or `--force` (re-run every hook, ArgoCD manual-sync parity; ADR
-  20260616-hook-rerun-on-failure).
+  20260616-hook-rerun-on-failure). `serverdiff.go` is the **diff strategy** shared by `Diff` and
+  `Sync`'s apply-skip: server-side by default (gitops-engine's `WithServerSideDiff` over
+  `kube.ManageServerSideDiffDryRuns` — the JSON-emitting dry-run applier, **not** `ManageResources`,
+  whose status-line printer silently degrades every resource to client-side — plus the warm cache's
+  `GetGVKParser`), with a per-resource fallback to client-side on a dry-run error; `Sync` runs it on
+  the first reconcile only (the apply-set decision), client-side on the health-wait polls. A field the
+  apiserver defaults or prunes (a `maxUnavailable` behind a disabled feature gate) is therefore not
+  re-applied every sync. `--client-diff` opts out (ADR 20260625-server-side-diff-default).
 - `internal/loop` — the watch-mode event loop tying the above together; cluster and docker
   sides injected as SyncFunc/BuildFunc so it tests without either. Two scheduler instances run the
   two phases independently: an image builds the moment its source is dirty (needs-free), overlapping

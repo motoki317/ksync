@@ -51,6 +51,13 @@ type SyncOptions struct {
 	// "waiting for health" progress line; it is never called once the app has
 	// converged (an already-healthy sync returns without ever invoking it).
 	OnWait func(pending []ResourceStatus)
+	// ServerSide decides the apply set from a dry-run server-side apply on the
+	// first reconcile (so a field the cluster defaults or prunes is not seen as
+	// drift and re-applied every sync), matching what `ksync diff` previews. The
+	// health-wait polls that follow stay client-side — the apply set is already
+	// decided, and a dry-run per poll would cost an API round-trip per resource
+	// per second. When false, the apply set uses the client-side diff throughout.
+	ServerSide bool
 }
 
 // ResourceStatus is one resource's health as the sync gate sees it — its
@@ -164,13 +171,38 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 	//     re-run, so the idempotent no-op fast path is unchanged.
 	skipHooks := false
 	firstReconcile := true
+	// The server-side apply-skip decision happens on the first reconcile only —
+	// build its dry-run differ once for the whole operation (a no-op when
+	// client-side). Later iterations re-diff client-side: they are health-wait
+	// polls whose recRes (and its prune candidates) shifts as resources converge,
+	// so the per-iteration realignment must be the cheap diff, not a dry-run per
+	// resource per poll. The first reconcile is where a no-build, no-hook app
+	// (the common case) decides and completes, so that is where the server-side
+	// skip matters; a multi-iteration app may re-apply a server-pruned field in a
+	// later wave, an idempotent server-side-apply no-op.
+	var ssd *differ
+	if opts.ServerSide {
+		// stripLabel=false: this drives the apply set, so an unlabeled-but-matching
+		// resource must read as modified to be applied and thereby adopted.
+		d, cleanup, err := e.newDiffer(true, false)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		ssd = d
+	}
 	for {
 		live, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 		if err != nil {
 			return results, fmt.Errorf("reading live state of %q: %w", app, err)
 		}
 		recRes := sync.Reconcile(target, live, opts.Namespace, e.clusterCache)
-		diffRes, err := diff.DiffArray(recRes.Target, recRes.Live, diff.WithLogr(e.log))
+		var diffRes *diff.DiffResultList
+		if firstReconcile && ssd != nil {
+			diffRes, err = ssd.diffArray(recRes.Target, recRes.Live)
+		} else {
+			diffRes, err = diff.DiffArray(recRes.Target, recRes.Live, diff.WithLogr(e.log))
+		}
 		if err != nil {
 			return results, fmt.Errorf("diffing %q: %w", app, err)
 		}

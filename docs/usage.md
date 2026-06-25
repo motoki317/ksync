@@ -345,6 +345,7 @@ rebuilds automatically with no prompt. Stop with Ctrl-C.
 | `-max-parallel` | CPU cores | Concurrent builds, and separately concurrent deploys (independent budgets). Also bounds an app's concurrent image builds. `0` = unlimited. |
 | `-prune` | `true` | Delete tracked resources removed from the files. |
 | `-timeout` | `5m` | Max wait for an app to become healthy before retrying. `0` = no limit. |
+| `-client-diff` | `false` | Decide the apply set with the client-side diff instead of a server-side dry-run apply. Faster, but a field the cluster defaults or prunes is re-applied on every sync. |
 | `-v` | `false` | Log every detected file change. |
 
 ### `ksync sync`
@@ -372,7 +373,13 @@ ksync sync --force sistema    # scoped to just that app
 
 Referenced namespaces an app does not own are created if missing — untracked, so prune ignores them.
 
-Flags: `-timeout`, `-max-parallel`, `-v` (as `watch`), plus `--force` and
+The apply set is decided **server-side** by default — a dry-run server-side apply on the first
+reconcile, so a field the apiserver defaults or prunes is not re-applied on every sync (the same
+strategy `ksync diff` previews). `--client-diff` decides it with the in-process client-side diff
+instead: faster (no dry-run), but such a field is re-applied each sync (a harmless server-side-apply
+no-op). The dry-run runs once per app per sync, not on the health-wait polls.
+
+Flags: `-timeout`, `-max-parallel`, `-v` (as `watch`), plus `--force`, `--client-diff`, and
 `--image`/`KSYNC_IMAGE_OVERRIDES`. `-max-parallel` defaults to CPU cores, which saturates the
 CPU-bound render; raise it only when builds and health waits dominate.
 
@@ -436,7 +443,40 @@ ksync destroy -yes shop
 
 ### `ksync diff`
 
-Not implemented. Planned: show local-vs-cluster differences without applying.
+Renders the selected apps and prints a per-resource unified YAML diff against live cluster state —
+what a sync would create, update, or prune. Read-only: no apply, no build, no hooks. Output goes to
+stdout.
+
+```bash
+ksync diff            # all apps
+ksync diff shop api-b
+```
+
+- Uses sync's own pipeline (tracking label, default namespace, reconcile, the same diff engine), so a
+  reported change is one a sync would apply.
+- Server-managed and ksync-bookkeeping fields (`managedFields`, `status`, `resourceVersion`, the
+  tracking label, …) are stripped; only the authored change shows.
+- Secret values are masked (distinct values get distinct-length masks, so a value-only change still
+  reports as an update — `password: ++++++++` ⟶ `password: ++++++++++++` — without exposing the value).
+- `--prune` (default true) includes resources a sync would delete. `--image IMAGE=REF` (also via
+  `KSYNC_IMAGE_OVERRIDES`) diffs as if that pre-built image were deployed, as on `sync`.
+- Renders against the cluster by default; `--offline-render` renders offline. `-max-parallel` bounds
+  concurrency.
+
+`build:` images are not rebuilt. When the cluster runs one at a ksync dev tag (`ksync-<hash>`), that
+tag is carried forward so its per-build churn does not show; the diff then reflects the currently
+deployed image, not an unbuilt source edit. An image at any other tag (no live image yet, or a
+foreign tag) is shown at its source ref, and a note warns that ref is not what a sync deploys — sync
+rebuilds to a fresh dev tag.
+
+By default the diff is computed **server-side**: a dry-run server-side apply asks the cluster for the
+predicted result, so a field the apiserver defaults or prunes (a StatefulSet `maxUnavailable` behind a
+disabled feature gate) is not reported as drift. `--client-diff` uses the in-process client-side
+three-way merge instead — faster, but it cannot know the apiserver will drop a field, so such a field
+shows as a perpetual change. A resource whose dry-run fails (a webhook, RBAC, a field-manager
+conflict) falls back to client-side for that resource alone. Server-side is the more faithful preview,
+but being faithful it also surfaces changes the client-side merge hides (a field SSA would remove that
+the manifest does not declare).
 
 ## Tracking and prune
 
@@ -485,6 +525,13 @@ directories), run `ksync sync`.
 **First install of a chart that ships CRDs fails for its custom resources**
 The cluster needs a moment to activate a new CRD applied in the same pass. It self-heals: `watch`
 retries, or run `ksync sync` again.
+
+**`cluster cannot map X (Y)`**
+Live render (the default) asks the cluster to map every rendered kind. A custom resource whose CRD is
+not yet installed (commonly one from a separate base layer) fails on a fresh cluster; the same error
+also appears for a built-in apiVersion the cluster does not serve. Install the CRD first (apply the
+base layer) if it is a custom resource, or render offline with `--offline-render` (helm `lookup`
+results will be empty).
 
 **The same resources re-apply on every sync**
 Some charts render fresh content each time (commonly a self-signed webhook certificate). ksync applies

@@ -267,6 +267,7 @@ func runSync(args []string) error {
 	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	clientDiff := fs.Bool("client-diff", false, "decide the apply set with the in-process (client-side) diff instead of a server-side dry-run apply; faster, but fields the cluster defaults or prunes are re-applied every sync")
 	var images stringSlice
 	fs.Var(&images, "image", "deploy a pre-built image instead of building it: IMAGE=REF (repeatable; also via "+overrideEnv+")")
 	kctx := contextFlag(fs)
@@ -349,7 +350,7 @@ func runSync(args []string) error {
 			prog.finish(app.Name, nil)
 			return fmt.Errorf("app %s: build failed: %w", app.Name, bo.err)
 		}
-		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, overrides, lookup, *prune, *force, *timeout)
+		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, overrides, lookup, *prune, *force, !*clientDiff, *timeout)
 		if err != nil {
 			prog.finish(app.Name, nil) // remove the live group; the error is returned and printed at the top level
 			return err
@@ -469,7 +470,7 @@ func startEagerBuilds(ctx context.Context, apps []config.App, buildFn loop.Build
 // reference images that exist. The deploy row lands in the app's pipeline; the
 // caller commits it after tallying so the live footer's count tracks the
 // committed lines.
-func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, overrides map[string]render.Image, lookup func(string) (string, bool), prune, force bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
+func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, overrides map[string]render.Image, lookup func(string) (string, bool), prune, force, serverSide bool, timeout time.Duration) ([]common.ResourceSyncResult, []string, error) {
 	images := make([]render.Image, 0, len(app.Build))
 	for j := range app.Build {
 		if ov, ok := overrides[app.Build[j].Image]; ok {
@@ -496,7 +497,7 @@ func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog
 	deploy.Start()
 	syncCtx, cancel := withTimeout(ctx, timeout)
 	defer cancel()
-	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Force: force, Namespace: app.Namespace, OnWait: deployWait(deploy)})
+	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Force: force, Namespace: app.Namespace, ServerSide: serverSide, OnWait: deployWait(deploy)})
 	deploy.Done(err)
 	if err != nil {
 		// On a health-gate timeout, dump what wedged the sync. ctx is the parent
@@ -641,6 +642,7 @@ func runWatch(args []string) error {
 	auto := fs.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
 	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
 	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	clientDiff := fs.Bool("client-diff", false, "decide the apply set with the in-process (client-side) diff instead of a server-side dry-run apply; faster, but fields the cluster defaults or prunes are re-applied on every sync")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -698,7 +700,7 @@ func runWatch(args []string) error {
 		defer cancel()
 		deploy := prog.pipeline(app).Deploy()
 		deploy.Start()
-		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], OnWait: deployWait(deploy)})
+		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], ServerSide: !*clientDiff, OnWait: deployWait(deploy)})
 		deploy.Done(err)
 		stats := syncStats(results)
 		if err == nil {
