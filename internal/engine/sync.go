@@ -530,7 +530,7 @@ func createNamespaceIfMissing(_, live *unstructured.Unstructured) (bool, error) 
 // ensureReferencedNamespaces creates every distinct namespace the target
 // resources live in, except the app's own (own, handled by gitops-engine's
 // namespace modifier) and the cluster scope (""). It exists for multi-namespace
-// apps — e.g. argo-workflows fans workflow RBAC out across the app namespaces —
+// apps — e.g. a controller that fans RBAC out across the app namespaces —
 // which gitops-engine would otherwise fail to apply on a fresh cluster, since it
 // only auto-creates the single destination namespace. Namespaces are created
 // bare (no tracking label), so they are never pruned and the app that owns one

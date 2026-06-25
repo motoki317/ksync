@@ -40,8 +40,9 @@ invocation:
 - M2's image-tag injection can run as an in-process `images` transformer on the rendered
   result instead of mutating overlay files on disk. It honors the kustomization's
   `configurations:` image field specs in addition to the builtin ones, so a dev tag reaches
-  CRD-embedded image paths (e.g. an argo WorkflowTemplate) exactly as `kustomize build` would
-  for the same config — the reference manifests rely on this for the linear-workflow CRDs.
+  CRD-embedded image paths (e.g. a custom resource with a nested container image) exactly as
+  `kustomize build` would for the same config — the reference manifests rely on this for CRDs
+  whose image fields sit at non-standard paths.
 - Any drift between the pinned module and the reference binary fails CI-visible tests
   immediately.
 

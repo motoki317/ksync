@@ -89,7 +89,7 @@ func matchTarget(rs []*resource.Resource, t config.PatchTarget) []*resource.Reso
 }
 
 // targetString renders a patch target for error messages, e.g.
-// "argoproj.io/v1alpha1/WorkflowTemplate/load-crawled-facility in shop".
+// "example.com/v1/Pipeline/data-job in shop".
 func targetString(t config.PatchTarget) string {
 	id := t.Kind
 	if gv := strings.Trim(t.Group+"/"+t.Version, "/"); gv != "" {

@@ -32,8 +32,8 @@ type Image = types.Image
 //
 // A kustomization may extend these through its `configurations:` files (see
 // configImageFieldSpecs); SetImages appends those so a built image is rewritten
-// at non-standard paths too — e.g. an argo WorkflowTemplate's
-// spec/templates/container/image — matching kustomize's own images transformer.
+// at non-standard paths too — e.g. a CRD's spec/templates/container/image —
+// matching kustomize's own images transformer.
 var imageFieldSpecs = types.FsSlice{
 	{Path: "spec/containers[]/image", CreateIfNotPresent: true},
 	{Path: "spec/initContainers[]/image", CreateIfNotPresent: true},
@@ -78,7 +78,8 @@ func (res *Result) YAML() ([]byte, error) {
 // how locally built dev tags are injected before sync.
 func (res *Result) SetImages(images []Image) error {
 	// Builtin specs plus whatever the kustomization's `configurations:` add, so
-	// CRD-embedded image paths (e.g. argo WorkflowTemplate) are rewritten too.
+	// CRD-embedded image paths (e.g. a custom resource with a nested container
+	// image) are rewritten too.
 	fieldSpecs := imageFieldSpecs
 	if len(res.extraImageFieldSpecs) > 0 {
 		fieldSpecs = append(append(types.FsSlice{}, imageFieldSpecs...), res.extraImageFieldSpecs...)
@@ -224,7 +225,7 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 // configImageFieldSpecs returns the image field specs the kustomization at dir
 // declares through its `configurations:` files — the mechanism kustomize's
 // images transformer uses to reach image fields the builtin specs miss, such as
-// an argo WorkflowTemplate's spec/templates/container/image. SetImages appends
+// a CRD's spec/templates/container/image. SetImages appends
 // them so locally built dev tags are injected there too, keeping parity with
 // `kustomize build` on the same kustomization.
 //

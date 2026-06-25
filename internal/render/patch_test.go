@@ -22,29 +22,29 @@ func constLookup(m map[string]string) func(string) (string, bool) {
 	return func(n string) (string, bool) { v, ok := m[n]; return v, ok }
 }
 
-// cacheHostPath reads the cache-app Deployment's download-cache hostPath from
-// the rendered Objects slice — the one sync applies, so it is what must change.
+// cacheHostPath reads the cache Deployment's cache-vol hostPath from the rendered
+// Objects slice — the one sync applies, so it is what must change.
 func cacheHostPath(t *testing.T, res *Result) string {
 	t.Helper()
 	for _, o := range res.Objects {
-		if o.GetKind() != "Deployment" || o.GetName() != "cache-app" {
+		if o.GetKind() != "Deployment" || o.GetName() != "cache" {
 			continue
 		}
 		vols, _, _ := unstructured.NestedSlice(o.Object, "spec", "template", "spec", "volumes")
 		for _, v := range vols {
 			m, _ := v.(map[string]any)
-			if m["name"] == "download-cache" {
+			if m["name"] == "cache-vol" {
 				hp, _ := m["hostPath"].(map[string]any)
 				return hp["path"].(string)
 			}
 		}
 	}
-	t.Fatal("cache-app download-cache hostPath not found")
+	t.Fatal("cache cache-vol hostPath not found")
 	return ""
 }
 
 func cacheAppTarget() config.PatchTarget {
-	return config.PatchTarget{Group: "apps", Version: "v1", Kind: "Deployment", Name: "cache-app", Namespace: "team-a"}
+	return config.PatchTarget{Group: "apps", Version: "v1", Kind: "Deployment", Name: "cache", Namespace: "team-a"}
 }
 
 // A patch rewrites the targeted hostPath, expanding ${KSYNC_WORKDIR}, and the
@@ -132,7 +132,7 @@ func TestApplyPatches_TestOpPasses(t *testing.T) {
 		Target: cacheAppTarget(),
 		Patch: `- op: test
   path: /spec/template/spec/volumes/0/name
-  value: download-cache
+  value: cache-vol
 - op: replace
   path: /spec/template/spec/volumes/0/hostPath/path
   value: /applied`,

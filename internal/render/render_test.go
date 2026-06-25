@@ -201,9 +201,9 @@ func TestSetImages_Digest(t *testing.T) {
 
 // SetImages honors image field specs the kustomization adds through
 // `configurations:`, so a built image is rewritten at a path the builtin specs
-// miss — here an argo WorkflowTemplate's spec/templates[].container.image — while
-// a builtin Deployment path is still rewritten and an unrelated image is left
-// alone. This is the parity that lets dev tags reach CRD-embedded images.
+// miss — here a Pipeline CRD's spec/templates[].container.image — while a builtin
+// Deployment path is still rewritten and an unrelated image is left alone. This is
+// the parity that lets dev tags reach CRD-embedded images.
 func TestSetImages_ConfigurationsFieldSpec(t *testing.T) {
 	res, err := New(Options{}).Render("testdata/configimages")
 	if err != nil {
@@ -220,10 +220,10 @@ func TestSetImages_ConfigurationsFieldSpec(t *testing.T) {
 		t.Errorf("Deployment image = %q, want %q (builtin field spec)", got, want)
 	}
 
-	wf := findObject(t, res.Objects, "WorkflowTemplate", "api-b-job")
+	wf := findObject(t, res.Objects, "Pipeline", "api-b-job")
 	templates, found, err := unstructured.NestedSlice(wf.Object, "spec", "templates")
 	if err != nil || !found {
-		t.Fatalf("WorkflowTemplate templates: found=%v err=%v", found, err)
+		t.Fatalf("Pipeline templates: found=%v err=%v", found, err)
 	}
 	image := func(tmpl any) string {
 		c, _ := tmpl.(map[string]any)["container"].(map[string]any)
@@ -231,10 +231,10 @@ func TestSetImages_ConfigurationsFieldSpec(t *testing.T) {
 		return s
 	}
 	if got := image(templates[0]); got != want {
-		t.Errorf("WorkflowTemplate matched image = %q, want %q (configurations: field spec)", got, want)
+		t.Errorf("Pipeline matched image = %q, want %q (configurations: field spec)", got, want)
 	}
 	if got := image(templates[1]); got != "example.com/shop/proxy:v1" {
-		t.Errorf("unrelated WorkflowTemplate image = %q, must stay untouched", got)
+		t.Errorf("unrelated Pipeline image = %q, must stay untouched", got)
 	}
 }
 

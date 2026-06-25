@@ -1,6 +1,6 @@
-# Extends the images transformer to the argo WorkflowTemplate CRD image path,
-# which the builtin field specs do not cover. `templates` is a list; the field
-# spec walker iterates it without a `[]` suffix (it descends real sequences).
+# Extends the images transformer to a CRD's nested image path, which the builtin
+# field specs do not cover. `templates` is a list; the field spec walker iterates
+# it without a `[]` suffix (it descends real sequences).
 images:
-  - kind: WorkflowTemplate
+  - kind: Pipeline
     path: spec/templates/container/image
