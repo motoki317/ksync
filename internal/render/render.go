@@ -208,7 +208,7 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 	// per-call state is what lets one Renderer serve parallel app renders.
 	resMap, err := krusty.MakeKustomizer(kOpts).Run(filesys.MakeFsOnDisk(), dir)
 	if err != nil {
-		return nil, fmt.Errorf("rendering %s: %w", dir, err)
+		return nil, fmt.Errorf("rendering %s: %w", dir, cleanRenderError(err))
 	}
 
 	objs, err := objectsFromResMap(resMap)
