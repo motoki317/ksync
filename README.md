@@ -9,8 +9,8 @@ Think of it as ArgoCD pointed at local files instead of git, or `helmfile apply`
 watch loop. It is a development tool only: no server or UI, no production deploys (use a GitOps
 controller), and no file-sync into running containers (use mirrord or Telepresence).
 
-> **Status: core loop and native builds working.** `watch`, `sync`, `render`, `images`, and
-> `destroy` are implemented. Not yet done: `diff`, exec-plugin (e.g. ksops) rendering, and
+> **Status: core loop and native builds working.** `watch`, `sync`, `diff`, `render`, `images`,
+> and `destroy` are implemented. Not yet done: exec-plugin (e.g. ksops) rendering and
 > hook-semantics conformance fixtures.
 
 ## Quickstart

@@ -50,7 +50,7 @@ var subcommands = []struct {
 }{
 	{"watch", "watch app directories and render/diff/apply on change (the main loop)", runWatch},
 	{"sync", "render and sync the given apps once", runSync},
-	{"diff", "render and show the diff against live cluster state", nil},
+	{"diff", "render and show the diff against live cluster state", runDiff},
 	{"render", "render the given apps to stdout", runRender},
 	{"images", "list the container images the given apps deploy (canonical refs, for cache scoping)", runImages},
 	{"destroy", "delete all tracked resources of the given apps", runDestroy},
