@@ -54,6 +54,17 @@ var subcommands = []struct {
 	{"render", "render the given apps to stdout", runRender},
 	{"images", "list the container images the given apps deploy (canonical refs, for cache scoping)", runImages},
 	{"destroy", "delete all tracked resources of the given apps", runDestroy},
+	{"version", "print the ksync version", runVersion},
+}
+
+// version is the build version, stamped at release time via
+// -ldflags "-X main.version=...". goreleaser and the Nix flake both set it; a
+// plain `go build` from source keeps "dev".
+var version = "dev"
+
+func runVersion([]string) error {
+	fmt.Println(version)
+	return nil
 }
 
 func main() {
