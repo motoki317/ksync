@@ -13,6 +13,27 @@ controller), and no file-sync into running containers (use mirrord or Telepresen
 > and `destroy` are implemented. Not yet done: exec-plugin (e.g. ksops) rendering and
 > hook-semantics conformance fixtures.
 
+## Install
+
+- **Nix** (flakes enabled): run it directly with `nix run github:motoki317/ksync -- <command>`, or
+  add it to a project's devShell:
+
+  ```nix
+  # flake.nix
+  inputs.ksync.url = "github:motoki317/ksync";
+  # then, in your devShell's packages:
+  #   inputs.ksync.packages.${system}.default
+  ```
+
+  Don't set `inputs.ksync.inputs.nixpkgs.follows` — pinning ksync to your nixpkgs rebuilds it from
+  source instead of substituting the prebuilt binary from its cache.
+
+- **Binary**: download the archive for your platform from the
+  [latest release](https://github.com/motoki317/ksync/releases) and put `ksync` on your `PATH`.
+
+ksync shells out to `helm` to inflate `helmCharts` during render, so `helm` must be on `PATH`; the
+Nix devShell bundles it.
+
 ## Quickstart
 
 Declare your apps in `ksync.yaml`:
