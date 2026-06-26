@@ -1,0 +1,28 @@
+# App release: pushing a vX.Y.Z tag publishes a GitHub Release (cross-platform
+# binaries + changelog) via GoReleaser (.goreleaser.yaml). The Nix flake
+# (`nix run github:motoki317/ksync`) is the other supported install path.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history so the changelog spans since the previous tag
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

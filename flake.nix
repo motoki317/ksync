@@ -1,6 +1,11 @@
 {
   description = "ksync — local-development sync loop for Kubernetes (watch local kustomize dirs; render/diff/apply with ArgoCD-parity semantics)";
 
+  nixConfig = {
+    extra-substituters = [ "https://motoki317-ksync.cachix.org" ];
+    extra-trusted-public-keys = [ "motoki317-ksync.cachix.org-1:uDM0RWapTkolNEgkcqQIGpmJc3bumFf+y3RYj50jQA0=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
@@ -89,7 +94,7 @@
             proxyVendor = true;
             vendorHash = "sha256-BjCcLbrZnoPtS+hGmLKSgZ5RT0t1S/AYeWoX4MbVk4Q=";
             subPackages = [ "cmd/ksync" ];
-            ldflags = [ "-s" "-w" ];
+            ldflags = [ "-s" "-w" "-X main.version=${version}" ];
             env.CGO_ENABLED = 0;
 
             meta = {

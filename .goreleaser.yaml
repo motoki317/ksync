@@ -1,0 +1,47 @@
+# GoReleaser builds the cross-platform release binaries on a `v*` tag push
+# (see .github/workflows/release.yaml). The Nix flake (`nix run github:motoki317/ksync`)
+# is the other supported install path; this one is for users without Nix.
+version: 2
+
+project_name: ksync
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: ksync
+    main: ./cmd/ksync
+    binary: ksync
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    # Stamp main.version to match the Nix flake's ldflags; keep the binary lean.
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  github:
+    owner: motoki317
+    name: ksync
