@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: badimage
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: badimage }
+  template:
+    metadata:
+      labels: { app: badimage }
+    spec:
+      containers:
+        - name: app
+          image: registry.invalid/does-not-exist:nope

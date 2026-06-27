@@ -147,10 +147,28 @@ re-litigate only with new evidence):
   non-hook resource is Healthy (or `--timeout`), so a completed `Sync` means deployed-and-healthy
   and a `needs` edge waits for the dependency to actually serve (ADR 20260614-sync-health-gate);
   while waiting, `OnWait` reports the not-yet-ready resources (`[]ResourceStatus`, UI-neutral) so the
-  live deploy line can name them, and on `--timeout` it returns a typed `TimeoutError` and
-  `Diagnose` gathers a **bounded** dump — each unhealthy resource's events plus the related pods
-  (found via the cache's `IterateHierarchyV2` ownership walk) with container state and current/
-  previous log tails (ADR 20260623-sync-timeout-diagnostics). A
+  live deploy line can name them. The health-gate/apply loops split `ctx.Err()`: only the app's own
+  `--timeout` (`DeadlineExceeded`) is a typed `TimeoutError`; a Ctrl-C or a sibling app's failure
+  aborting the run (`Canceled`) returns the cancellation, which the command maps to `ksync:
+  interrupted` + exit 130 (not the raw error). `Diagnose` (`diagnose.go`) gathers a **bounded,
+  actionable** dump on a real timeout, **and on a user Ctrl-C of a one-shot `sync`** (the usual way to
+  abandon a wedged deploy — `cmd`'s `reportSyncDiagnostics`/`shouldDiagnose`, gated on `userInterrupted`
+  = the **signal** ctx being cancelled, *not* the app's own ctx; a sibling-abort cancels this app too
+  but `userInterrupted` is false then, so the aborted-but-progressing app stays quiet while the failed
+  sibling reports its own error). `Diagnose` self-selects the still-unhealthy resources, so an app
+  merely mid-rollout prints nothing, and `watch` skips the dump on its routine Ctrl-C quit (ADR
+  20260627-actionable-diagnostics). The gather runs on a **fresh `context.Background()`** (never the
+  just-cancelled sync ctx, which returned only `context canceled`), so a second Ctrl-C still
+  force-quits before it finishes: each unhealthy resource plus the related pods (found via the cache's
+  `IterateHierarchyV2` ownership walk). The dump is kept terse — events filtered to **warnings** then
+  deduped (per reason, the most-informative kept; the redundant `BackOff` dropped), identical replica
+  pods **collapsed** to one representative `+N`; both bounds name what they drop, never silently —
+  distinct modes past the display cap as `+N more distinct failure modes`, related pods past the
+  `diagMaxPodScan` work cap (each costs a live get/event-list/log-stream) as `+N related pods not
+  inspected`; one log stream per pod (previous run for a crashed container, kubelet placeholder
+  filtered), and a container's **last-termination** appended to its waiting state so a CrashLoopBackOff
+  names its real exit code / OOMKill (ADRs 20260623-sync-timeout-diagnostics,
+  20260627-actionable-diagnostics; live fixtures in `testdata/diagnostics/`). A
   no-diff sync skips hooks, **except** a currently-Degraded hook (re-run so a transiently-failed
   PostSync Job self-heals) or `--force` (re-run every hook, ArgoCD manual-sync parity; ADR
   20260616-hook-rerun-on-failure). `serverdiff.go` is the **diff strategy** shared by `Diff` and

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -81,9 +82,14 @@ func (r ResourceStatus) key() kube.ResourceKey {
 func (r ResourceStatus) ShortName() string { return r.Kind + "/" + r.Name }
 
 // Line is the full "group/Kind/ns/name: Status — message" detail line used in
-// the timeout error and the diagnostics header.
+// the timeout error and the diagnostics header. With no Status (an intermediate
+// controller surfaced only for its events, with no health verdict of its own) it
+// is just the identity.
 func (r ResourceStatus) Line() string {
 	k := r.key()
+	if r.Status == "" {
+		return k.String()
+	}
 	line := k.String() + ": " + r.Status
 	if r.Message != "" {
 		line += " — " + r.Message
@@ -259,7 +265,7 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 			// A health-gated wave or a hook waiting on a stuck workload
 			// (ErrImagePull, CrashLoop) holds the operation here until the
 			// deadline; name the resource the sync is stuck on.
-			return results, e.timeoutError(app, target, isManaged)
+			return results, notConverged(ctx, e.timeoutError(app, target, isManaged))
 		case <-time.After(operationRefresh):
 		}
 	}
@@ -283,7 +289,7 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		}
 		select {
 		case <-ctx.Done():
-			return results, notHealthyError(app, pending)
+			return results, notConverged(ctx, notHealthyError(app, pending))
 		case <-time.After(operationRefresh):
 		}
 	}
@@ -326,6 +332,20 @@ func (e *Engine) timeoutError(app string, target []*unstructured.Unstructured, i
 // message and, via errors.As, gather a diagnostic dump for them.
 func notHealthyError(app string, pending []ResourceStatus) error {
 	return &TimeoutError{App: app, Pending: pending}
+}
+
+// notConverged maps a ctx-cancelled wait to its error. Only the app's own
+// deadline (DeadlineExceeded) is a real timeout — a *TimeoutError carrying the
+// pending resources so the command layer gathers a diagnostic dump. Any other
+// cause (the parent cancelled by Ctrl-C, or a sibling app's failure aborting the
+// run) returns the cancellation itself, so the command layer reports a clean
+// interrupt instead of a misleading "timed out" with diagnostics read against an
+// already-dead context.
+func notConverged(ctx context.Context, timeoutErr error) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return timeoutErr
+	}
+	return ctx.Err()
 }
 
 // pendingHealth returns one entry per non-hook target resource that has not yet

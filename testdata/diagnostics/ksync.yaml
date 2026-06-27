@@ -1,0 +1,33 @@
+allowedContexts:
+  - docker-desktop
+apps:
+  - name: crashloop
+    path: crashloop
+    namespace: diag-crashloop
+  - name: badimage
+    path: badimage
+    namespace: diag-badimage
+  - name: unschedulable
+    path: unschedulable
+    namespace: diag-unschedulable
+  - name: badconfig
+    path: badconfig
+    namespace: diag-badconfig
+  - name: readiness
+    path: readiness
+    namespace: diag-readiness
+  - name: oom
+    path: oom
+    namespace: diag-oom
+  - name: jobfail
+    path: jobfail
+    namespace: diag-jobfail
+  - name: initfail
+    path: initfail
+    namespace: diag-initfail
+  - name: multicontainer
+    path: multicontainer
+    namespace: diag-multicontainer
+  - name: quota
+    path: quota
+    namespace: diag-quota
