@@ -37,7 +37,11 @@ re-litigate only with new evidence):
 ## Repo at a glance
 
 - `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / images / destroy /
-  diff` implemented). `diff.go` is the **`ksync diff`** command: the read-only preview of `sync` —
+  diff` implemented). `signalContext` is the shared interrupt handler all entry points use: the
+  first Ctrl-C cancels the context (graceful), the second `os.Exit(130)`s — so a non-context-aware
+  step (engine.New's warm-cache LIST, render) can always be force-quit instead of swallowing every
+  signal until it returns (ADR 20260627-double-signal-force-quit). `diff.go` is the **`ksync diff`**
+  command: the read-only preview of `sync` —
   per-resource unified YAML diff against live, build-tag carry-forward, secret masking (ADR
   20260625-diff-command). `diff` and `sync`/`watch` default to a **server-side dry-run diff** (the
   apiserver's predicted post-apply object, so a field the cluster defaults or prunes is not seen as

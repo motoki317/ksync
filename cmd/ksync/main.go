@@ -42,6 +42,31 @@ import (
 // in watch mode the scheduler then retries with backoff.
 const defaultSyncTimeout = 5 * time.Minute
 
+// signalContext returns a context canceled on the first SIGINT/SIGTERM, and
+// hard-exits the process on the second. signal.NotifyContext alone is unsafe
+// here: registering it disables Go's default-terminate, yet several steps a
+// command runs are not ctx-aware — the warm-cache LIST in engine.New
+// (gitops-engine EnsureSynced, seconds on a large cluster) and kustomize/helm
+// render. A SIGINT during one of those is recorded but ignored, and so is every
+// SIGINT after it, so the user cannot force-quit until the blocking step returns
+// on its own. The second signal therefore os.Exit(130)s unconditionally; the
+// blocking windows are all in cooked mode (the build picker handles its own
+// raw-mode Ctrl-C and restores the terminal), so a force-quit leaves no terminal
+// state broken. The returned cancel doubles as the watch picker's quit hook.
+func signalContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sig := make(chan os.Signal, 2)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr, "\ninterrupt received; press Ctrl-C again to force quit")
+		cancel()
+		<-sig
+		os.Exit(130)
+	}()
+	return ctx, cancel
+}
+
 // The Milestone 1 CLI surface. Commands without an implementation yet are
 // stubs; listing them all from day one fixes the command names early.
 var subcommands = []struct {
@@ -296,7 +321,7 @@ func runSync(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalContext()
 	defer stop()
 
 	appLog, engineLog := setupLogging(*verbose)
@@ -675,12 +700,9 @@ func runWatch(args []string) error {
 		return err
 	}
 
-	// A cancelable context derived from the signal context, so the confirmation
-	// picker can quit the run on Ctrl-C (in raw mode the terminal delivers no
-	// SIGINT, so the picker calls cancel itself).
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ctx, cancel := context.WithCancel(sigCtx)
+	// signalContext's cancel doubles as the confirmation picker's quit hook: in
+	// raw mode the terminal delivers no SIGINT, so the picker calls cancel itself.
+	ctx, cancel := signalContext()
 	defer cancel()
 
 	log, engineLog := setupLogging(*verbose)
@@ -1126,7 +1148,7 @@ func runDestroy(args []string) error {
 	apps = config.SortByNeeds(apps)
 	slices.Reverse(apps)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalContext()
 	defer stop()
 
 	_, engineLog := setupLogging(false)

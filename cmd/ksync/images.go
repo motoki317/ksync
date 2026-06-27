@@ -5,11 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/distribution/reference"
 	corev1 "k8s.io/api/core/v1"
@@ -106,7 +104,7 @@ func runImages(args []string) error {
 	}
 
 	if *live {
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, stop := signalContext()
 		defer stop()
 		if err := addLiveImages(ctx, kubeContext, namespaces, images); err != nil {
 			return err
