@@ -517,6 +517,27 @@ func isGlob(s string) bool {
 	return strings.ContainsAny(s, "*?[")
 }
 
+// MatchedViaGlob reports whether name is allowed only through a glob pattern (no
+// AllowedContexts entry equals it exactly). The command layer warns on this so a
+// --context resolved by pattern — the per-worktree microVM case (k3s-*) — names
+// the cluster it actually acted on, rather than silently matching.
+func (c *Config) MatchedViaGlob(name string) bool {
+	for _, pat := range c.AllowedContexts {
+		if pat == name {
+			return false
+		}
+	}
+	for _, pat := range c.AllowedContexts {
+		if !isGlob(pat) {
+			continue
+		}
+		if ok, _ := path.Match(pat, name); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Config) Select(names []string) ([]App, error) {
 	if len(names) == 0 {
 		return c.Apps, nil

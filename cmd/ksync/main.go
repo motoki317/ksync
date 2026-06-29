@@ -211,7 +211,17 @@ func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, []string, erro
 // (see config.SelectContext); an ambiguous allowlist with no --context is refused
 // rather than guessed.
 func resolveContext(cfg *config.Config, override string) (string, error) {
-	return cfg.SelectContext(override)
+	kubeContext, err := cfg.SelectContext(override)
+	if err != nil {
+		return "", err
+	}
+	// A --context resolved by glob (not an exact allowlist entry) names the
+	// cluster it matched, so a per-worktree pattern like k3s-* never acts on a
+	// surprise cluster silently.
+	if cfg.MatchedViaGlob(kubeContext) {
+		fmt.Fprintf(os.Stderr, "ksync: context %q matched a glob in allowedContexts\n", kubeContext)
+	}
+	return kubeContext, nil
 }
 
 // renderContext resolves the context for a render-only command, or "" when the
@@ -779,6 +789,15 @@ func excludedNeedsNote(selected []config.App, names []string) string {
 	return fmt.Sprintf("note: not syncing dependencies %s (not selected); assuming they are already deployed", strings.Join(missing, ", "))
 }
 
+// appNames returns the apps' names in order, for scope and confirmation lines.
+func appNames(apps []config.App) []string {
+	names := make([]string, len(apps))
+	for i, a := range apps {
+		names[i] = a.Name
+	}
+	return names
+}
+
 // runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
 // app only once every app it needs has finished. apps must be topologically
 // sorted (config.SortByNeeds). It returns the first error and, on any error,
@@ -1313,12 +1332,11 @@ func runDestroy(args []string) error {
 		return err
 	}
 	if !*yes {
-		all := make([]string, len(apps))
-		for i, a := range apps {
-			all[i] = a.Name
-		}
-		return fmt.Errorf("destroy deletes every tracked resource of: %s — re-run with -yes to confirm", strings.Join(all, ", "))
+		return fmt.Errorf("destroy deletes every tracked resource of: %s — re-run with -yes to confirm", strings.Join(appNames(apps), ", "))
 	}
+	// Always echo the scope: a bare `destroy -yes` (no app names) deletes every
+	// app, so the user must see what is about to go and on which cluster.
+	fmt.Fprintf(os.Stderr, "destroying %d app(s) on context %s: %s\n", len(apps), kubeContext, strings.Join(appNames(apps), ", "))
 	// Dependents go down before their dependencies.
 	apps = config.SortByNeeds(apps)
 	slices.Reverse(apps)

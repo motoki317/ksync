@@ -974,3 +974,17 @@ func mustWriteFile(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestMatchedViaGlob(t *testing.T) {
+	cfg := &Config{AllowedContexts: []string{"docker-desktop", "k3s-*"}}
+	cases := map[string]bool{
+		"docker-desktop": false, // exact entry
+		"k3s-abc":        true,  // only via glob
+		"unlisted":       false, // matches nothing
+	}
+	for name, want := range cases {
+		if got := cfg.MatchedViaGlob(name); got != want {
+			t.Errorf("MatchedViaGlob(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
