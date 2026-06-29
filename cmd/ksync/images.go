@@ -29,12 +29,12 @@ import (
 //
 // Images ksync builds locally (any `build:` entry's image) are excluded: those
 // are content-addressed dev tags that live only in the local store and are never
-// pulled, so caching them is pointless. With --live, images of running pods in
-// the apps' namespaces are added too, which is how operator-derived images (an
-// ECK Elasticsearch data image named only by spec.version) get covered.
+// pulled, so caching them is pointless. With --live, images of pods in the apps'
+// namespaces are added too, which is how operator-derived images (an ECK
+// Elasticsearch data image named only by spec.version) get covered.
 func runImages(args []string) error {
 	fs := newSubFlagSet("images")
-	live := fs.Bool("live", false, "also include images of running pods in the apps' namespaces (captures operator-derived images, e.g. ECK Elasticsearch, that rendered manifests never name)")
+	live := fs.Bool("live", false, "also include images of pods in the apps' namespaces (captures operator-derived images, e.g. ECK Elasticsearch, that rendered manifests never name)")
 	offline := offlineRenderFlag(fs)
 	maxParallel := maxParallelFlag(fs)
 	kctx := contextFlag(fs)
@@ -149,7 +149,7 @@ func collectNamespaces(into map[string]struct{}, objs []*unstructured.Unstructur
 	}
 }
 
-// addLiveImages adds the container images of running pods in the given
+// addLiveImages adds the container images of the pods in the given
 // namespaces. This catches images no manifest names because a controller
 // creates the pod (an ECK operator materializing an Elasticsearch's data image
 // from spec.version) — exactly the ones a render-only list misses.
