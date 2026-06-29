@@ -55,18 +55,32 @@ cachix push (which silently degrades every downstream `nix run`/`nix develop` to
      tree leaking a real cluster/namespace/ARN name.** (`just check` is the gofmt+vet gate;
      golangci-lint there is advisory `|| true` and does not block.)
    - `nix run nixpkgs#goreleaser -- check` — validates `.goreleaser.yaml`.
-   - **Dry-run the real pipeline against a LOCAL tag** — this is the highest-value gate and the one a
-     snapshot can't give you (snapshot skips the changelog). A local tag is fully reversible; only the
-     *push* is not:
+   - **Dry-run the real pipeline against a LOCAL tag.** A local tag is fully reversible; only the
+     *push* is not. The validation splits into build, archives, and changelog because of a quirk
+     below:
      ```bash
      git tag vX.Y.Z                         # local only — NOT pushed
      rm -rf dist
-     GITHUB_TOKEN="$(gh auth token)" nix run nixpkgs#goreleaser -- release --skip=publish --clean
-     # inspect dist/CHANGELOG.md, and an extracted binary's `ksync version` (= X.Y.Z)
+     # (a) build + version stamp, all 4 targets — stamps X.Y.Z from the local tag:
+     nix run nixpkgs#goreleaser -- build --clean
+     dist/ksync_darwin_arm64_v8.0/ksync version   # host-arch binary → X.Y.Z
+     # (b) archives + checksums — snapshot avoids the changelog compare (synthetic version):
+     nix run nixpkgs#goreleaser -- release --snapshot --skip=publish --clean
      git tag -d vX.Y.Z                      # remove the local tag before the real push
      ```
+     **Why not `goreleaser release --skip=publish` for the dry-run?** That worked for the *first* tag
+     only. With a previous tag present, the `use: github` changelog calls
+     `compare/vPREV...vX.Y.Z`, which **404s** because vX.Y.Z is not on GitHub yet — the dry-run dies
+     before archiving. And `--skip=changelog` is **not** a valid skip option in current GoReleaser
+     (valid: announce, archive, before, nfpm, nix, publish, sbom, sign, validate, …). So the changelog
+     cannot be exercised against a local tag; it generates correctly on the real push (both tags
+     remote). Preview it from git instead — GoReleaser groups Features/Bug fixes/Performance and drops
+     `docs`/`test`/`chore`/`ci` (scope-aware):
+     ```bash
+     for k in feat fix perf; do echo "## $k"; git log --pretty='%s' vPREV..HEAD | grep -E "^$k(\(.+\))?!?:"; done
+     ```
      If the tree is dirty with a yet-to-commit release change (e.g. a `.goreleaser.yaml` edit), add
-     `--skip=publish,validate` to bypass the clean-tree check for the dry-run only.
+     `--skip=validate` to bypass the clean-tree check for the snapshot run only.
 4. **Push `main`** so the tagged commit exists on the remote: `git push origin main`.
 5. **Create the lightweight tag on HEAD and push it** — *this is the public, hard-to-undo step.*
    Treat it like any outward-facing publish: do it only when the user has asked for the release (they
