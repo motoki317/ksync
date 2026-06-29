@@ -225,6 +225,25 @@ hook runs `just nix-build` ONLY when the commit touches `go.mod`/`go.sum`/`flake
 flake sets `proxyVendor`, pinning `vendorHash` to go.mod/go.sum alone). There is no pre-push
 hook; the guarantee lives at commit time so non-building commits never land in history.
 
+## Releases
+
+One track: pushing a `vX.Y.Z` git tag publishes the release. The runbook (gates, order, traps) is
+the `release` skill (`.claude/skills/release/SKILL.md`) — this is the summary.
+
+- The tag fires **two** workflows, both must go green: `release.yaml` (GoReleaser, `.goreleaser.yaml`)
+  builds the GitHub Release (linux/darwin × amd64/arm64 tarballs + grouped changelog);
+  `cachix.yaml` builds `.#ksync` on three runners and pushes to the `motoki317-ksync` cache so
+  `nix run github:motoki317/ksync` substitutes the binary.
+- **No version file to bump.** `main.version` defaults to `dev` and is stamped at build time —
+  GoReleaser from the tag (`-X main.version={{.Version}}`), the flake from `self.shortRev`. The tag
+  *is* the version; there is no source constant to edit.
+- A consequence of the two stampers: the GoReleaser binary's `ksync version` prints `X.Y.Z`, while
+  a `nix run github:motoki317/ksync/vX.Y.Z` build prints the git short-rev. Known, not a bug.
+- Changelog excludes (`docs`/`test`/`chore`/`ci`) are scope-aware (`^docs(\(.+\))?!?:`) so a scoped
+  `docs(readme):` is dropped like an unscoped `docs:`; the rest is grouped Features/Bug fixes/
+  Performance/Other. On the first tag (no previous tag) GoReleaser falls back from `use: github` to
+  `git` automatically.
+
 ## Conventions
 
 - Conventional Commits, **English**. Commit per coherent slice. Git ops ONLY when explicitly
