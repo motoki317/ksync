@@ -1353,18 +1353,34 @@ func runDestroy(args []string) error {
 
 	out := ui.NewColors(os.Stderr)
 	nameW := nameColWidth(apps)
+	return destroyApps(ctx, apps, *timeout,
+		func(ctx context.Context, app string, opts engine.SyncOptions) ([]common.ResourceSyncResult, error) {
+			return eng.Sync(ctx, app, nil, opts)
+		},
+		func(app string, results []common.ResourceSyncResult, took time.Duration) {
+			printSummary(os.Stderr, out, app, results, nil, took, nameW)
+		})
+}
+
+// destroySyncFunc is the slice of engine.Sync that destroyApps needs — narrowed
+// so the destroy flow is testable without a live cluster.
+type destroySyncFunc func(ctx context.Context, app string, opts engine.SyncOptions) ([]common.ResourceSyncResult, error)
+
+// destroyApps deletes each app's tracked resources by syncing it to an empty
+// target with prune, in the given order (the caller reverses needs order so a
+// dependent is removed before what it depends on). AllowEmpty is required: the
+// empty target is intentional here and would otherwise trip the empty-render
+// guard. It stops at the first failure so a wedged delete is not masked.
+func destroyApps(ctx context.Context, apps []config.App, timeout time.Duration, sync destroySyncFunc, report func(app string, results []common.ResourceSyncResult, took time.Duration)) error {
 	for _, app := range apps {
-		// Destroy is a sync to an empty target set: prune removes everything
-		// the tracking label scopes to this app, and nothing else. AllowEmpty
-		// opts past the empty-render guard — here the empty target is the intent.
-		syncCtx, cancel := withTimeout(ctx, *timeout)
+		syncCtx, cancel := withTimeout(ctx, timeout)
 		start := time.Now()
-		results, err := eng.Sync(syncCtx, app.Name, nil, engine.SyncOptions{Prune: true, AllowEmpty: true})
+		results, err := sync(syncCtx, app.Name, engine.SyncOptions{Prune: true, AllowEmpty: true})
 		cancel()
 		if err != nil {
 			return fmt.Errorf("app %s: destroy: %w", app.Name, err)
 		}
-		printSummary(os.Stderr, out, app.Name, results, nil, time.Since(start), nameW)
+		report(app.Name, results, time.Since(start))
 	}
 	return nil
 }
