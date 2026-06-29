@@ -38,7 +38,16 @@ import (
 // arrive via env vars, never interpolated into the script, so any value can
 // carry any character without becoming shell injection. ksync sets them in its
 // own process; kustomize's exec inherits them.
+//
+// KSYNC_HELM_UNAVAILABLE defers the "helm missing or cluster unreachable" error
+// to the moment kustomize actually inflates a chart: a pure-kustomize app never
+// execs this wrapper, so it renders with neither helm nor a reachable cluster.
 const helmLookupWrapper = `#!/bin/sh
+if [ -n "$KSYNC_HELM_UNAVAILABLE" ]; then
+	echo "ksync: cannot render helm charts: $KSYNC_HELM_UNAVAILABLE" >&2
+	echo "ksync: install helm and ensure the cluster is reachable, or pass --offline-render" >&2
+	exit 1
+fi
 if [ "$1" = "template" ]; then
 	shift
 	set -- "$@" --dry-run=server --take-ownership --kube-context "$KSYNC_KUBE_CONTEXT"
@@ -55,23 +64,15 @@ exec "$KSYNC_HELM" "$@"
 
 // setupHelmLookup writes the wrapper to a temp dir, points ksync's env at the
 // real helm and the given context, and returns the wrapper path to use as the
-// renderer's HelmCommand (plus a cleanup). Returns an error only if helm is
-// missing or the temp file cannot be written; callers fall back to offline
-// rendering by passing --offline-render.
+// renderer's HelmCommand (plus a cleanup).
+//
+// Missing helm or an unreachable cluster is NOT a setup failure: a pure-kustomize
+// app never execs the wrapper, so it must render without either. Instead the
+// failure reason is stashed in KSYNC_HELM_UNAVAILABLE, and the wrapper surfaces it
+// only if kustomize actually inflates a chart — deferring the error to where it
+// matters, rather than gating every render on helm and cluster connectivity.
+// Returns an error only if the temp files cannot be written.
 func setupHelmLookup(kubeContext string) (helmCommand string, cleanup func(), err error) {
-	helmPath, err := exec.LookPath("helm")
-	if err != nil {
-		return "", nil, fmt.Errorf("helm not found on PATH (needed to render charts against the cluster; use --offline-render to skip): %w", err)
-	}
-	// Discover the cluster's capabilities up front (once per command, not per
-	// render) so helm renders version-gated templates for the real target. Live
-	// render already requires cluster connectivity, so a discovery failure means
-	// the cluster is unreachable — surface it rather than render with wrong
-	// (static) capabilities.
-	apiVersions, kubeVersion, err := engine.DiscoverCapabilities(kubeContext)
-	if err != nil {
-		return "", nil, fmt.Errorf("reading cluster capabilities (use --offline-render to skip live rendering): %w", err)
-	}
 	dir, err := os.MkdirTemp("", "ksync-helm-")
 	if err != nil {
 		return "", nil, err
@@ -84,17 +85,35 @@ func setupHelmLookup(kubeContext string) (helmCommand string, cleanup func(), er
 		cleanup()
 		return "", nil, err
 	}
-	apiVersionsFile := filepath.Join(dir, "api-versions")
-	if err := os.WriteFile(apiVersionsFile, []byte(strings.Join(apiVersions, "\n")), 0o644); err != nil {
-		cleanup()
-		return "", nil, err
+
+	env := map[string]string{"KSYNC_KUBE_CONTEXT": kubeContext}
+	// Resolve helm and the cluster's capabilities, but defer any failure to chart
+	// inflation. Capabilities are discovered up front (once per command) so a
+	// version-gated chart template (a PDB behind a Capabilities.APIVersions.Has)
+	// resolves against the real cluster; on a discovery failure the wrapper refuses
+	// to render charts rather than rendering them with wrong (static) capabilities.
+	unavailable := ""
+	if helmPath, lookErr := exec.LookPath("helm"); lookErr != nil {
+		unavailable = "helm not found on PATH"
+	} else {
+		env["KSYNC_HELM"] = helmPath
+		apiVersions, kubeVersion, capErr := engine.DiscoverCapabilities(kubeContext)
+		if capErr != nil {
+			unavailable = fmt.Sprintf("reading cluster capabilities: %v", capErr)
+		} else {
+			apiVersionsFile := filepath.Join(dir, "api-versions")
+			if err := os.WriteFile(apiVersionsFile, []byte(strings.Join(apiVersions, "\n")), 0o644); err != nil {
+				cleanup()
+				return "", nil, err
+			}
+			env["KSYNC_KUBE_VERSION"] = kubeVersion
+			env["KSYNC_API_VERSIONS"] = apiVersionsFile
+		}
 	}
-	for k, v := range map[string]string{
-		"KSYNC_HELM":         helmPath,
-		"KSYNC_KUBE_CONTEXT": kubeContext,
-		"KSYNC_KUBE_VERSION": kubeVersion,
-		"KSYNC_API_VERSIONS": apiVersionsFile,
-	} {
+	// Always set it (empty when available) so an inherited stale value can never
+	// make the wrapper wrongly refuse a chart.
+	env["KSYNC_HELM_UNAVAILABLE"] = unavailable
+	for k, v := range env {
 		if err := os.Setenv(k, v); err != nil {
 			cleanup()
 			return "", nil, err

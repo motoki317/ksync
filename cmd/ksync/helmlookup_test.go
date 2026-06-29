@@ -97,6 +97,29 @@ func TestHelmLookupWrapper_TemplateGetsCapabilityFlags(t *testing.T) {
 	}
 }
 
+// When helm or the cluster is unavailable, the wrapper refuses with an
+// actionable message — but only when kustomize actually execs it (a chart). A
+// pure-kustomize render never reaches here, so it succeeds without helm or a
+// cluster.
+func TestHelmLookupWrapper_UnavailableRefusesCharts(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "helm")
+	if err := os.WriteFile(wrapper, []byte(helmLookupWrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(wrapper, "template", "chart")
+	cmd.Env = append(os.Environ(), "KSYNC_HELM_UNAVAILABLE=helm not found on PATH")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("wrapper succeeded; want a non-zero exit when helm is unavailable.\noutput: %s", out)
+	}
+	for _, want := range []string{"cannot render helm charts", "helm not found on PATH", "--offline-render"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("error output %q missing %q", out, want)
+		}
+	}
+}
+
 func TestRenderOptions_OfflineUsesPlainHelm(t *testing.T) {
 	opts, cleanup, err := renderOptions("dev-ctx", true)
 	if err != nil {
