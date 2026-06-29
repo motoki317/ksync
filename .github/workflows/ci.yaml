@@ -22,3 +22,6 @@ jobs:
       # (binary absent) or fail on version skew. --accept-flake-config opts into the
       # flake's cachix substituters once they are configured (no-op until then).
       - run: nix develop --accept-flake-config -c just pre-commit
+      # Race detector on top of the commit gate: catches data races the plain
+      # `go test` cannot. Separate from pre-commit so local commits stay fast.
+      - run: nix develop --accept-flake-config -c just test-race

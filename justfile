@@ -10,6 +10,11 @@ build:
 test:
     go test ./...
 
+# Run all tests under the race detector. Kept separate from `test`/`pre-commit`
+# (it needs cgo and runs ~2-3x slower); CI runs it on every push/PR.
+test-race:
+    CGO_ENABLED=1 go test -race ./...
+
 # Static checks: gofmt gate + go vet + (advisory) golangci-lint.
 check:
     @u="$(gofmt -l cmd internal)"; if [ -n "$u" ]; then echo "gofmt needed:"; echo "$u"; exit 1; fi
