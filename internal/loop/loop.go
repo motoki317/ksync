@@ -330,6 +330,25 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		}
 	}
 
+	// resyncAll marks every app for a full rebuild-and-redeploy. It re-dirties each
+	// buildable entry as well as redeploying, because the callers (a programmatic
+	// Resync, a dropped-event recovery) cannot trust the dirty set: a missed edit
+	// may have been a build source, so redeploying alone would ship the stale tag.
+	// The external gate then holds each build-app's deploy until its rebuild lands.
+	resyncAll := func(now time.Time) {
+		for _, a := range apps {
+			for j := range builds[a.Name] {
+				if builds[a.Name][j].override == nil {
+					builds[a.Name][j].dirty = true
+				}
+			}
+			if buildable[a.Name] {
+				buildSched.MarkDirty(a.Name, now)
+			}
+			deploySched.MarkDirty(a.Name, now)
+		}
+	}
+
 	rn := &runner{
 		renderer: renderer,
 		lookup:   render.NewVarLookup(opts.WorkDir),
@@ -537,10 +556,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		case <-ctx.Done():
 			return nil
 		case <-opts.Resync:
-			now := time.Now()
-			for _, a := range apps {
-				deploySched.MarkDirty(a.Name, now)
-			}
+			resyncAll(time.Now())
 			log.Info("Manual resync requested", "apps", len(apps))
 		case dec := <-gateDecisions:
 			now := time.Now()
@@ -620,13 +636,10 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			}
 			// A watch error (typically an fsnotify buffer overflow) may have dropped
 			// events, so the dirty set can no longer be trusted. Warn visibly and
-			// mark every app dirty for a full resync — the same response as a manual
-			// Resync — so a missed edit still reaches the cluster.
+			// resync every app — rebuilding buildable ones, since a dropped event may
+			// have been a build source — so a missed edit still reaches the cluster.
 			log.Error(err, "watch error; some changes may have been missed — resyncing all apps")
-			now := time.Now()
-			for _, a := range apps {
-				deploySched.MarkDirty(a.Name, now)
-			}
+			resyncAll(time.Now())
 		case r := <-buildResults:
 			building[r.app] = false
 			states := builds[r.app]

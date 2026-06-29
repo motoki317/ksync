@@ -280,6 +280,45 @@ func TestRun_BuildsOnStartupAndInjectsTheTag(t *testing.T) {
 	}
 }
 
+// A full resync (the Resync trigger, and the identical dropped-event recovery)
+// must rebuild a build app, not merely redeploy it: a missed event may have been
+// a source edit, so reusing the last tag would ship stale code. Both callers run
+// the same resyncAll closure, so the Resync trigger exercises that path.
+func TestRun_ResyncRebuildsBuildApps(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	resync := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Resync: resync})
+	}()
+
+	// Startup builds once and deploys the dev tag.
+	waitFor(t, func() bool { return len(sink.synced()) == 1 })
+	if got := builder.builds(); got != 1 {
+		t.Fatalf("startup builds = %d, want 1", got)
+	}
+
+	// A resync rebuilds and deploys the fresh tag — not a bare redeploy of the
+	// remembered one.
+	resync <- struct{}{}
+	waitFor(t, func() bool { return len(sink.synced()) == 2 })
+	if got := builder.builds(); got != 2 {
+		t.Errorf("builds after resync = %d, want 2 (a resync must rebuild, not redeploy the stale tag)", got)
+	}
+	if got := sink.synced()[1]; got != "api-b:ksync-000000000002" {
+		t.Errorf("resync deployed %q, want the freshly rebuilt dev tag", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 // An overridden build is never built: its supplied ref is injected at deploy and
 // its sources are not watched, so a source edit triggers neither a build nor a
 // redeploy (only a manifest edit redeploys, re-injecting the override).
