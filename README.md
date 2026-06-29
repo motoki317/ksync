@@ -31,17 +31,30 @@ controller), and no file-sync into running containers (use mirrord or Telepresen
 - **Binary**: download the archive for your platform from the
   [latest release](https://github.com/motoki317/ksync/releases) and put `ksync` on your `PATH`.
 
-ksync shells out to `helm` to inflate `helmCharts` during render, so `helm` must be on `PATH`; the
-Nix devShell bundles it.
+`helm` is needed on `PATH` only when a kustomization inflates `helmCharts`; the Nix devShell bundles
+it. `docker` is needed only for apps that build from source. kustomize is built in.
 
 ## Quickstart
 
-Declare your apps in `ksync.yaml`:
+A minimal `ksync.yaml` lists a context and one app directory:
 
 ```yaml
 allowedContexts: [docker-desktop]   # the only context ksync may touch; a sole entry is auto-targeted
 apps:
-  - path: apps/shop
+  - path: apps/shop                 # a directory with a kustomization.yaml
+```
+
+Then run the loop:
+
+```bash
+ksync watch   # keep watching; re-render + apply affected apps on save
+ksync sync    # one-shot: converge the cluster to the local files, then exit
+```
+
+Apps grow fields as you need them — a default namespace, dependency ordering, image builds:
+
+```yaml
+apps:
   - name: api-b
     path: apps/api-b
     namespace: team-a          # default ns for resources without one
@@ -54,14 +67,7 @@ apps:
     namespace: team-a
 ```
 
-Then run the loop:
-
-```bash
-ksync watch   # keep watching; re-render + apply affected apps on save
-ksync sync    # one-shot: converge the cluster to the local files, then exit
-```
-
-The full guide — every field, every flag, tracking/prune/hook behavior, troubleshooting — is in
+The full guide — fields, commands, tracking/prune/hook behavior, troubleshooting — is in
 **[docs/usage.md](docs/usage.md)**.
 
 ## Development
