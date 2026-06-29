@@ -29,7 +29,8 @@ func NewVarLookup(workdir string) func(string) (string, bool) {
 
 // ApplyPatches applies each config patch to this result's rendered objects,
 // before image injection and apply. For each patch it resolves ${VAR} in the op
-// `value` strings via lookup (an undefined variable is an error), finds the one
+// `value` strings via lookup (an undefined variable with no ${VAR:-default}
+// fallback is an error), finds the one
 // rendered object the target names by literal GVK+name (and namespace when the
 // target pins one) — failing closed if zero or several match — and applies the
 // RFC 6902 ops to it (a failed `test` op or a missing path fails the whole
@@ -171,11 +172,20 @@ func expandAny(v any, lookup func(string) (string, bool)) (any, error) {
 	}
 }
 
-// expandVars replaces ${NAME} with lookup(NAME) and $$ with a literal $.
-// A ${NAME} whose variable is undefined is an error (fail-closed). Any other $
-// is kept literally, so the grammar is exactly "${NAME}" and "$$" — narrower
-// than shell expansion, which would also substitute a bare $word and special
-// forms, surprising a value that legitimately contains a $.
+// expandVars replaces ${NAME} with lookup(NAME), ${NAME:-default} with the
+// variable's value or, when it is unset or empty, the literal default, and $$
+// with a literal $. A bare ${NAME} whose variable is undefined is an error
+// (fail-closed); the ${NAME:-default} form is the explicit opt-out that supplies
+// a fallback instead. The default follows POSIX ${parameter:-word} colon
+// semantics (substituted when the variable is unset OR empty), so
+// ${GOOGLE_MAPS_API_KEY:-} yields "" when that variable is absent — matching a
+// helmfile `env "" ` default without breaking the fail-closed rule. The default
+// is taken literally: it is not itself re-expanded, and the first "}" ends the
+// form, so a nested ${...} inside a default is not supported. Only the colon
+// form ":-" is recognized (no unset-only "-"). Any other $ is kept literally, so
+// the grammar is exactly "${NAME}", "${NAME:-default}", and "$$" — narrower than
+// shell expansion, which would also substitute a bare $word and special forms,
+// surprising a value that legitimately contains a $.
 func expandVars(s string, lookup func(string) (string, bool)) (string, error) {
 	if !strings.ContainsRune(s, '$') {
 		return s, nil
@@ -196,15 +206,21 @@ func expandVars(s string, lookup func(string) (string, bool)) (string, error) {
 			if end < 0 {
 				return "", fmt.Errorf("unterminated ${...} in %q", s)
 			}
-			name := s[i+2 : i+2+end]
+			name, def, hasDefault := strings.Cut(s[i+2:i+2+end], ":-")
 			if name == "" {
-				return "", fmt.Errorf("empty ${} in %q", s)
+				return "", fmt.Errorf("empty variable name in ${%s}", s[i+2:i+2+end])
 			}
 			val, ok := lookup(name)
-			if !ok {
+			switch {
+			case ok && val != "":
+				b.WriteString(val)
+			case hasDefault:
+				b.WriteString(def)
+			case !ok:
 				return "", fmt.Errorf("undefined variable ${%s}", name)
+			default:
+				b.WriteString(val) // set but empty, no default: preserve prior behavior
 			}
-			b.WriteString(val)
 			i += 2 + end + 1
 		default:
 			b.WriteByte('$')

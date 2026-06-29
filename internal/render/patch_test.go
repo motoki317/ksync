@@ -104,6 +104,25 @@ func TestApplyPatches_UndefinedVarFails(t *testing.T) {
 	}
 }
 
+// An unset variable with a ${VAR:-default} fallback applies the default instead
+// of failing — the opt-out that lets an optional value (e.g. an API key absent
+// in this environment) render to its default rather than break the patch.
+func TestApplyPatches_DefaultExpansionOnUnset(t *testing.T) {
+	res := renderPatchFixture(t)
+	patches := []config.Patch{{
+		Target: cacheAppTarget(),
+		Patch: `- op: replace
+  path: /spec/template/spec/volumes/0/hostPath/path
+  value: ${NOT_SET:-/fallback/path}`,
+	}}
+	if err := res.ApplyPatches(patches, constLookup(nil)); err != nil {
+		t.Fatalf("ApplyPatches: %v", err)
+	}
+	if got := cacheHostPath(t, res); got != "/fallback/path" {
+		t.Errorf("hostPath = %q, want /fallback/path", got)
+	}
+}
+
 // A failed `test` op aborts the patch (RFC 6902 atomicity) and leaves the
 // object unchanged.
 func TestApplyPatches_TestOpFailsClosed(t *testing.T) {
@@ -203,7 +222,7 @@ func TestApplyPatches_NamespacePinsMatch(t *testing.T) {
 }
 
 func TestExpandVars(t *testing.T) {
-	lookup := constLookup(map[string]string{"A": "x", "B": "/b/dir"})
+	lookup := constLookup(map[string]string{"A": "x", "B": "/b/dir", "E": ""})
 	cases := []struct {
 		in      string
 		want    string
@@ -217,6 +236,16 @@ func TestExpandVars(t *testing.T) {
 		{"${MISSING}", "", true},
 		{"${A", "", true}, // unterminated
 		{"${}", "", true}, // empty name
+		// ${NAME:-default}: default substituted when unset OR empty (POSIX :- semantics).
+		{"${A:-fallback}", "x", false},              // set and non-empty: value wins, default ignored
+		{"${MISSING:-fallback}", "fallback", false}, // unset: default
+		{"${E:-fallback}", "fallback", false},       // set but empty: default (the colon form)
+		{"${MISSING:-}", "", false},                 // unset, empty default → "" without error (helmfile env "" parity)
+		{"pre-${MISSING:-mid}-post", "pre-mid-post", false},
+		{"${MISSING:-a:-b}", "a:-b", false}, // only the first ":-" splits; the rest is a literal default
+		{"${:-x}", "", true},                // empty name even with a default
+		// Regression: bare ${NAME} keeps fail-closed/empty behavior unchanged.
+		{"${E}", "", false}, // set but empty, no default: "" without error
 	}
 	for _, c := range cases {
 		got, err := expandVars(c.in, lookup)

@@ -92,11 +92,15 @@ re-litigate only with new evidence):
   render/sync/watch/images): each `config.Patch` matches **exactly one** rendered object by literal
   GVK+name(+ns) — fail-closed on 0/≥2, not kustomize's regex `Selector` — and applies its inline
   RFC6902 ops via a single-resource `patchjson6902.Filter`, refreshing `Objects` so `YAML()` and
-  `Objects` never drift. `${VAR}` in op `value`s is expanded by a narrow custom scanner (`${NAME}`
-  and `$$`→`$` only, fail-closed on undefined) over the process env plus the built-in
+  `Objects` never drift. `${VAR}` in op `value`s is expanded by a narrow custom scanner (`${NAME}`,
+  `${NAME:-default}`, and `$$`→`$` only; a bare `${NAME}` is fail-closed on undefined, while the
+  `:-default` form is the explicit opt-out — POSIX colon semantics, so the literal default applies
+  when the variable is unset **or** empty, and `${FOO:-}` yields `""` for an absent var, matching a
+  helmfile `env ""` default without breaking fail-closed) over the process env plus the built-in
   `${KSYNC_WORKDIR}` = config dir; expansion touches only `value` strings (`NewVarLookup` builds the
   resolver). Because ksync runs next to the cluster, `${HOME}` self-resolves to the cluster host's
-  home, so a wrapper needs no per-environment plumbing (ADR 20260623-post-render-patches).
+  home, so a wrapper needs no per-environment plumbing (ADRs 20260623-post-render-patches,
+  20260629-default-var-expansion).
 - `internal/ui` — human-facing output: a `logr.LogSink` that renders clean, colored,
   single-line records (a quiet variant drops Info/V noise; used for the engine and the routed
   klog/client-go stream), color helpers (NO_COLOR + TTY aware), and the live terminal block
