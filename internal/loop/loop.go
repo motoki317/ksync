@@ -611,8 +611,22 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 					abortPending = true
 				}
 			}
-		case err := <-watcher.Errors:
-			log.Error(err, "Watch error")
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				// The watcher closed its error channel: its run goroutine returns
+				// after closing either channel, so nothing more will arrive. Exit
+				// rather than spin on the now-closed channel (a busy loop).
+				return nil
+			}
+			// A watch error (typically an fsnotify buffer overflow) may have dropped
+			// events, so the dirty set can no longer be trusted. Warn visibly and
+			// mark every app dirty for a full resync — the same response as a manual
+			// Resync — so a missed edit still reaches the cluster.
+			log.Error(err, "watch error; some changes may have been missed — resyncing all apps")
+			now := time.Now()
+			for _, a := range apps {
+				deploySched.MarkDirty(a.Name, now)
+			}
 		case r := <-buildResults:
 			building[r.app] = false
 			states := builds[r.app]
