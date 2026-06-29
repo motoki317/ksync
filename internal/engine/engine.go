@@ -35,6 +35,30 @@ type resourceInfo struct {
 	app string
 }
 
+// appManaged reports whether a cached resource is a prune-eligible managed
+// resource of app — the single predicate every prune/diff/health path keys on.
+// Namespaces are deliberately excluded: an authored Namespace is still applied
+// (target objects are applied regardless of this predicate), but it is never a
+// prune candidate, so neither a prune nor a `ksync destroy` deletes a namespace
+// and cascades via Kubernetes GC into another app's resources sharing it. This
+// also neutralizes a Namespace a prior ksync version labeled — prune candidacy is
+// decided here, from the live cache, not from what the current run stamps. It
+// mirrors how auto-created and referenced namespaces are already left bare.
+func appManaged(app string) func(*cache.Resource) bool {
+	return func(r *cache.Resource) bool {
+		info, ok := r.Info.(*resourceInfo)
+		if !ok || info.app != app {
+			return false
+		}
+		return !isNamespace(r.ResourceKey())
+	}
+}
+
+// isNamespace reports whether a resource key is a core/v1 Namespace.
+func isNamespace(k kube.ResourceKey) bool {
+	return k.Group == "" && k.Kind == "Namespace"
+}
+
 // Engine is a connected sync engine with a running cluster cache.
 type Engine struct {
 	clusterCache cache.ClusterCache

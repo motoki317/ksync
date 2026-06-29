@@ -59,6 +59,12 @@ type SyncOptions struct {
 	// decided, and a dry-run per poll would cost an API round-trip per resource
 	// per second. When false, the apply set uses the client-side diff throughout.
 	ServerSide bool
+	// AllowEmpty permits a sync whose target renders to zero objects to prune the
+	// app's entire managed live set. It defaults false, so an accidental
+	// empty render (a broken overlay, a commented-out resource) refuses rather
+	// than silently deleting the whole app — ArgoCD's allowEmpty=false guard. Only
+	// `ksync destroy`, whose empty target is the intent, sets it.
+	AllowEmpty bool
 }
 
 // ResourceStatus is one resource's health as the sync gate sees it — its
@@ -113,16 +119,51 @@ func (e *TimeoutError) Error() string {
 	return fmt.Sprintf("sync of %q timed out; still not healthy:\n  %s", e.App, strings.Join(statusLines(e.Pending), "\n  "))
 }
 
+// EmptyRenderError reports a prune refused because the app rendered to zero
+// objects while it still has managed live resources — applying that with prune
+// would delete the whole app. The command layer can errors.As it; in watch mode
+// the next good edit re-renders and syncs normally.
+type EmptyRenderError struct {
+	App  string
+	Live int
+}
+
+func (e *EmptyRenderError) Error() string {
+	return fmt.Sprintf("%s rendered 0 resources but manages %d live resource(s); refusing to prune them all. Fix the kustomization, or run `ksync destroy %s` to remove the app intentionally.", e.App, e.Live, e.App)
+}
+
+// refusesEmptyPrune is the empty-render guard decision, split out so the rule —
+// empty target, prune on, not opted into emptiness, live resources still to lose
+// — is unit-testable without a cluster cache.
+func refusesEmptyPrune(targetLen, liveLen int, opts SyncOptions) bool {
+	return targetLen == 0 && opts.Prune && !opts.AllowEmpty && liveLen > 0
+}
+
 // Sync makes the cluster state of one app match the given rendered resources,
 // with ArgoCD semantics: server-side apply, hook phases and waves from the
 // resource annotations, health-gated PostSync, and tracking-label-scoped
 // prune.
 func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured.Unstructured, opts SyncOptions) ([]common.ResourceSyncResult, error) {
 	target := StampTracking(app, resources)
-	isManaged := func(r *cache.Resource) bool {
-		info, ok := r.Info.(*resourceInfo)
-		return ok && info.app == app
+	isManaged := appManaged(app)
+
+	// Refuse to prune the whole app to nothing. A target that renders to zero
+	// objects is almost always a mistake (a commented-out resource, a broken
+	// overlay, a patch that matched nothing); applying it with prune would delete
+	// every resource ksync manages for the app — silently, and in watch mode on
+	// every save. ArgoCD guards this the same way (allowEmpty defaults false).
+	// Intentional deletion is `ksync destroy`, which sets AllowEmpty. A brand-new
+	// app with nothing live yet is exempt — there is nothing to lose.
+	if len(target) == 0 && opts.Prune && !opts.AllowEmpty {
+		live, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
+		if err != nil {
+			return nil, fmt.Errorf("reading live state of %q: %w", app, err)
+		}
+		if refusesEmptyPrune(len(target), len(live), opts) {
+			return nil, &EmptyRenderError{App: app, Live: len(live)}
+		}
 	}
+
 	// Fill the default namespace before any key-based matching: the live-state
 	// lookup and the diff below key resources by the target's namespace, so a
 	// late fill (gitops-engine also stamps at task creation) would mismatch.
@@ -507,10 +548,7 @@ func (e *Engine) AppDegraded(app, namespace string, objects []*unstructured.Unst
 	if namespace != "" {
 		fillDefaultNamespace(target, namespace, e.clusterCache.IsNamespaced)
 	}
-	isManaged := func(r *cache.Resource) bool {
-		info, ok := r.Info.(*resourceInfo)
-		return ok && info.app == app
-	}
+	isManaged := appManaged(app)
 	lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 	if err != nil {
 		return nil
@@ -607,17 +645,21 @@ func (e *Engine) ensureReferencedNamespaces(ctx context.Context, target []*unstr
 }
 
 // StampTracking returns copies of objs labeled as belonging to app. Copies,
-// because callers reuse the rendered objects (e.g. for diff output).
+// because callers reuse the rendered objects (e.g. for diff output). A Namespace
+// is copied through unlabeled: it is applied but must never become a prune
+// candidate (see appManaged), matching how auto-created namespaces are left bare.
 func StampTracking(app string, objs []*unstructured.Unstructured) []*unstructured.Unstructured {
 	out := make([]*unstructured.Unstructured, len(objs))
 	for i, obj := range objs {
 		c := obj.DeepCopy()
-		labels := c.GetLabels()
-		if labels == nil {
-			labels = make(map[string]string, 1)
+		if !isNamespace(kube.GetResourceKey(c)) {
+			labels := c.GetLabels()
+			if labels == nil {
+				labels = make(map[string]string, 1)
+			}
+			labels[TrackingLabel] = app
+			c.SetLabels(labels)
 		}
-		labels[TrackingLabel] = app
-		c.SetLabels(labels)
 		out[i] = c
 	}
 	return out

@@ -1207,10 +1207,11 @@ func runDestroy(args []string) error {
 	nameW := nameColWidth(apps)
 	for _, app := range apps {
 		// Destroy is a sync to an empty target set: prune removes everything
-		// the tracking label scopes to this app, and nothing else.
+		// the tracking label scopes to this app, and nothing else. AllowEmpty
+		// opts past the empty-render guard — here the empty target is the intent.
 		syncCtx, cancel := withTimeout(ctx, *timeout)
 		start := time.Now()
-		results, err := eng.Sync(syncCtx, app.Name, nil, engine.SyncOptions{Prune: true})
+		results, err := eng.Sync(syncCtx, app.Name, nil, engine.SyncOptions{Prune: true, AllowEmpty: true})
 		cancel()
 		if err != nil {
 			return fmt.Errorf("app %s: destroy: %w", app.Name, err)

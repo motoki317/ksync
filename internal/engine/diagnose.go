@@ -43,10 +43,7 @@ func (e *Engine) Diagnose(ctx context.Context, app, namespace string, objects []
 	if namespace != "" {
 		fillDefaultNamespace(target, namespace, e.clusterCache.IsNamespaced)
 	}
-	isManaged := func(r *cache.Resource) bool {
-		info, ok := r.Info.(*resourceInfo)
-		return ok && info.app == app
-	}
+	isManaged := appManaged(app)
 	lives, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 	if err != nil {
 		return nil

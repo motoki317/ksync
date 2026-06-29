@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/argoproj/argo-cd/gitops-engine/pkg/cache"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/diff"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
@@ -89,10 +88,7 @@ func (e *Engine) Diff(app string, resources []*unstructured.Unstructured, opts D
 	if opts.Namespace != "" {
 		fillDefaultNamespace(target, opts.Namespace, e.clusterCache.IsNamespaced)
 	}
-	isManaged := func(r *cache.Resource) bool {
-		info, ok := r.Info.(*resourceInfo)
-		return ok && info.app == app
-	}
+	isManaged := appManaged(app)
 	live, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 	if err != nil {
 		return nil, fmt.Errorf("reading live state of %q: %w", app, err)
@@ -120,10 +116,7 @@ func (e *Engine) LiveObjects(app, namespace string, resources []*unstructured.Un
 	if namespace != "" {
 		fillDefaultNamespace(target, namespace, e.clusterCache.IsNamespaced)
 	}
-	isManaged := func(r *cache.Resource) bool {
-		info, ok := r.Info.(*resourceInfo)
-		return ok && info.app == app
-	}
+	isManaged := appManaged(app)
 	live, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 	if err != nil {
 		return nil, fmt.Errorf("reading live state of %q: %w", app, err)
