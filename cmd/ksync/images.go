@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
-	"runtime"
 	"sort"
 	"strings"
 
@@ -35,10 +33,10 @@ import (
 // the apps' namespaces are added too, which is how operator-derived images (an
 // ECK Elasticsearch data image named only by spec.version) get covered.
 func runImages(args []string) error {
-	fs := flag.NewFlagSet("images", flag.ContinueOnError)
+	fs := newSubFlagSet("images")
 	live := fs.Bool("live", false, "also include images of running pods in the apps' namespaces (captures operator-derived images, e.g. ECK Elasticsearch, that rendered manifests never name)")
-	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
-	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps to render concurrently (0 = one worker per app)")
+	offline := offlineRenderFlag(fs)
+	maxParallel := maxParallelFlag(fs)
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -48,7 +46,9 @@ func runImages(args []string) error {
 	if err != nil {
 		return err
 	}
-	kubeContext, err := resolveContext(cfg, *kctx)
+	// A cluster is needed only to read live pods (--live) or for the default live
+	// helm render; a plain offline render touches none, so don't force a --context.
+	kubeContext, err := renderContext(cfg, *kctx, *offline && !*live)
 	if err != nil {
 		return err
 	}

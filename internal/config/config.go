@@ -224,6 +224,9 @@ func (a *App) BuildBatches(indices []int) [][]int {
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("no config file at %s — create a ksync.yaml here, or pass -f <path>", path)
+		}
 		return nil, err
 	}
 	// Absolute base dir, so every resolved path is absolute no matter how -f
@@ -258,10 +261,29 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	if len(errs) > 0 {
-		return nil, fmt.Errorf("%s: %w", path, errors.Join(errs...))
+		return nil, fmt.Errorf("%s: %w", path, multiErr(errs))
 	}
 	return cfg, nil
 }
+
+// multiErr formats several validation failures as a counted, indented list, so a
+// config with multiple problems reads as a checklist rather than one run-on
+// line. It still unwraps to each underlying error, so errors.Is/As traverse all.
+type multiErr []error
+
+func (m multiErr) Error() string {
+	if len(m) == 1 {
+		return m[0].Error()
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d problems:", len(m))
+	for _, e := range m {
+		fmt.Fprintf(&b, "\n  - %s", e.Error())
+	}
+	return b.String()
+}
+
+func (m multiErr) Unwrap() []error { return m }
 
 // Parse parses and validates a config document. Relative app paths are
 // resolved against baseDir (the config file's directory); defaults (app name
@@ -449,7 +471,7 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	}
 
 	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
+		return nil, multiErr(errs)
 	}
 	return &cfg, nil
 }

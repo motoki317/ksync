@@ -114,3 +114,45 @@ func TestRunByNeeds_FirstErrorStopsDependents(t *testing.T) {
 		t.Errorf("app ran despite its need failing")
 	}
 }
+
+// TestExcludedNeedsNote covers the targeted-sync warning: a note naming the
+// dependencies a selected app declares but that are not in the selected set
+// (runByNeeds skips them rather than waiting), and silence otherwise.
+func TestExcludedNeedsNote(t *testing.T) {
+	apps := []config.App{
+		{Name: "api-b", Needs: []string{"db", "cache"}},
+		{Name: "db"},
+	}
+	cases := []struct {
+		name     string
+		selected []config.App
+		names    []string
+		want     string
+	}{
+		{
+			name:     "untargeted run is silent",
+			selected: apps,
+			names:    nil,
+			want:     "",
+		},
+		{
+			name:     "targeted run names only out-of-set needs",
+			selected: apps,
+			names:    []string{"api-b", "db"},
+			want:     "note: not syncing dependencies cache (not selected); assuming they are already deployed",
+		},
+		{
+			name:     "all needs in set is silent",
+			selected: []config.App{{Name: "db"}, {Name: "api-b", Needs: []string{"db"}}},
+			names:    []string{"db", "api-b"},
+			want:     "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := excludedNeedsNote(c.selected, c.names); got != c.want {
+				t.Errorf("excludedNeedsNote = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

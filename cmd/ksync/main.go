@@ -67,19 +67,27 @@ func signalContext() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
-// The Milestone 1 CLI surface. Commands without an implementation yet are
-// stubs; listing them all from day one fixes the command names early.
-var subcommands = []struct {
+type subcommand struct {
 	name, summary string
 	run           func(args []string) error
-}{
-	{"watch", "watch app directories and render/diff/apply on change (the main loop)", runWatch},
-	{"sync", "render and sync the given apps once", runSync},
-	{"diff", "render and show the diff against live cluster state", runDiff},
-	{"render", "render the given apps to stdout", runRender},
-	{"images", "list the container images the given apps deploy (canonical refs, for cache scoping)", runImages},
-	{"destroy", "delete all tracked resources of the given apps", runDestroy},
-	{"version", "print the ksync version", runVersion},
+}
+
+// subcommands is the CLI surface, in the order `ksync help` lists them. It is
+// populated in init rather than as a var initializer to avoid an
+// initialization cycle: summaryOf reads this slice, and the command functions
+// named here reach summaryOf through the shared flag-parsing helpers.
+var subcommands []subcommand
+
+func init() {
+	subcommands = []subcommand{
+		{"watch", "watch app directories and render/diff/apply on change (the main loop)", runWatch},
+		{"sync", "render and sync the given apps once", runSync},
+		{"diff", "render and show the diff against live cluster state", runDiff},
+		{"render", "render the given apps to stdout", runRender},
+		{"images", "list the container images the given apps deploy (canonical refs, for cache scoping)", runImages},
+		{"destroy", "delete all tracked resources of the given apps", runDestroy},
+		{"version", "print the ksync version", runVersion},
+	}
 }
 
 // version is the build version, stamped at release time via
@@ -93,14 +101,21 @@ func runVersion([]string) error {
 }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	err := run(os.Args[1:])
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, flag.ErrHelp):
+		// `-h`/`--help` on a command: usage was already printed to stdout by the
+		// flag parse. A help request is success, not an error.
+		return
+	case errors.Is(err, context.Canceled):
 		// A Ctrl-C (or a sibling app's failure aborting the run) surfaces as a
 		// context cancellation, not a real failure: report it as an interrupt with
 		// the conventional 130, never a stack of "timed out" / "context canceled".
-		if errors.Is(err, context.Canceled) {
-			fmt.Fprintln(os.Stderr, "ksync: interrupted")
-			os.Exit(130)
-		}
+		fmt.Fprintln(os.Stderr, "ksync: interrupted")
+		os.Exit(130)
+	default:
 		fmt.Fprintln(os.Stderr, "ksync:", err)
 		os.Exit(1)
 	}
@@ -109,28 +124,68 @@ func main() {
 func run(args []string) error {
 	if len(args) == 0 {
 		usage(os.Stderr)
-		return fmt.Errorf("no subcommand given")
+		return errors.New("no command given (run 'ksync help')")
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		usage(os.Stdout)
+		return nil
+	case "-V", "--version", "-version":
+		return runVersion(nil)
 	}
 	for _, c := range subcommands {
 		if args[0] == c.name {
-			if c.run == nil {
-				return fmt.Errorf("%s: not implemented yet", c.name)
-			}
 			return c.run(args[1:])
 		}
 	}
 	usage(os.Stderr)
-	return fmt.Errorf("unknown subcommand %q", args[0])
+	return fmt.Errorf("unknown command %q (run 'ksync help')", args[0])
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: ksync <command> [args]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "commands:")
+	var b strings.Builder
+	b.WriteString("ksync — a local-development sync loop for Kubernetes\n\n")
+	b.WriteString("usage: ksync <command> [flags] [app...]\n\n")
+	b.WriteString("commands:\n")
 	for _, c := range subcommands {
-		fmt.Fprintf(w, "  %-8s %s\n", c.name, c.summary)
+		fmt.Fprintf(&b, "  %-9s %s\n", c.name, c.summary)
 	}
-	fmt.Fprintln(w)
+	b.WriteString("\nrun 'ksync <command> -h' for a command's flags.\n")
+	fmt.Fprint(w, b.String())
+}
+
+// summaryOf returns a subcommand's one-line description for its help banner.
+func summaryOf(name string) string {
+	for _, c := range subcommands {
+		if c.name == name {
+			return c.summary
+		}
+	}
+	return ""
+}
+
+// newSubFlagSet builds a subcommand flag set that prints its own help and parse
+// errors exactly once, on streams we choose. flag's auto-output is discarded and
+// its Usage suppressed; parseInterspersed prints help to stdout on `-h` and the
+// error (with a `-h` hint) to stderr otherwise — so neither is duplicated nor
+// sent to the wrong stream.
+func newSubFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
+	return fs
+}
+
+// printSubUsage writes a command's help: its summary, a usage line, and the flag
+// defaults — what `ksync <command> -h` shows.
+func printSubUsage(w io.Writer, fs *flag.FlagSet) {
+	if s := summaryOf(fs.Name()); s != "" {
+		fmt.Fprintf(w, "%s\n\n", s)
+	}
+	fmt.Fprintf(w, "usage: ksync %s [flags] [app...]\n\nflags:\n", fs.Name())
+	fs.SetOutput(w)
+	fs.PrintDefaults()
+	fs.SetOutput(io.Discard)
 }
 
 // loadConfig adds the shared -f flag to fs, parses args, and loads the
@@ -159,9 +214,45 @@ func resolveContext(cfg *config.Config, override string) (string, error) {
 	return cfg.SelectContext(override)
 }
 
+// renderContext resolves the context for a render-only command, or "" when the
+// render touches no cluster (offline): no context is needed, so an ambiguous
+// allowlist must not force a --context that would go unused.
+func renderContext(cfg *config.Config, override string, offline bool) (string, error) {
+	if offline {
+		return "", nil
+	}
+	return resolveContext(cfg, override)
+}
+
 // contextFlag registers the shared --context flag on a subcommand's flag set.
 func contextFlag(fs *flag.FlagSet) *string {
 	return fs.String("context", "", "kubectl context to target; must be listed in allowedContexts (default: the sole allowedContexts entry, when exactly one)")
+}
+
+// maxParallelFlag registers the shared --max-parallel flag. One definition keeps
+// the help identical across commands (it drifted before) and lets Go append the
+// real default (CPU count) instead of a hand-written, duplicated note. 0 lifts
+// the cap (one worker per app), the same in every command.
+func maxParallelFlag(fs *flag.FlagSet) *int {
+	return fs.Int("max-parallel", runtime.NumCPU(), "how many apps to process concurrently (0 = no limit)")
+}
+
+// offlineRenderFlag registers the shared --offline-render flag. "lookup" is not
+// backtick-quoted: a backtick would make flag treat it as the value placeholder,
+// printing the nonsensical "-offline-render lookup" for a boolean flag.
+func offlineRenderFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm lookup will not resolve)")
+}
+
+// clientDiffFlag registers the shared --client-diff flag for the apply paths
+// (sync, watch).
+func clientDiffFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("client-diff", false, "decide the apply set with the in-process (client-side) diff instead of a server-side dry-run apply; faster, but fields the cluster defaults or prunes are re-applied every sync")
+}
+
+// verboseFlag registers the shared -v flag.
+func verboseFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("v", false, "verbose: also log per-change tracing")
 }
 
 // parseInterspersed parses fs allowing flags and positional args (app names) in
@@ -172,7 +263,11 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	var names []string
 	for len(args) > 0 {
 		if err := fs.Parse(args); err != nil {
-			return nil, err
+			if errors.Is(err, flag.ErrHelp) {
+				printSubUsage(os.Stdout, fs)
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w (run 'ksync %s -h' for usage)", err, fs.Name())
 		}
 		args = fs.Args()
 		if len(args) == 0 {
@@ -185,9 +280,9 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 }
 
 func runRender(args []string) error {
-	fs := flag.NewFlagSet("render", flag.ContinueOnError)
-	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
-	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps to render concurrently (0 = one worker per app)")
+	fs := newSubFlagSet("render")
+	offline := offlineRenderFlag(fs)
+	maxParallel := maxParallelFlag(fs)
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -197,7 +292,9 @@ func runRender(args []string) error {
 	if err != nil {
 		return err
 	}
-	kubeContext, err := resolveContext(cfg, *kctx)
+	// Offline rendering touches no cluster, so it needs no context — don't make an
+	// ambiguous allowlist force a --context that will go unused.
+	kubeContext, err := renderContext(cfg, *kctx, *offline)
 	if err != nil {
 		return err
 	}
@@ -303,16 +400,16 @@ func setupLogging(verbose bool) (app, engineLog logr.Logger) {
 }
 
 func runSync(args []string) error {
-	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
+	fs := newSubFlagSet("sync")
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
 	force := fs.Bool("force", false, "re-run hooks even when manifests are unchanged (re-applies PostSync Jobs; a failed hook is retried regardless)")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
-	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
-	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
-	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
-	clientDiff := fs.Bool("client-diff", false, "decide the apply set with the in-process (client-side) diff instead of a server-side dry-run apply; faster, but fields the cluster defaults or prunes are re-applied every sync")
+	maxParallel := maxParallelFlag(fs)
+	verbose := verboseFlag(fs)
+	offline := offlineRenderFlag(fs)
+	clientDiff := clientDiffFlag(fs)
 	var images stringSlice
-	fs.Var(&images, "image", "deploy a pre-built image instead of building it: IMAGE=REF (repeatable; also via "+overrideEnv+")")
+	fs.Var(&images, "image", "deploy a pre-built image instead of building it: `IMAGE=REF` (repeatable; also via "+overrideEnv+")")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -323,6 +420,9 @@ func runSync(args []string) error {
 		return err
 	}
 	apps = config.SortByNeeds(apps)
+	if note := excludedNeedsNote(apps, names); note != "" {
+		fmt.Fprintln(os.Stderr, note)
+	}
 	kubeContext, err := resolveContext(cfg, *kctx)
 	if err != nil {
 		return err
@@ -649,6 +749,36 @@ func waitingTail(pending []engine.ResourceStatus) string {
 	return tail
 }
 
+// excludedNeedsNote warns when a targeted sync (explicit app names) omits apps
+// the selected ones declare in needs: those dependencies are not synced here and
+// are assumed already deployed. runByNeeds skips an out-of-set need rather than
+// waiting on it, so without this note a missing dependency surfaces only as a
+// downstream failure. Empty for an untargeted run (no names) or when nothing is
+// excluded.
+func excludedNeedsNote(selected []config.App, names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	in := make(map[string]bool, len(selected))
+	for _, a := range selected {
+		in[a.Name] = true
+	}
+	var missing []string
+	seen := map[string]bool{}
+	for _, a := range selected {
+		for _, dep := range a.Needs {
+			if !in[dep] && !seen[dep] {
+				seen[dep] = true
+				missing = append(missing, dep)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("note: not syncing dependencies %s (not selected); assuming they are already deployed", strings.Join(missing, ", "))
+}
+
 // runByNeeds runs fn for every app, up to maxParallel concurrently, starting an
 // app only once every app it needs has finished. apps must be topologically
 // sorted (config.SortByNeeds). It returns the first error and, on any error,
@@ -713,15 +843,15 @@ func withTimeout(ctx context.Context, d time.Duration) (context.Context, context
 }
 
 func runWatch(args []string) error {
-	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	fs := newSubFlagSet("watch")
 	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
 	debounce := fs.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
-	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps may build, render, and sync concurrently (0 = no limit; default = CPU cores)")
+	maxParallel := maxParallelFlag(fs)
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
 	auto := fs.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
-	verbose := fs.Bool("v", false, "verbose: also log per-change tracing")
-	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
-	clientDiff := fs.Bool("client-diff", false, "decide the apply set with the in-process (client-side) diff instead of a server-side dry-run apply; faster, but fields the cluster defaults or prunes are re-applied on every sync")
+	verbose := verboseFlag(fs)
+	offline := offlineRenderFlag(fs)
+	clientDiff := clientDiffFlag(fs)
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {
@@ -1166,7 +1296,7 @@ func makeBuildFunc(runCtx context.Context, cfg *config.Config, prog *progress, k
 }
 
 func runDestroy(args []string) error {
-	fs := flag.NewFlagSet("destroy", flag.ContinueOnError)
+	fs := newSubFlagSet("destroy")
 	yes := fs.Bool("yes", false, "confirm deleting every tracked resource of the selected apps")
 	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app's resources to delete (0 = no limit)")
 	kctx := contextFlag(fs)

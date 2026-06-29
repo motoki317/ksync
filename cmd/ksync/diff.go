@@ -1,10 +1,8 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
 
 	"github.com/pmezard/go-difflib/difflib"
@@ -30,13 +28,13 @@ type appDiff struct {
 // image overrides, and live build-tag carry-forward) and prints a per-resource
 // unified YAML diff against live cluster state. Read-only: no apply, no build.
 func runDiff(args []string) error {
-	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	fs := newSubFlagSet("diff")
 	prune := fs.Bool("prune", true, "show tracked resources a sync would prune (delete)")
-	maxParallel := fs.Int("max-parallel", runtime.NumCPU(), "how many apps to render and diff concurrently (0 = one worker per app)")
-	offline := fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm `lookup` will not resolve)")
+	maxParallel := maxParallelFlag(fs)
+	offline := offlineRenderFlag(fs)
 	clientDiff := fs.Bool("client-diff", false, "diff in-process (client-side) instead of via a server-side dry-run apply; faster, but fields the cluster defaults or prunes can show as drift")
 	var images stringSlice
-	fs.Var(&images, "image", "diff as if this pre-built image were deployed: IMAGE=REF (repeatable; also via "+overrideEnv+")")
+	fs.Var(&images, "image", "diff as if this pre-built image were deployed: `IMAGE=REF` (repeatable; also via "+overrideEnv+")")
 	kctx := contextFlag(fs)
 	cfg, names, err := loadConfig(fs, args)
 	if err != nil {

@@ -724,6 +724,38 @@ apps:
 	}
 }
 
+func TestLoad_MissingFileGivesActionableMessage(t *testing.T) {
+	_, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err == nil {
+		t.Fatal("Load of a missing file succeeded, want an error")
+	}
+	for _, want := range []string{"no config file", "-f"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestMultiErr_FormatsManyAsIndentedList(t *testing.T) {
+	one := multiErr{errFor("only one")}
+	if got := one.Error(); got != "only one" {
+		t.Errorf("single error = %q, want it unwrapped without a list header", got)
+	}
+	many := multiErr{errFor("first"), errFor("second")}
+	got := many.Error()
+	for _, want := range []string{"2 problems:", "\n  - first", "\n  - second"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("multi error %q missing %q", got, want)
+		}
+	}
+}
+
+func errFor(msg string) error { return &simpleErr{msg} }
+
+type simpleErr struct{ msg string }
+
+func (e *simpleErr) Error() string { return e.msg }
+
 func TestLoad_ResolvesPathsRelativeToConfigFile(t *testing.T) {
 	dir := t.TempDir()
 	appDir := filepath.Join(dir, "apps", "api-b")
