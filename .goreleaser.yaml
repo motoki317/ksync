@@ -34,12 +34,27 @@ checksum:
 changelog:
   use: github
   sort: asc
+  # The optional `(scope)` and breaking `!` must be matched, or a scoped
+  # `docs(readme):` slips past an `^docs:` anchor while an unscoped `ci:` is
+  # dropped — so the same prefix lands inconsistently in the notes.
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
-      - "^ci:"
+      - '^docs(\(.+\))?!?:'
+      - '^test(\(.+\))?!?:'
+      - '^chore(\(.+\))?!?:'
+      - '^ci(\(.+\))?!?:'
+  groups:
+    - title: Features
+      regexp: '^feat(\(.+\))?!?:'
+      order: 0
+    - title: Bug fixes
+      regexp: '^fix(\(.+\))?!?:'
+      order: 1
+    - title: Performance
+      regexp: '^perf(\(.+\))?!?:'
+      order: 2
+    - title: Other
+      order: 999
 
 release:
   github:
