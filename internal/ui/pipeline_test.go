@@ -111,36 +111,37 @@ func TestPipeline_ExpandNeverCollapses(t *testing.T) {
 	}
 }
 
-// Off a terminal a succeeding stage prints no line as it runs — the heartbeat and
-// the committed line carry it (ADR 20260630-non-tty-progress-output). Finish then
-// commits ONE app-qualified line for a build app: the app, each stage's label and
-// time, and the deploy's apply summary — so an app's whole record is one line.
-func TestPipeline_NonTTYBuildCommitsOneLine(t *testing.T) {
+// Off a terminal a build app streams its per-stage result lines as they finish
+// (the buildx model — line-by-line output is covered in streaming_test.go), then
+// Finish commits just the deploy result line; the slowest-first recap (Recap)
+// carries the per-app total.
+func TestPipeline_NonTTYBuildStreamsThenCommitsDeployLine(t *testing.T) {
+	t.Cleanup(resetLiveTerm)
+	resetLiveTerm()
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
 	p := newPipe(&buf, "ns-system", true, clk)
 	b := p.Build("img")
 	clk.add(time.Second)
 	b.Done(nil)
+	// The build's result line streamed as it finished, so the buffer is not empty.
+	if !strings.Contains(buf.String(), "ns-system/img build │ ✓") {
+		t.Errorf("a build's result line should stream as it finishes, got %q", buf.String())
+	}
 	d := p.Deploy()
 	d.Start()
 	clk.add(500 * time.Millisecond)
 	d.Done(nil)
 
-	// Nothing prints before the commit: a succeeding build/deploy is silent off a
-	// terminal (no liveTerm write happens, so the buffer is untouched).
-	if mid := buf.String(); mid != "" {
-		t.Errorf("succeeding stages should print nothing before commit off a terminal, got %q", mid)
-	}
-
+	buf.Reset()
 	p.Finish(CommitInfo{Summary: "3 applied", Symbol: "✓"})
 	out := strings.TrimSpace(buf.String())
 	if strings.Contains(out, "\n") {
-		t.Errorf("a build app should commit exactly one line off a terminal, got %q", out)
+		t.Errorf("a build app should commit just its deploy line off a terminal, got %q", out)
 	}
-	for _, want := range []string{"ns-system", IconBuild, "img", "1.0s", "3 applied"} {
+	for _, want := range []string{"ns-system", IconDeploy, "Deploy", "3 applied", "0.5s"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("committed one-line should contain %q, got %q", want, out)
+			t.Errorf("committed deploy line should contain %q, got %q", want, out)
 		}
 	}
 }
@@ -249,8 +250,8 @@ func TestPipeline_OverrideOnlyDeployCollapses(t *testing.T) {
 	}
 }
 
-// A failed stage surfaces its full captured output (not just the ✗) so a build
-// failure is diagnosable even on a pipe.
+// A failed stage off a terminal is diagnosable: a build's lines already streamed
+// (each app/label/phase-prefixed), and Done adds a ✗ result line.
 func TestPipeline_FailureShowsCapturedOutput(t *testing.T) {
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
@@ -261,43 +262,12 @@ func TestPipeline_FailureShowsCapturedOutput(t *testing.T) {
 
 	out := buf.String()
 	if !strings.Contains(out, "ERROR: it broke") {
-		t.Errorf("failure should print the captured output, got %q", out)
+		t.Errorf("failure should stream the captured output, got %q", out)
 	}
-	// The stage heading is app-qualified, so a failure names which app built what.
-	if !strings.Contains(out, "Build ns-system/img") {
-		t.Errorf("failure log should be headed by the app-qualified stage, got %q", out)
-	}
-}
-
-// Snapshot reports only the running stages (a pending deploy is excluded), each
-// carrying its owning app, label, phase, and how long it has been running — the
-// raw material the off-terminal heartbeat formats.
-func TestPipeline_SnapshotReportsRunningStages(t *testing.T) {
-	clk := &clock{t: time.Unix(0, 0)}
-	var buf bytes.Buffer
-	p := newPipe(&buf, "shop", true, clk)
-	b := p.Build("ui")
-	d := p.Deploy() // pending, not running
-	clk.add(7 * time.Second)
-
-	snap := p.Snapshot()
-	if len(snap) != 1 {
-		t.Fatalf("only the running build should appear (pending deploy excluded), got %d: %+v", len(snap), snap)
-	}
-	if s := snap[0]; s.App != "shop" || s.Label != "ui" || s.Phase != phaseBuild || s.Elapsed != 7*time.Second {
-		t.Errorf("snapshot should carry app/label/phase/elapsed, got %+v", s)
-	}
-
-	b.Done(nil)
-	d.Start()
-	d.SetTail("3 not ready")
-	clk.add(3 * time.Second)
-	snap = p.Snapshot()
-	if len(snap) != 1 || snap[0].Phase != phaseDeploy {
-		t.Fatalf("after the build finishes and the deploy starts, only the deploy runs, got %+v", snap)
-	}
-	if snap[0].Tail != "3 not ready" {
-		t.Errorf("snapshot should carry the deploy's health-gate tail, got %q", snap[0].Tail)
+	// Each streamed line is app/label/phase-prefixed, so a failure names which app
+	// built what.
+	if !strings.Contains(out, "ns-system/img build │") {
+		t.Errorf("streamed lines should be app/label/phase-prefixed, got %q", out)
 	}
 }
 
@@ -341,12 +311,14 @@ func TestPipeline_RecapSilentOnTerminal(t *testing.T) {
 	}
 }
 
-// Stage is the io.Writer a command's output is wired to: the latest non-empty
-// line surfaces as the running row's tail, carriage-return updates included.
+// On a terminal Stage is the io.Writer a command's output is wired to: the latest
+// non-empty line surfaces as the running row's tail, carriage-return updates
+// included. (Off a terminal the line streams instead — see streaming_test.go.)
 func TestStage_WriteTailsLatestLine(t *testing.T) {
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
 	p := newPipe(&buf, "ns-system", true, clk)
+	p.tty = true // exercise the on-terminal tail path
 	b := p.Build("img")
 	_, _ = b.Write([]byte("pulling base\rexporting layers"))
 

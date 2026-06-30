@@ -1,8 +1,15 @@
 ---
 date: "2026-06-30"
 author: "motoki317"
-status: "accepted"
+status: "superseded"
 ---
+
+> **Superseded by [20260701-non-terminal-log-streaming](20260701-non-terminal-log-streaming.md).**
+> The heartbeat decided here read as noise on a real multi-app run — it reprinted a near-identical
+> in-flight snapshot every 30s with only a climbing elapsed. The successor drops the heartbeat and
+> the per-app aggregate line for the docker-buildx model: stream each build's command output live,
+> prefixed by app/stage. The app-qualification problem this ADR identified, and the slowest-first
+> timing recap it added, both carry forward.
 
 # Context
 

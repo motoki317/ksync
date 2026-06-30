@@ -47,10 +47,11 @@ type SyncOptions struct {
 	// release whose source did not change. A failed hook is re-run regardless of
 	// this flag (see the skipHooks decision in Sync).
 	Force bool
-	// OnWait, when set, is called once per poll while the post-apply health gate
-	// is still waiting, with the resources not yet Healthy. It drives a live
-	// "waiting for health" progress line; it is never called once the app has
-	// converged (an already-healthy sync returns without ever invoking it).
+	// OnWait, when set, is called each poll while the sync is still waiting on
+	// not-yet-Healthy resources — both during the operation (a health-gated wave or
+	// a non-hook Job) and in the post-apply health gate. It drives a live "waiting
+	// for health" progress line. It is never called with an empty set, so an
+	// already-healthy sync returns without ever invoking it.
 	OnWait func(pending []ResourceStatus)
 	// ServerSide decides the apply set from a dry-run server-side apply on the
 	// first reconcile (so a field the cluster defaults or prunes is not seen as
@@ -299,6 +300,18 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 				return results, err
 			}
 			break
+		}
+
+		// The operation loop awaits health-gated waves and non-hook Jobs (a
+		// migration) — often the longest stretch of a sync, and silent off a
+		// terminal without this. Stream the same wait line the final gate does;
+		// SetTail de-dupes, so an unchanged pending set prints nothing. Skip an
+		// empty set: hooks are excluded from pendingHealth, so a lone PostSync Job
+		// yields none and a "0 not ready" line would mislead.
+		if opts.OnWait != nil {
+			if p := e.pendingHealth(target, isManaged); len(p) > 0 {
+				opts.OnWait(p)
+			}
 		}
 
 		select {

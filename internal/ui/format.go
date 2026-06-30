@@ -18,6 +18,10 @@ var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 // emit, so the live tail we show stays on one clean line.
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\r`)
 
+// ansiOnly strips escape sequences but KEEPS carriage returns, for a caller that
+// interprets "\r" redraws itself (streamClean) — ansiPattern would consume them.
+var ansiOnly = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+
 // cols reports the terminal width for fd, or 80 if it cannot be determined.
 func cols(fd int) int {
 	if w, _, err := term.GetSize(fd); err == nil && w > 0 {
@@ -51,6 +55,24 @@ func lastNonEmptyLine(p []byte) string {
 func sanitizeLine(s string) string {
 	s = ansiPattern.ReplaceAllString(s, "")
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// streamClean prepares one captured command line for off-terminal streaming: it
+// strips ANSI escapes, then collapses a carriage-return redraw to the final text
+// the line settled on, and trims trailing space. Unlike sanitizeLine it preserves
+// inner spacing, so a build tool's aligned output (buildx's "#5 [2/4] RUN …")
+// stays readable rather than collapsed to one space. It strips ANSI with ansiOnly,
+// not ansiPattern, precisely so the "\r" survives to be interpreted here.
+func streamClean(s string) string {
+	s = ansiOnly.ReplaceAllString(s, "")
+	// Trim a trailing "\r" (and spaces) first so a plain "\r\n"-terminated line —
+	// already stripped of its "\n" upstream — keeps its text instead of vanishing;
+	// only then take the text after the last remaining "\r" (the final redraw).
+	s = strings.TrimRight(s, "\r \t")
+	if i := strings.LastIndexByte(s, '\r'); i >= 0 {
+		s = s[i+1:]
+	}
+	return s
 }
 
 // Elapsed renders a stage's duration as a threshold-colored token — the single

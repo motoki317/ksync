@@ -131,8 +131,13 @@ re-litigate only with new evidence):
   instead of collapsing, so per-stage timings survive the run; a deploy-only app commits one
   `🚢 Deploy <app>  N applied  <time>` line (the "Deploy" word matches the in-tree deploy row; the
   committed deploy time is the deploy stage's own, via `ui.CommitInfo`). `ui.DeployLine`'s `kind`
-  arg carries that word — sync passes "Deploy", `ksync destroy` passes "" (it is not a deploy). Off
-  a terminal the block is inert (plain per-stage and per-app lines). The console also owns
+  arg carries that word — sync passes "Deploy", `ksync destroy` passes "" (it is not a deploy). **Off
+  a terminal the block is inert; instead each build streams its command output live, line by line,
+  prefixed `app/label <phase> │ ` (the docker-buildx model — the log itself is the liveness signal,
+  no heartbeat)**; imports buffer and report a result line (a coalesced load tees one command to every
+  waiting app, so per-stage streaming would duplicate it — dumped only on failure); a deploy streams a
+  health-gate line only when its not-ready status changes; the run ends with the slowest-first
+  `Timings` recap after the Summary (ADR 20260701-non-terminal-log-streaming). The console also owns
   **inter-section spacing**: every committed write is tagged with a `ui.Section` (Log/Plan/Summary/
   Pipeline) and the console emits exactly one blank line at each kind change — so a new kind of output
   is separated automatically and producers carry no hand-rolled blanks (ADR
@@ -148,8 +153,8 @@ re-litigate only with new evidence):
   re-asks with the larger pending set (the picker reports `aborted`, the gate a `Decision{Reask}`) — and
   ctx/SIGTERM is honored within a poll tick, not only on the next key. See ADRs
   20260615-grouped-pipeline-progress, 20260616-committed-stage-timings, 20260616-manual-build-gate,
-  20260618-group-total-and-deploy-line, 20260619-single-view-build-picker, and
-  20260619-refresh-open-build-prompt.
+  20260618-group-total-and-deploy-line, 20260619-single-view-build-picker,
+  20260619-refresh-open-build-prompt, and 20260701-non-terminal-log-streaming.
 - `internal/watch` — dirty-set mapping (changed path → affected apps/build entries, with
   per-entry ignore predicates), dependency-root derivation (escaping
   chartHome/resources/values), recursive fsnotify watcher with per-root directory pruning.

@@ -43,8 +43,12 @@ const (
 // and Import stages are born running (their work starts immediately); the Deploy
 // stage is born pending and Start()ed when the apply begins, so it shows as
 // upcoming work beneath the builds. A Stage is also the io.Writer a build or
-// import command's combined output is wired to: it tails the latest line live
-// and buffers the rest, surfacing the full log only if the command fails.
+// import command's combined output is wired to. On a terminal it tails the latest
+// line on the live row and buffers the rest, surfacing the full log only if the
+// command fails. Off a terminal it streams each complete build line live, prefixed
+// with the app/stage it belongs to (the buildx model — the log itself is the
+// liveness signal); import output is buffered there too (a coalesced load tees one
+// command to every waiting app, so it is shown only on failure, never per app).
 type Stage struct {
 	pipe  *Pipeline
 	icon  string
@@ -52,12 +56,13 @@ type Stage struct {
 	phase int
 	label string
 
-	mu    sync.Mutex
-	state stageState
-	start time.Time
-	end   time.Time
-	tail  string
-	buf   bytes.Buffer
+	mu      sync.Mutex
+	state   stageState
+	start   time.Time
+	end     time.Time
+	tail    string
+	buf     bytes.Buffer // full output, for the on-terminal failure dump (and off-terminal import failures)
+	partial []byte       // off-terminal: bytes since the last newline, awaiting a complete line to stream
 }
 
 // Start moves a pending stage to running (no-op once running). The Deploy stage
@@ -73,11 +78,19 @@ func (s *Stage) Start() {
 }
 
 // SetTail updates the trailing detail shown while the stage runs (the deploy's
-// "N not ready", say). The next tick repaints it.
+// "N not ready", say). On a terminal the next tick repaints it on the live row.
+// Off a terminal there is no row to repaint, so a *changed* tail is streamed as
+// one prefixed line — the deploy's health gate calls this each poll, and an
+// unchanged status prints nothing, so only real progress (the not-ready set
+// shrinking) emits, never a timed reprint of the same elapsed.
 func (s *Stage) SetTail(line string) {
 	s.mu.Lock()
+	changed := line != s.tail
 	s.tail = line
 	s.mu.Unlock()
+	if changed && line != "" && !s.pipe.tty {
+		liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix()+line+"\n")
+	}
 }
 
 // getState reads the stage's lifecycle state under its lock — used by the
@@ -88,9 +101,14 @@ func (s *Stage) getState() stageState {
 	return s.state
 }
 
-// Write captures a command's output and feeds its latest non-empty line to the
-// live row. It never blocks the command and never errors.
+// Write captures a command's output. On a terminal it buffers the whole output
+// (for the failure dump) and feeds its latest non-empty line to the live row. Off
+// a terminal it streams instead — see writeOff. It never blocks the command and
+// never errors.
 func (s *Stage) Write(p []byte) (int, error) {
+	if !s.pipe.tty {
+		return s.writeOff(p)
+	}
 	s.mu.Lock()
 	s.buf.Write(p)
 	s.mu.Unlock()
@@ -100,11 +118,78 @@ func (s *Stage) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// writeOff streams a command's output off a terminal, the buildx model: each
+// complete build line is printed live, prefixed with the app/stage it belongs to,
+// so a long build's progress shows in a pipe or CI log without any synthetic
+// heartbeat. Import stages do not stream — build.Loader coalesces a load and tees
+// one command's output to every waiting app's stage, so streaming per stage would
+// print each line once per app; their output is buffered and surfaced only if the
+// load fails. Build stages keep no full buffer (their lines already streamed, so a
+// failure needs no re-dump).
+func (s *Stage) writeOff(p []byte) (int, error) {
+	if s.phase == phaseImport {
+		s.mu.Lock()
+		s.buf.Write(p)
+		s.mu.Unlock()
+		return len(p), nil
+	}
+	s.mu.Lock()
+	s.partial = append(s.partial, p...)
+	lines := s.takeLines()
+	s.mu.Unlock()
+	for _, line := range lines {
+		s.emitLine(line)
+	}
+	return len(p), nil
+}
+
+// takeLines splits the complete (newline-terminated) lines out of the partial
+// buffer, leaving any trailing partial line for the next write. Caller holds s.mu.
+func (s *Stage) takeLines() []string {
+	var lines []string
+	for {
+		i := bytes.IndexByte(s.partial, '\n')
+		if i < 0 {
+			break
+		}
+		lines = append(lines, string(s.partial[:i]))
+		s.partial = s.partial[i+1:]
+	}
+	if len(s.partial) == 0 {
+		s.partial = nil // drop the reslice's backing array so it cannot grow unbounded
+	}
+	return lines
+}
+
+// emitLine prints one streamed output line with its stage prefix, skipping a line
+// blank after cleaning so a build tool's empty line never becomes a bare prefix.
+// Called without s.mu held — it writes through the console.
+func (s *Stage) emitLine(line string) {
+	if line = streamClean(line); line == "" {
+		return
+	}
+	liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix()+line+"\n")
+}
+
+// streamPrefix tags a streamed line with the app, the build/import label, and the
+// phase word — "shop/ui build │ ", "shop/ui import │ ", "db deploy │ " — so the
+// interleaved lines of concurrent apps stay attributable and greppable by phase
+// (the word disambiguates a build from an import that share a label). A label equal
+// to the app name (a single unnamed build whose image's last segment is the app) is
+// dropped, so "web/web build" reads as "web build".
+func (s *Stage) streamPrefix() string {
+	name := s.pipe.app
+	if s.label != "" && s.label != s.pipe.app {
+		name += "/" + s.label
+	}
+	return name + " " + strings.ToLower(s.kind) + " " + s.pipe.c.Dim("│") + " "
+}
+
 // Done finishes the stage as succeeded or failed and stamps its elapsed time.
-// On failure it prints the full captured output above the live block so the
-// developer can see what went wrong; the row itself stays (as ✗) until the
-// whole pipeline is committed. Off a terminal it prints a single plain result
-// line instead, keeping piped output clean.
+// On a terminal a failure prints the full captured output above the live block so
+// the developer can see what went wrong; the row itself stays (as ✗) until the
+// whole pipeline is committed. Off a terminal it streams a result line instead —
+// see doneOff.
 func (s *Stage) Done(err error) {
 	s.mu.Lock()
 	s.end = s.pipe.now()
@@ -118,24 +203,42 @@ func (s *Stage) Done(err error) {
 	}
 	elapsed := s.end.Sub(s.start)
 	out := strings.TrimRight(s.buf.String(), "\n")
+	partial := string(s.partial)
+	s.partial = nil
 	s.mu.Unlock()
 
-	// On failure, surface the full captured output above the block in both modes
-	// so the developer (or a CI log) sees what broke, not just the ✗.
+	if !s.pipe.tty {
+		s.doneOff(err, elapsed, out, partial)
+		return
+	}
+	// On a terminal, surface the full captured output above the block on failure so
+	// the developer sees what broke, not just the ✗.
 	if err != nil && out != "" {
 		liveTerm.line(SectionPipeline, s.pipe.w, fmt.Sprintf("%s\n%s\n", s.pipe.c.Dim("─── "+s.heading()+" output ───"), out))
 	}
-	if !s.pipe.tty {
-		// Off a terminal, a succeeding stage prints no line of its own — the
-		// heartbeat reports it in flight and the committed per-app line records its
-		// time (ADR 20260630-non-tty-progress-output). A failure still prints an
-		// app-qualified ✗ line above the captured output, so it is never silent.
-		if err != nil {
-			liveTerm.line(SectionPipeline, s.pipe.w, s.plainResult(err, elapsed))
-		}
+	s.pipe.refresh()
+}
+
+// doneOff finishes a stage off a terminal. The deploy stage prints nothing here —
+// its result is the committed deploy line (Pipeline.Finish). A build/import stage
+// flushes any trailing partial line, then prints one prefixed result line
+// ("shop/ui build │ ✓ 1m01s"). A failure prints the captured output first when
+// there is any — an import never streamed its output, so its buffer is dumped;
+// a build already streamed every line, so its buffer is empty and only the ✗
+// result prints.
+func (s *Stage) doneOff(err error, elapsed time.Duration, out, partial string) {
+	if s.phase == phaseDeploy {
 		return
 	}
-	s.pipe.refresh()
+	s.emitLine(partial)
+	if err != nil && out != "" {
+		liveTerm.line(SectionPipeline, s.pipe.w, fmt.Sprintf("%s\n%s\n", s.pipe.c.Dim("─── "+s.heading()+" output ───"), out))
+	}
+	mark := "✓"
+	if err != nil {
+		mark = "✗"
+	}
+	liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix()+mark+" "+Elapsed(s.pipe.c, elapsed)+"\n")
 }
 
 // heading names the stage for the failure-log header and the non-terminal result
@@ -147,14 +250,6 @@ func (s *Stage) heading() string {
 		return s.kind + " " + s.pipe.app
 	}
 	return s.kind + " " + s.pipe.app + "/" + s.label
-}
-
-func (s *Stage) plainResult(err error, d time.Duration) string {
-	mark := s.pipe.c.Green("✓")
-	if err != nil {
-		mark = s.pipe.c.Red("✗")
-	}
-	return fmt.Sprintf("%s %s %s  %s\n", mark, s.icon, s.heading(), Elapsed(s.pipe.c, d))
 }
 
 // Pipeline is one app's live progress group: a header line (app name plus the
@@ -245,8 +340,9 @@ type CommitInfo struct {
 // block. On a terminal an app that built keeps its full stage tree frozen — every
 // build/import row and the deploy row retain their final time, the header its
 // group total — while a deploy-only app collapses to one deploy line. Off a
-// terminal every app commits a single line (oneLine for a build app, the deploy
-// line otherwise), since the per-stage lines no longer stream as they run.
+// terminal every app commits its single deploy line: a build app's per-stage
+// results already streamed as they ran, so only the deploy result remains, and the
+// slowest-first recap (Recap) carries the per-app totals.
 func (p *Pipeline) Finish(info CommitInfo) {
 	block := p.committed(info)
 	if p.tty {
@@ -267,18 +363,15 @@ func (p *Pipeline) Discard() {
 
 // committed renders the frozen committed block: the per-resource failure/degraded
 // lines first, then the app's summary. A build app on a terminal keeps its full
-// stage tree (each stage's final time preserved); off a terminal it collapses to
-// one line that still carries every stage's label and time, since the per-stage
-// lines no longer stream as they run (ADR 20260630-non-tty-progress-output). A
-// deploy-only app is its single deploy line in either mode.
+// stage tree (each stage's final time preserved); off a terminal it commits just
+// its deploy line, since the build/import stages already streamed their result
+// lines as they ran (ADR 20260701-non-terminal-log-streaming). A deploy-only app
+// is its single deploy line in either mode.
 func (p *Pipeline) committed(info CommitInfo) string {
 	lines := append([]string{}, info.Above...)
-	switch {
-	case p.hasBuildStages() && p.tty:
+	if p.hasBuildStages() && p.tty {
 		lines = append(lines, p.committedTree(info)...)
-	case p.hasBuildStages():
-		lines = append(lines, p.oneLine(info))
-	default:
+	} else {
 		lines = append(lines, p.committedLine(info))
 	}
 	return strings.Join(lines, "\n") + "\n"
@@ -287,10 +380,11 @@ func (p *Pipeline) committed(info CommitInfo) string {
 // oneLine renders a build app's whole pipeline as a single non-terminal line: the
 // group health symbol, the app, each finished stage as "icon label time" (the
 // deploy carries its apply summary instead of a label, which the app already
-// supplies) joined by " · ", then the group's total wall-clock. Off a terminal
-// this one line is both the app's completion line and its entry in the slowest-
-// first recap, so an app's timings read identically in both places. Pending
-// stages (a deploy that never ran because a build failed) are skipped.
+// supplies) joined by " · ", then the group's total wall-clock. It is a build app's
+// entry in the slowest-first recap (Recap) printed after the run's Summary — the
+// consolidated "which app took how long" view; the per-stage progress itself
+// streamed live as the build ran. Pending stages (a deploy that never ran because a
+// build failed) are skipped.
 func (p *Pipeline) oneLine(info CommitInfo) string {
 	p.mu.Lock()
 	stages := make([]*Stage, len(p.stages))
@@ -456,8 +550,8 @@ func (p *Pipeline) refresh() {
 
 // groupSpan is the whole group's wall-clock duration: from the earliest stage
 // start to the latest stage end, or to now while any stage still runs. It is the
-// span, not the sum of the rows — builds overlap, so "sistema took N" is the
-// elapsed wall clock across the tree, not the addition of its stage times.
+// span, not the sum of the rows — builds overlap, so "app took N" is the elapsed
+// wall clock across the tree, not the addition of its stage times.
 // Returns 0 when every stage is still pending (nothing has started to time).
 // Each stage is read under its own lock; the caller passes the stage snapshot.
 func groupSpan(stages []*Stage, now time.Time) time.Duration {
@@ -565,42 +659,6 @@ func (p *Pipeline) collapsedLine(s *Stage, frame rune) string {
 		line += "  " + meta
 	}
 	return line
-}
-
-// RunningStage is one in-flight stage in a heartbeat snapshot: the owning app,
-// the stage's phase (for grouping and to tell a deploy from a build/import), its
-// label, how long it has been running, and its live tail — the deploy's health-gate
-// status ("3 not ready"), so a stalled deploy's heartbeat names what it waits on,
-// not just an elapsed that keeps climbing.
-type RunningStage struct {
-	App     string
-	Phase   int
-	Label   string
-	Elapsed time.Duration
-	Tail    string
-}
-
-// Snapshot returns this app's currently-running stages, for the off-terminal
-// heartbeat. It copies the stage list under the pipeline lock, then reads each
-// stage under its own lock (the same order every other reader takes), so the
-// caller can format and write without holding any UI lock. Empty when nothing in
-// this app is running.
-func (p *Pipeline) Snapshot() []RunningStage {
-	p.mu.Lock()
-	stages := make([]*Stage, len(p.stages))
-	copy(stages, p.stages)
-	app := p.app
-	p.mu.Unlock()
-	now := p.now()
-	var out []RunningStage
-	for _, s := range stages {
-		s.mu.Lock()
-		if s.state == stateRunning {
-			out = append(out, RunningStage{App: app, Phase: s.phase, Label: s.label, Elapsed: now.Sub(s.start), Tail: s.tail})
-		}
-		s.mu.Unlock()
-	}
-	return out
 }
 
 // Recap returns this app's one-line completion summary and its total wall-clock,

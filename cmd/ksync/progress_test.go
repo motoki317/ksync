@@ -11,44 +11,11 @@ import (
 )
 
 // offProgress builds a progress whose pipelines are off-terminal (a *bytes.Buffer
-// is not an *os.File, so isLive is false) — the mode the heartbeat and the timing
-// recap serve.
+// is not an *os.File, so isLive is false) — the mode the streamed logs and the
+// timing recap serve.
 func offProgress(apps []config.App) (*progress, *bytes.Buffer) {
 	var buf bytes.Buffer
 	return newProgress(&buf, ui.NewColors(&buf), apps), &buf
-}
-
-// snapshot aggregates the in-flight stages across every live pipeline — the seam
-// the heartbeat reads each tick. The per-pipeline Snapshot is covered in internal/ui;
-// this exercises the cmd-layer map walk: stages from distinct apps all appear, and a
-// waiting deploy's health-gate tail survives the hop into the RunningStage set.
-func TestProgressSnapshot_AggregatesAcrossPipelines(t *testing.T) {
-	prog, _ := offProgress([]config.App{{Name: "shop"}, {Name: "db"}})
-
-	prog.pipeline("shop").Build("ui") // born running
-	d := prog.pipeline("db").Deploy()
-	d.Start()
-	d.SetTail("3 not ready")
-
-	snap := prog.snapshot()
-	if len(snap) != 2 {
-		t.Fatalf("snapshot should gather one running stage from each pipeline, got %d: %+v", len(snap), snap)
-	}
-	var build, deploy *ui.RunningStage
-	for i := range snap {
-		switch snap[i].App {
-		case "shop":
-			build = &snap[i]
-		case "db":
-			deploy = &snap[i]
-		}
-	}
-	if build == nil || build.Label != "ui" {
-		t.Errorf("the shop build (label ui) should be in the snapshot, got %+v", snap)
-	}
-	if deploy == nil || deploy.Tail != "3 not ready" {
-		t.Errorf("the db deploy's health-gate tail should survive into the snapshot, got %+v", snap)
-	}
 }
 
 // Off a terminal, finishing an app captures its completion line for the recap, and
