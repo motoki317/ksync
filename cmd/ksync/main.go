@@ -843,6 +843,15 @@ func runByNeeds(ctx context.Context, apps []config.App, maxParallel int, fn func
 				return
 			}
 			defer func() { <-sem }()
+			// A need's done channel closes on failure as well as success, and a
+			// failed need cancels ctx before that close. The waits above use
+			// select, which may take a ready closed-channel case even when
+			// ctx.Done() is also ready — so without this re-check a dependent
+			// could run after the need it waited on failed. cancel() happens
+			// before the close, so a cancellation is always observable here.
+			if ctx.Err() != nil {
+				return
+			}
 			if err := fn(ctx, a); err != nil {
 				errOnce.Do(func() { firstErr = err; cancel() })
 			}
