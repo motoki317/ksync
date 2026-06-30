@@ -21,6 +21,7 @@ func TestWatchReporter_CommitsSummaryPerBatch(t *testing.T) {
 	out := ui.NewColors(&buf)
 	log := ui.New(ui.Options{Writer: &buf})
 	r := startWatchReporter(&buf, out, log, newProgress(&buf, out, apps), apps, "prod-cluster")
+	t.Cleanup(r.stop) // the reporter starts a heartbeat goroutine; don't leak it past the test
 
 	if out := buf.String(); !strings.Contains(out, "Plan") || !strings.Contains(out, "prod-cluster") {
 		t.Fatalf("watch start = %q, want a Plan naming the context", out)
@@ -64,6 +65,7 @@ func TestWatchReporter_SingleAppHasNoPlanOrSummary(t *testing.T) {
 	colors := ui.NewColors(&buf)
 	log := ui.New(ui.Options{Writer: &buf})
 	r := startWatchReporter(&buf, colors, log, newProgress(&buf, colors, apps), apps, "prod-cluster")
+	t.Cleanup(r.stop) // the reporter starts a heartbeat goroutine; don't leak it past the test
 	r.report("duo", loop.SyncStats{Applied: 3}, 0)
 	r.onIdle(time.Second)
 	out := buf.String()

@@ -53,6 +53,7 @@ const (
 	SectionLog
 	SectionPlan
 	SectionSummary
+	SectionTimings
 	SectionPipeline
 )
 

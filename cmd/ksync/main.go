@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,6 +42,12 @@ import (
 // On expiry the sync fails with the names of the resources still unhealthy;
 // in watch mode the scheduler then retries with backoff.
 const defaultSyncTimeout = 5 * time.Minute
+
+// heartbeatInterval is how often the off-terminal heartbeat prints an in-flight
+// snapshot, so a piped or CI run shows progress instead of looking hung. Kept at
+// the low-overload end of the 10–30s the use case calls for; inert on a terminal,
+// where the live block already animates (ADR 20260630-non-tty-progress-output).
+const heartbeatInterval = 30 * time.Second
 
 // signalContext returns a context canceled on the first SIGINT/SIGTERM, and
 // hard-exits the process on the second. signal.NotifyContext alone is unsafe
@@ -488,6 +495,13 @@ func runSync(args []string) error {
 			return summaryLines(out, len(apps), synced, agg, degradedApps, time.Since(started), false)
 		})
 	}
+	// Off a terminal the live block is inert, so a periodic heartbeat reports the
+	// in-flight builds/deploys — otherwise a long run looks hung in a CI log. Inert
+	// on a terminal (ADR 20260630-non-tty-progress-output).
+	heartbeat := ui.StartHeartbeat(os.Stderr, out, heartbeatInterval, func() string {
+		return ui.HeartbeatLine(out, prog.snapshot())
+	})
+	defer heartbeat.Stop()
 	// Builds run ahead of the needs DAG: an image is local, so it can build
 	// while the apps it depends on still deploy. The deploy phase below awaits
 	// each app's own build, so nothing applies an unbuilt image — but no build
@@ -534,12 +548,20 @@ func runSync(args []string) error {
 		prog.finish(app.Name, &ui.CommitInfo{Summary: summary, Symbol: symbol, Above: failureLines(out, results, degraded), NameW: nameW})
 		return nil
 	})
+	// Stop and drain any eager builds still running — a failed or aborted run
+	// leaves some unfinished — before the Summary, so a late build's failure line
+	// cannot land after it. waitBuilds is wg.Wait, safe to call here and again via
+	// the defer. Then end the heartbeat so no liveness tick interleaves the Summary.
+	buildCancel()
+	waitBuilds()
+	heartbeat.Stop()
 	footer.Stop()
 	if multi {
 		mu.Lock()
 		final := summaryLines(out, len(apps), synced, agg, degradedApps, time.Since(started), true)
 		mu.Unlock()
 		printSummaryBlock(os.Stderr, final)
+		printTimings(os.Stderr, out, prog.takeTimings())
 	}
 	return err
 }
@@ -1095,18 +1117,24 @@ type watchReporter struct {
 	nameW int
 	multi bool // frame with a Plan/footer/Summary (more than one app)
 
-	mu       sync.Mutex
-	synced   int            // apps synced in the current batch
-	agg      loop.SyncStats // apply stats aggregated over the current batch
-	degraded []string       // degraded apps in the current batch
-	started  time.Time      // initial-convergence start, for the live footer's elapsed
-	footer   *ui.Footer     // live tally; pinned only during the initial convergence
+	mu        sync.Mutex
+	synced    int            // apps synced in the current batch
+	agg       loop.SyncStats // apply stats aggregated over the current batch
+	degraded  []string       // degraded apps in the current batch
+	started   time.Time      // initial-convergence start, for the live footer's elapsed
+	footer    *ui.Footer     // live tally; pinned only during the initial convergence
+	heartbeat *ui.Heartbeat  // off-terminal liveness ticks; inert on a terminal
 }
 
 // startWatchReporter prints the Plan and pins the live Summary footer for a
-// multi-app watch; a single-app watch gets an inert reporter (no Plan/footer).
+// multi-app watch (a single-app watch gets neither), and starts the off-terminal
+// heartbeat for either — a single long-building app still needs liveness in a CI
+// log. The heartbeat is inert on a terminal.
 func startWatchReporter(w io.Writer, out ui.Colors, log logr.Logger, prog *progress, apps []config.App, kubeContext string) *watchReporter {
 	r := &watchReporter{w: w, out: out, log: log, prog: prog, total: len(apps), nameW: nameColWidth(apps), multi: len(apps) > 1, started: time.Now()}
+	r.heartbeat = ui.StartHeartbeat(w, out, heartbeatInterval, func() string {
+		return ui.HeartbeatLine(out, prog.snapshot())
+	})
 	if !r.multi {
 		return r
 	}
@@ -1154,22 +1182,29 @@ func (r *watchReporter) onIdle(took time.Duration) {
 	r.mu.Unlock()
 
 	footer.Stop() // nil-safe; present only for the initial convergence
+	// Drain the recap every batch to bound memory even on a single-app watch (where
+	// it is captured but not printed); print the slowest-first recap after the
+	// Summary only for a multi-app batch.
+	timings := r.prog.takeTimings()
 	if r.multi {
 		printSummaryBlock(r.w, summaryLines(r.out, r.total, synced, agg, degraded, took, true))
+		printTimings(r.w, r.out, timings)
 	}
 	// The console sets this log line one blank apart from the Summary (or, for a
 	// single-app watch, from the pipeline) above it — see ui.Section.
 	r.log.Info("Finished, watching for changes")
 }
 
-// stop removes the live footer; idempotent, so the deferred call after the loop
-// exits is harmless when a batch already stopped it. It matters when Ctrl-C
-// arrives mid-convergence — without it the footer stays pinned.
+// stop removes the live footer and ends the heartbeat; idempotent, so the deferred
+// call after the loop exits is harmless when a batch already stopped the footer. It
+// matters when Ctrl-C arrives mid-convergence — without it the footer stays pinned
+// and the heartbeat goroutine leaks.
 func (r *watchReporter) stop() {
 	r.mu.Lock()
 	footer := r.footer
 	r.mu.Unlock()
 	footer.Stop()
+	r.heartbeat.Stop()
 }
 
 // progress coordinates the per-app pipelines (ui.Pipeline) that group an app's
@@ -1184,8 +1219,17 @@ type progress struct {
 	colors ui.Colors
 	expand map[string]bool // app -> has builds: show the full tree, never collapse
 
-	mu    sync.Mutex
-	pipes map[string]*ui.Pipeline
+	mu      sync.Mutex
+	pipes   map[string]*ui.Pipeline
+	timings []timingEntry // off-terminal: finished apps' recap lines, drained per batch
+}
+
+// timingEntry is one app's contribution to the slowest-first timing recap: its
+// completion line (identical to what Finish printed) and the group's total
+// wall-clock, the sort key.
+type timingEntry struct {
+	line  string
+	total time.Duration
 }
 
 func newProgress(w io.Writer, colors ui.Colors, apps []config.App) *progress {
@@ -1194,6 +1238,36 @@ func newProgress(w io.Writer, colors ui.Colors, apps []config.App) *progress {
 		expand[a.Name] = len(a.Build) > 0
 	}
 	return &progress{w: w, colors: colors, expand: expand, pipes: make(map[string]*ui.Pipeline)}
+}
+
+// snapshot collects the in-flight stages across every live pipeline for the
+// heartbeat. It copies the pipeline set under the lock, then snapshots each
+// outside it — so a heartbeat tick never holds progress.mu (let alone a pipeline
+// or stage lock) across the console write that follows.
+func (p *progress) snapshot() []ui.RunningStage {
+	p.mu.Lock()
+	pipes := make([]*ui.Pipeline, 0, len(p.pipes))
+	for _, pipe := range p.pipes {
+		pipes = append(pipes, pipe)
+	}
+	p.mu.Unlock()
+	var out []ui.RunningStage
+	for _, pipe := range pipes {
+		out = append(out, pipe.Snapshot()...)
+	}
+	return out
+}
+
+// takeTimings drains the accumulated per-app recap entries, sorted slowest-first,
+// and resets the accumulator for the next batch. Called every batch (one-shot run,
+// or each watch convergence) to bound memory even when the recap is not printed.
+func (p *progress) takeTimings() []timingEntry {
+	p.mu.Lock()
+	entries := p.timings
+	p.timings = nil
+	p.mu.Unlock()
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].total > entries[j].total })
+	return entries
 }
 
 // pipeline returns the app's live pipeline, creating it (with a pending Deploy
@@ -1222,8 +1296,17 @@ func (p *progress) finish(app string, info *ui.CommitInfo) {
 	if pipe != nil {
 		if info == nil {
 			pipe.Discard()
-		} else {
-			pipe.Finish(*info)
+			return
+		}
+		pipe.Finish(*info)
+		// Off a terminal, retain this app's completion line and total for the
+		// slowest-first recap printed after the run's Summary — the live pipes map is
+		// empty by then, so the recap cannot be read from it (Recap is a no-op on a
+		// terminal, where the frozen trees already show timings in scrollback).
+		if line, total, ok := pipe.Recap(*info); ok {
+			p.mu.Lock()
+			p.timings = append(p.timings, timingEntry{line: line, total: total})
+			p.mu.Unlock()
 		}
 		return
 	}
@@ -1580,4 +1663,21 @@ func summaryLines(c ui.Colors, total, synced int, agg loop.SyncStats, degradedAp
 // and the watching-for-changes log below.
 func printSummaryBlock(w io.Writer, lines []string) {
 	ui.WriteLine(ui.SectionSummary, w, strings.Join(lines, "\n")+"\n")
+}
+
+// printTimings commits the slowest-first per-app timing recap after the Summary —
+// the "which app/image took how long" breakdown a CI reader wants. The entries are
+// captured only off a terminal (Recap is a no-op on one), so on a terminal this is
+// empty and prints nothing. Its own section means the console sets it one blank
+// apart from the Summary above and the watching-for-changes log below.
+func printTimings(w io.Writer, c ui.Colors, entries []timingEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString(c.Bold("Timings") + "\n")
+	for _, e := range entries {
+		b.WriteString("  " + e.line + "\n")
+	}
+	ui.WriteLine(ui.SectionTimings, w, b.String())
 }

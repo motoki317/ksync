@@ -3,8 +3,6 @@ package ui
 import (
 	"io"
 	"os"
-
-	"golang.org/x/term"
 )
 
 // Footer is a multi-line block pinned to the bottom of the terminal, below any
@@ -22,13 +20,11 @@ type Footer struct {
 // concurrently with the caller's own updates to whatever state it reads.
 func StartFooter(w io.Writer, c Colors, render func() []string) *Footer {
 	f := &Footer{}
-	file, ok := w.(*os.File)
-	isTTY := ok && c.Enabled() && term.IsTerminal(int(file.Fd()))
-	if !isTTY {
+	if !isLive(w, c) {
 		return f
 	}
 	f.active = true
-	fd := int(file.Fd())
+	fd := int(w.(*os.File).Fd())
 	liveTerm.setFooter(w, func() int { return cols(fd) }, func() int { return rows(fd) }, render)
 	return f
 }

@@ -53,6 +53,16 @@ func colorEnabled(w io.Writer) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
+// isLive reports whether w is a live terminal these Colors will animate on — the
+// one predicate behind the live block (Pipeline), the pinned footer, and the
+// off-terminal heartbeat (its inverse). It pairs c.Enabled() (NO_COLOR/terminal)
+// with a direct terminal check on w, so a Colors built for a different writer
+// cannot mistake a pipe for a terminal.
+func isLive(w io.Writer, c Colors) bool {
+	f, ok := w.(*os.File)
+	return ok && c.Enabled() && term.IsTerminal(int(f.Fd()))
+}
+
 // Enabled reports whether these Colors emit escape codes.
 func (c Colors) Enabled() bool { return c.on }
 

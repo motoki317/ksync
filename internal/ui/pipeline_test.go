@@ -111,12 +111,11 @@ func TestPipeline_ExpandNeverCollapses(t *testing.T) {
 	}
 }
 
-// Off a terminal, build/import stages print plain result lines (their only
-// record) but the deploy stage is silent — its committed summary already reports
-// the app, so a pipe shows one line per app, not two. The committed line itself
-// does carry the "Deploy" word; the silence is that the stage adds no line of its
-// own before the commit.
-func TestPipeline_NonTTYBuildPrintsDeploySilent(t *testing.T) {
+// Off a terminal a succeeding stage prints no line as it runs — the heartbeat and
+// the committed line carry it (ADR 20260630-non-tty-progress-output). Finish then
+// commits ONE app-qualified line for a build app: the app, each stage's label and
+// time, and the deploy's apply summary — so an app's whole record is one line.
+func TestPipeline_NonTTYBuildCommitsOneLine(t *testing.T) {
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
 	p := newPipe(&buf, "ns-system", true, clk)
@@ -128,19 +127,21 @@ func TestPipeline_NonTTYBuildPrintsDeploySilent(t *testing.T) {
 	clk.add(500 * time.Millisecond)
 	d.Done(nil)
 
-	// Before the commit, the build has streamed its own result line but the deploy
-	// stage has added none — its committed summary is its only record off a terminal.
-	mid := buf.String()
-	if !strings.Contains(mid, "Build img") {
-		t.Errorf("non-tty build should print a plain result line, got %q", mid)
-	}
-	if strings.Contains(mid, IconDeploy) || strings.Contains(mid, "Deploy") {
-		t.Errorf("non-tty deploy stage must stay silent until commit, got %q", mid)
+	// Nothing prints before the commit: a succeeding build/deploy is silent off a
+	// terminal (no liveTerm write happens, so the buffer is untouched).
+	if mid := buf.String(); mid != "" {
+		t.Errorf("succeeding stages should print nothing before commit off a terminal, got %q", mid)
 	}
 
 	p.Finish(CommitInfo{Summary: "3 applied", Symbol: "✓"})
-	if out := buf.String(); !strings.Contains(out, "3 applied") {
-		t.Errorf("Finish should print the committed summary, got %q", out)
+	out := strings.TrimSpace(buf.String())
+	if strings.Contains(out, "\n") {
+		t.Errorf("a build app should commit exactly one line off a terminal, got %q", out)
+	}
+	for _, want := range []string{"ns-system", IconBuild, "img", "1.0s", "3 applied"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("committed one-line should contain %q, got %q", want, out)
+		}
 	}
 }
 
@@ -262,8 +263,81 @@ func TestPipeline_FailureShowsCapturedOutput(t *testing.T) {
 	if !strings.Contains(out, "ERROR: it broke") {
 		t.Errorf("failure should print the captured output, got %q", out)
 	}
-	if !strings.Contains(out, "Build img") {
-		t.Errorf("failure log should be headed by the stage, got %q", out)
+	// The stage heading is app-qualified, so a failure names which app built what.
+	if !strings.Contains(out, "Build ns-system/img") {
+		t.Errorf("failure log should be headed by the app-qualified stage, got %q", out)
+	}
+}
+
+// Snapshot reports only the running stages (a pending deploy is excluded), each
+// carrying its owning app, label, phase, and how long it has been running — the
+// raw material the off-terminal heartbeat formats.
+func TestPipeline_SnapshotReportsRunningStages(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "shop", true, clk)
+	b := p.Build("ui")
+	d := p.Deploy() // pending, not running
+	clk.add(7 * time.Second)
+
+	snap := p.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("only the running build should appear (pending deploy excluded), got %d: %+v", len(snap), snap)
+	}
+	if s := snap[0]; s.App != "shop" || s.Label != "ui" || s.Phase != phaseBuild || s.Elapsed != 7*time.Second {
+		t.Errorf("snapshot should carry app/label/phase/elapsed, got %+v", s)
+	}
+
+	b.Done(nil)
+	d.Start()
+	d.SetTail("3 not ready")
+	clk.add(3 * time.Second)
+	snap = p.Snapshot()
+	if len(snap) != 1 || snap[0].Phase != phaseDeploy {
+		t.Fatalf("after the build finishes and the deploy starts, only the deploy runs, got %+v", snap)
+	}
+	if snap[0].Tail != "3 not ready" {
+		t.Errorf("snapshot should carry the deploy's health-gate tail, got %q", snap[0].Tail)
+	}
+}
+
+// Off a terminal, Recap returns the app's completion line and the group's total
+// wall-clock (the span across overlapping stages) for the slowest-first recap.
+func TestPipeline_RecapOffTerminal(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "shop", true, clk)
+	d := p.Deploy()
+	b := p.Build("ui")
+	clk.add(30 * time.Second)
+	b.Done(nil)
+	d.Start()
+	clk.add(10 * time.Second)
+	d.Done(nil)
+
+	line, total, ok := p.Recap(CommitInfo{Summary: "5 applied", Symbol: "✓"})
+	if !ok {
+		t.Fatal("Recap should report off a terminal")
+	}
+	if total != 40*time.Second {
+		t.Errorf("total should be the group span (build start → deploy end = 40s), got %s", total)
+	}
+	for _, want := range []string{"shop", "ui", "5 applied"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("recap line should contain %q, got %q", want, line)
+		}
+	}
+}
+
+// On a terminal Recap is a no-op: the frozen stage trees already show per-app
+// timings in scrollback, so there is no separate recap to print.
+func TestPipeline_RecapSilentOnTerminal(t *testing.T) {
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "shop", true, clk)
+	p.tty = true // pretend a terminal
+	if _, _, ok := p.Recap(CommitInfo{}); ok {
+		t.Error("Recap should be a no-op on a terminal")
 	}
 }
 

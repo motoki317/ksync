@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/term"
 )
 
 // Stage icons distinguish the kinds of work at a glance; the kind word beside
@@ -48,12 +46,11 @@ const (
 // import command's combined output is wired to: it tails the latest line live
 // and buffers the rest, surfacing the full log only if the command fails.
 type Stage struct {
-	pipe   *Pipeline
-	icon   string
-	kind   string
-	phase  int
-	label  string
-	silent bool // off a terminal, prints no standalone result line (the deploy: its record is the committed summary)
+	pipe  *Pipeline
+	icon  string
+	kind  string
+	phase int
+	label string
 
 	mu    sync.Mutex
 	state stageState
@@ -129,9 +126,11 @@ func (s *Stage) Done(err error) {
 		liveTerm.line(SectionPipeline, s.pipe.w, fmt.Sprintf("%s\n%s\n", s.pipe.c.Dim("─── "+s.heading()+" output ───"), out))
 	}
 	if !s.pipe.tty {
-		// The deploy is silent on a pipe (its committed summary already reports the
-		// app); build/import lines are not — they are the only record of that work.
-		if !s.silent {
+		// Off a terminal, a succeeding stage prints no line of its own — the
+		// heartbeat reports it in flight and the committed per-app line records its
+		// time (ADR 20260630-non-tty-progress-output). A failure still prints an
+		// app-qualified ✗ line above the captured output, so it is never silent.
+		if err != nil {
 			liveTerm.line(SectionPipeline, s.pipe.w, s.plainResult(err, elapsed))
 		}
 		return
@@ -140,14 +139,14 @@ func (s *Stage) Done(err error) {
 }
 
 // heading names the stage for the failure-log header and the non-terminal result
-// line: "Build ns-dashboard", "Deploy ns-system" (the app when the stage has no
-// label of its own, as the deploy does not).
+// line, always carrying the owning app so two apps that build like-named images
+// are never conflated: "Build shop/ui" (app-qualified label), "Deploy ns-system"
+// (the deploy has no label of its own, so the app stands alone).
 func (s *Stage) heading() string {
-	label := s.label
-	if label == "" {
-		label = s.pipe.app
+	if s.label == "" {
+		return s.kind + " " + s.pipe.app
 	}
-	return s.kind + " " + label
+	return s.kind + " " + s.pipe.app + "/" + s.label
 }
 
 func (s *Stage) plainResult(err error, d time.Duration) string {
@@ -189,10 +188,9 @@ func StartPipeline(w io.Writer, c Colors, app string, expand bool) *Pipeline {
 
 func startPipeline(w io.Writer, c Colors, app string, expand bool, now func() time.Time) *Pipeline {
 	p := &Pipeline{w: w, c: c, app: app, expand: expand, now: now}
-	f, ok := w.(*os.File)
-	p.tty = ok && c.Enabled() && term.IsTerminal(int(f.Fd()))
+	p.tty = isLive(w, c)
 	if p.tty {
-		fd := int(f.Fd())
+		fd := int(w.(*os.File).Fd())
 		liveTerm.addItem(w, func() int { return cols(fd) }, func() int { return rows(fd) }, p)
 	}
 	return p
@@ -222,7 +220,7 @@ func (p *Pipeline) Import(label string) *Stage {
 func (p *Pipeline) Deploy() *Stage {
 	p.mu.Lock()
 	if p.deploy == nil {
-		p.deploy = &Stage{pipe: p, icon: IconDeploy, kind: "Deploy", phase: phaseDeploy, state: statePending, silent: true}
+		p.deploy = &Stage{pipe: p, icon: IconDeploy, kind: "Deploy", phase: phaseDeploy, state: statePending}
 		p.stages = append(p.stages, p.deploy)
 	}
 	d := p.deploy
@@ -244,12 +242,11 @@ type CommitInfo struct {
 }
 
 // Finish commits the group in place of the live one and removes it from the
-// block. An app that built keeps its full stage tree frozen — every build/import
-// row and the deploy row retain their final time, the header its group total — so
-// the per-stage timings survive the run; a deploy-only app (no builds, or all
-// overridden) collapses to one deploy line. Off a terminal it prints only that
-// single line (the build/import stages already streamed their own result lines as
-// they finished).
+// block. On a terminal an app that built keeps its full stage tree frozen — every
+// build/import row and the deploy row retain their final time, the header its
+// group total — while a deploy-only app collapses to one deploy line. Off a
+// terminal every app commits a single line (oneLine for a build app, the deploy
+// line otherwise), since the per-stage lines no longer stream as they run.
 func (p *Pipeline) Finish(info CommitInfo) {
 	block := p.committed(info)
 	if p.tty {
@@ -269,18 +266,74 @@ func (p *Pipeline) Discard() {
 }
 
 // committed renders the frozen committed block: the per-resource failure/degraded
-// lines first, then — when the app actually built — its full stage tree (so each
-// stage's final time is preserved) or, for a deploy-only app, its single deploy
-// line. Off a terminal it is always the single line — the build/import rows
-// already printed as they ran.
+// lines first, then the app's summary. A build app on a terminal keeps its full
+// stage tree (each stage's final time preserved); off a terminal it collapses to
+// one line that still carries every stage's label and time, since the per-stage
+// lines no longer stream as they run (ADR 20260630-non-tty-progress-output). A
+// deploy-only app is its single deploy line in either mode.
 func (p *Pipeline) committed(info CommitInfo) string {
 	lines := append([]string{}, info.Above...)
-	if p.tty && p.hasBuildStages() {
+	switch {
+	case p.hasBuildStages() && p.tty:
 		lines = append(lines, p.committedTree(info)...)
-	} else {
+	case p.hasBuildStages():
+		lines = append(lines, p.oneLine(info))
+	default:
 		lines = append(lines, p.committedLine(info))
 	}
 	return strings.Join(lines, "\n") + "\n"
+}
+
+// oneLine renders a build app's whole pipeline as a single non-terminal line: the
+// group health symbol, the app, each finished stage as "icon label time" (the
+// deploy carries its apply summary instead of a label, which the app already
+// supplies) joined by " · ", then the group's total wall-clock. Off a terminal
+// this one line is both the app's completion line and its entry in the slowest-
+// first recap, so an app's timings read identically in both places. Pending
+// stages (a deploy that never ran because a build failed) are skipped.
+func (p *Pipeline) oneLine(info CommitInfo) string {
+	p.mu.Lock()
+	stages := make([]*Stage, len(p.stages))
+	copy(stages, p.stages)
+	p.mu.Unlock()
+	sort.SliceStable(stages, func(i, j int) bool { return stages[i].phase < stages[j].phase })
+
+	sym := info.Symbol
+	if sym == "" {
+		sym = p.c.Green("✓")
+	}
+	var segs []string
+	for _, s := range stages {
+		s.mu.Lock()
+		pending := s.state == statePending
+		elapsed := s.end.Sub(s.start)
+		s.mu.Unlock()
+		if pending {
+			continue
+		}
+		seg := s.icon
+		if s.phase == phaseDeploy {
+			if info.Summary != "" {
+				seg += " " + info.Summary
+			}
+		} else if s.label != "" {
+			seg += " " + s.label
+		}
+		seg += " " + Elapsed(p.c, elapsed)
+		segs = append(segs, seg)
+	}
+	line := sym + " " + p.c.Bold(p.app)
+	if len(segs) > 0 {
+		line += "  " + strings.Join(segs, p.c.Dim(" · "))
+	}
+	// The total is the wall-clock span (builds overlap), worth showing only when
+	// more than one stage ran — for a single stage it would just repeat its time.
+	if len(segs) > 1 {
+		if d := groupSpan(stages, p.now()); d > 0 {
+			line += "  " + Elapsed(p.c, d)
+		}
+	}
+	return line
 }
 
 // committedTree freezes a build app's group: the app header (with the group's
@@ -512,6 +565,61 @@ func (p *Pipeline) collapsedLine(s *Stage, frame rune) string {
 		line += "  " + meta
 	}
 	return line
+}
+
+// RunningStage is one in-flight stage in a heartbeat snapshot: the owning app,
+// the stage's phase (for grouping and to tell a deploy from a build/import), its
+// label, how long it has been running, and its live tail — the deploy's health-gate
+// status ("3 not ready"), so a stalled deploy's heartbeat names what it waits on,
+// not just an elapsed that keeps climbing.
+type RunningStage struct {
+	App     string
+	Phase   int
+	Label   string
+	Elapsed time.Duration
+	Tail    string
+}
+
+// Snapshot returns this app's currently-running stages, for the off-terminal
+// heartbeat. It copies the stage list under the pipeline lock, then reads each
+// stage under its own lock (the same order every other reader takes), so the
+// caller can format and write without holding any UI lock. Empty when nothing in
+// this app is running.
+func (p *Pipeline) Snapshot() []RunningStage {
+	p.mu.Lock()
+	stages := make([]*Stage, len(p.stages))
+	copy(stages, p.stages)
+	app := p.app
+	p.mu.Unlock()
+	now := p.now()
+	var out []RunningStage
+	for _, s := range stages {
+		s.mu.Lock()
+		if s.state == stateRunning {
+			out = append(out, RunningStage{App: app, Phase: s.phase, Label: s.label, Elapsed: now.Sub(s.start), Tail: s.tail})
+		}
+		s.mu.Unlock()
+	}
+	return out
+}
+
+// Recap returns this app's one-line completion summary and its total wall-clock,
+// for the slowest-first timing recap printed after a run's Summary. ok is false on
+// a terminal — there the frozen stage trees already show per-app timings in
+// scrollback, so no recap is printed. Call after Finish, when every stage is
+// frozen.
+func (p *Pipeline) Recap(info CommitInfo) (line string, total time.Duration, ok bool) {
+	if p.tty {
+		return "", 0, false
+	}
+	p.mu.Lock()
+	stages := make([]*Stage, len(p.stages))
+	copy(stages, p.stages)
+	p.mu.Unlock()
+	if p.hasBuildStages() {
+		return p.oneLine(info), groupSpan(stages, p.now()), true
+	}
+	return p.committedLine(info), groupSpan(stages, p.now()), true
 }
 
 // stageParts returns a stage's status symbol and its meta (the dim tail plus the
