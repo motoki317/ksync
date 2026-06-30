@@ -121,6 +121,14 @@ type App struct {
 	// between clusters — keeping the kustomization a pure kustomize file. See
 	// Patch and ADR 20260623-post-render-patches.
 	Patches []Patch `json:"patches,omitempty"`
+	// ClientRender renders this app the way ArgoCD does — an in-process `helm
+	// template` that keeps the cluster's API capabilities but drops the
+	// server-side dry-run ksync uses by default. That dry-run validates every
+	// resource against the live cluster, so an app whose chart ships a CRD
+	// alongside custom resources of that kind otherwise fails to render with "no
+	// matches for kind" until the CRD exists. Disables `helm lookup` for the app.
+	// See ADR 20260630-client-render-per-app.
+	ClientRender bool `json:"clientRender,omitempty"`
 }
 
 // PatchTarget identifies the single rendered object a Patch applies to, by

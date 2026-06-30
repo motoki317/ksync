@@ -120,6 +120,64 @@ func TestHelmLookupWrapper_UnavailableRefusesCharts(t *testing.T) {
 	}
 }
 
+// The no-lookup wrapper (clientRender) drops --dry-run=server/--take-ownership
+// so a chart shipping a CRD with its custom resources renders before the CRD
+// exists, but keeps the capability flags so version-gated templates still
+// resolve against the live cluster.
+func TestHelmNoLookupWrapper_TemplateDropsServerDryRunKeepsCaps(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "helm")
+	if err := os.WriteFile(wrapper, []byte(helmNoLookupWrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	apiFile := filepath.Join(dir, "api-versions")
+	if err := os.WriteFile(apiFile, []byte("policy/v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(wrapper, "template", "chart")
+	cmd.Env = append(os.Environ(),
+		"KSYNC_HELM="+fakeHelm(t),
+		"KSYNC_KUBE_CONTEXT=dev-ctx",
+		"KSYNC_KUBE_VERSION=v1.30.2",
+		"KSYNC_API_VERSIONS="+apiFile,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("wrapper: %v", err)
+	}
+	got := strings.Join(strings.Fields(string(out)), " ")
+	for _, want := range []string{"template chart", "--kube-version v1.30.2", "--api-versions policy/v1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("template args %q missing %q", got, want)
+		}
+	}
+	for _, banned := range []string{"--dry-run=server", "--take-ownership", "--kube-context"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("client-render template args %q must not contain %q", got, banned)
+		}
+	}
+}
+
+// The no-lookup wrapper shares the lookup wrapper's unavailability guard: a
+// clientRender app on an unreachable cluster must refuse rather than render with
+// wrong (static) capabilities.
+func TestHelmNoLookupWrapper_UnavailableRefusesCharts(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "helm")
+	if err := os.WriteFile(wrapper, []byte(helmNoLookupWrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(wrapper, "template", "chart")
+	cmd.Env = append(os.Environ(), "KSYNC_HELM_UNAVAILABLE=reading cluster capabilities: timeout")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("wrapper succeeded; want non-zero exit when the cluster is unavailable.\noutput: %s", out)
+	}
+	if !strings.Contains(string(out), "cannot render helm charts") {
+		t.Errorf("error output %q missing the refusal message", out)
+	}
+}
+
 func TestRenderOptions_OfflineUsesPlainHelm(t *testing.T) {
 	opts, cleanup, err := renderOptions("dev-ctx", true)
 	if err != nil {

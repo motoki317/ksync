@@ -2,7 +2,10 @@ package render
 
 import (
 	"bytes"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,7 +13,7 @@ import (
 )
 
 func TestRender_PlainKustomization(t *testing.T) {
-	res, err := New(Options{}).Render("testdata/plain")
+	res, err := New(Options{}).Render("testdata/plain", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -38,7 +41,7 @@ func TestRender_PlainKustomization(t *testing.T) {
 // int64 is required). A Deployment with numeric fields is the minimal
 // reproduction.
 func TestRender_ObjectsCarryJSONTypesOnly(t *testing.T) {
-	res, err := New(Options{}).Render("testdata/typed")
+	res, err := New(Options{}).Render("testdata/typed", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -67,7 +70,7 @@ func TestRender_HelmChartsInflatedFromSharedChartHome(t *testing.T) {
 	// The production manifest shape: chartHome points outside the
 	// kustomization root and one chart is inflated as several releases.
 	requireBinary(t, "helm")
-	res, err := New(Options{}).Render("testdata/helm-app")
+	res, err := New(Options{}).Render("testdata/helm-app", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -105,7 +108,7 @@ func TestRender_MatchesKustomizeBuildOutput(t *testing.T) {
 			if tt.needsHelm {
 				requireBinary(t, "helm")
 			}
-			res, err := New(Options{}).Render(tt.dir)
+			res, err := New(Options{}).Render(tt.dir, false)
 			if err != nil {
 				t.Fatalf("Render: %v", err)
 			}
@@ -126,7 +129,7 @@ func TestRender_MatchesKustomizeBuildOutput(t *testing.T) {
 }
 
 func TestSetImages_RewritesMatchingImagesEverywhere(t *testing.T) {
-	res, err := New(Options{}).Render("testdata/images")
+	res, err := New(Options{}).Render("testdata/images", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -181,7 +184,7 @@ func TestSetImages_RewritesMatchingImagesEverywhere(t *testing.T) {
 // A digest override (the image-override path for a pinned, registry-resolved
 // ref) rewrites the reference to name@digest, not name:tag.
 func TestSetImages_Digest(t *testing.T) {
-	res, err := New(Options{}).Render("testdata/images")
+	res, err := New(Options{}).Render("testdata/images", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -205,7 +208,7 @@ func TestSetImages_Digest(t *testing.T) {
 // Deployment path is still rewritten and an unrelated image is left alone. This is
 // the parity that lets dev tags reach CRD-embedded images.
 func TestSetImages_ConfigurationsFieldSpec(t *testing.T) {
-	res, err := New(Options{}).Render("testdata/configimages")
+	res, err := New(Options{}).Render("testdata/configimages", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -315,12 +318,69 @@ func findObject(t *testing.T, objs []*unstructured.Unstructured, kind, name stri
 }
 
 func TestRender_ErrorMentionsDirectory(t *testing.T) {
-	_, err := New(Options{}).Render("testdata/does-not-exist")
+	_, err := New(Options{}).Render("testdata/does-not-exist", false)
 	if err == nil {
 		t.Fatal("Render succeeded on a missing directory")
 	}
 	if !strings.Contains(err.Error(), "testdata/does-not-exist") {
 		t.Errorf("error %q does not mention the directory", err)
+	}
+}
+
+func TestOptionsHelmCommand_SelectsClientRenderCommand(t *testing.T) {
+	tests := []struct {
+		name         string
+		opts         Options
+		clientRender bool
+		want         string
+	}{
+		{"default uses HelmCommand", Options{HelmCommand: "lookup"}, false, "lookup"},
+		{"client without a client command falls back to HelmCommand", Options{HelmCommand: "lookup"}, true, "lookup"},
+		{"default ignores the client command", Options{HelmCommand: "lookup", ClientRenderCommand: "client"}, false, "lookup"},
+		{"client uses the client command", Options{HelmCommand: "lookup", ClientRenderCommand: "client"}, true, "client"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.opts.helmCommand(tt.clientRender); got != tt.want {
+				t.Errorf("helmCommand(%v) = %q, want %q", tt.clientRender, got, tt.want)
+			}
+		})
+	}
+}
+
+// Render(dir, true) must drive helm through ClientRenderCommand, not the default
+// HelmCommand — the selector unit test proves the choice, this proves the choice
+// reaches kustomize's HelmConfig.Command. Each fake helm tags a marker on the
+// template call then delegates to the real helm so the chart still inflates.
+func TestRender_ClientRenderUsesClientRenderCommand(t *testing.T) {
+	requireBinary(t, "helm")
+	realHelm, err := exec.LookPath("helm")
+	if err != nil {
+		t.Fatalf("LookPath helm: %v", err)
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "which")
+	fakeHelm := func(tag string) string {
+		p := filepath.Join(dir, tag)
+		script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = template ]; then printf '%%s\\n' %s >> %q; fi\nexec %q \"$@\"\n", tag, marker, realHelm)
+		if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	opts := Options{HelmCommand: fakeHelm("LOOKUP"), ClientRenderCommand: fakeHelm("CLIENT")}
+	if _, err := New(opts).Render("testdata/helm-app", true); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("helm template was never invoked: %v", err)
+	}
+	if !strings.Contains(string(got), "CLIENT") {
+		t.Errorf("clientRender render did not use ClientRenderCommand; marker = %q", got)
+	}
+	if strings.Contains(string(got), "LOOKUP") {
+		t.Errorf("clientRender render also used the default HelmCommand; marker = %q", got)
 	}
 }
 

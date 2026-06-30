@@ -140,7 +140,7 @@ func TestReferencedRepos(t *testing.T) {
 // image matches live at a CRD-embedded path too — and reports which repos it
 // carried. A repo whose live image is not a ksync dev tag is left untouched.
 func TestCarryForwardBuildTags_ReachesCRDPathAndReportsCarried(t *testing.T) {
-	res, err := New(Options{}).Render("testdata/configimages")
+	res, err := New(Options{}).Render("testdata/configimages", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}

@@ -734,7 +734,7 @@ type runner struct {
 // build-less, non-overridden one, and the manifest's own pin is used.
 func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render.Image) deployResult {
 	started := time.Now()
-	res, err := rn.renderer.Render(app.Path)
+	res, err := rn.renderer.Render(app.Path, app.ClientRender)
 	if err != nil {
 		rn.log.Error(err, "Render failed", "app", app.Name)
 		rn.onError(app.Name, err)

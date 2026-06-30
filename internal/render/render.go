@@ -48,6 +48,21 @@ type Options struct {
 	// HelmCommand is the binary used for helmCharts inflation; empty means
 	// "helm" from PATH.
 	HelmCommand string
+	// ClientRenderCommand is the binary used to inflate helmCharts for an app
+	// rendered with Render(dir, clientRender=true) — a no-lookup `helm template`
+	// that keeps cluster capabilities but skips the server-side dry-run. Empty
+	// falls back to HelmCommand, so an offline renderer (both empty → plain helm)
+	// renders every app the same way.
+	ClientRenderCommand string
+}
+
+// helmCommand picks the helm binary for one render: the client-render command
+// when that app opted in and the command is configured, else the default.
+func (o Options) helmCommand(clientRender bool) string {
+	if clientRender && o.ClientRenderCommand != "" {
+		return o.ClientRenderCommand
+	}
+	return o.HelmCommand
 }
 
 // Result is the rendered output of one kustomization directory.
@@ -190,8 +205,9 @@ func New(opts Options) *Renderer {
 	return &Renderer{opts: opts}
 }
 
-// Render builds the kustomization at dir.
-func (r *Renderer) Render(dir string) (*Result, error) {
+// Render builds the kustomization at dir. clientRender selects the no-lookup
+// helm command (see Options.ClientRenderCommand) for this app's chart inflation.
+func (r *Renderer) Render(dir string, clientRender bool) (*Result, error) {
 	kOpts := krusty.MakeDefaultOptions()
 	// ReorderOptionUnspecified is what `kustomize build` passes when no
 	// --reorder flag is given (legacy ordering unless the kustomization
@@ -202,7 +218,7 @@ func (r *Renderer) Render(dir string) (*Result, error) {
 	// rejects; ArgoCD setups using that shape disable load restrictions.
 	kOpts.LoadRestrictions = types.LoadRestrictionsNone
 	kOpts.PluginConfig.HelmConfig.Enabled = true
-	kOpts.PluginConfig.HelmConfig.Command = r.opts.HelmCommand
+	kOpts.PluginConfig.HelmConfig.Command = r.opts.helmCommand(clientRender)
 
 	// A fresh kustomizer per call: krusty makes no concurrency promises, and
 	// per-call state is what lets one Renderer serve parallel app renders.

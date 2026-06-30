@@ -111,6 +111,26 @@ apps:
 	}
 }
 
+func TestParse_ClientRenderField(t *testing.T) {
+	yml := `
+allowedContexts: [docker-desktop]
+apps:
+  - path: apps/api-b
+    clientRender: true
+  - path: apps/shop
+`
+	cfg, err := Parse([]byte(yml), "/cfg")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !cfg.Apps[0].ClientRender {
+		t.Errorf("Apps[0].ClientRender = false, want true")
+	}
+	if cfg.Apps[1].ClientRender {
+		t.Errorf("Apps[1].ClientRender = true, want false (default)")
+	}
+}
+
 func TestParse_NamespaceField(t *testing.T) {
 	yml := `
 allowedContexts: [docker-desktop]

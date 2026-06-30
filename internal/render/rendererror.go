@@ -57,7 +57,9 @@ func actionableRenderMessage(helmStderr string) string {
 	if m := missingCRD.FindStringSubmatch(helmStderr); m != nil {
 		return fmt.Sprintf(
 			"cluster cannot map %s (%s).\n"+
-				"fix: if it is a custom resource, install its CRD first (apply the base layer); or render offline: --offline-render (helm `lookup` results will be empty)",
+				"fix: if this app's chart bundles the CRD, set `clientRender: true` to render its custom resources before the CRD exists; "+
+				"if the CRD comes from another app, install it first (apply the base layer); "+
+				"or render without a cluster: --offline-render",
 			m[1], m[2])
 	}
 	return helmStderr

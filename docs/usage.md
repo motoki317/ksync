@@ -52,6 +52,7 @@ apps:
 | `needs` | Apps that must sync and become Healthy before this one. Cycles are rejected. |
 | `build` | Images built from local source (see "Building from source"). |
 | `patches` | Post-render edits to one rendered object (see "Per-environment patches"). |
+| `clientRender` | Render this app client-side so it can bundle its own CRDs and custom resources (see "Render, diff, and apply strategy"). |
 
 Unknown fields are rejected.
 
@@ -205,13 +206,34 @@ Every command except `version` takes `-f <file>`, an app-name list (none means a
 
 `--offline-render` is accepted by `render`, `sync`, `watch`, `diff`, and `images`.
 
-### Diff strategy
+### Render, diff, and apply strategy
 
-`sync`, `watch`, and `diff` decide the apply set with a server-side dry-run apply by default, so a
-field the apiserver defaults or prunes (a StatefulSet `maxUnavailable` behind a disabled feature gate)
-is not seen as drift and re-applied every sync. `--client-diff` uses the faster in-process client-side
-merge instead, at the cost of showing such a field as a perpetual change — a harmless no-op on
-`sync`/`watch`, visible drift on `diff`.
+ksync runs three phases. Each defaults to the cluster-aware behavior; each has an opt-out for when
+that default is wrong for one app or one run.
+
+| Phase | Default | Opt-out |
+|---|---|---|
+| **Render** | `helm template` against the cluster (so `helm lookup` resolves and capabilities match) | `clientRender: true` (per app), or `--offline-render` (per run) |
+| **Diff** | server-side dry-run apply (a field the apiserver defaults or prunes is not drift) | `--client-diff` (per run) |
+| **Apply** | server-side apply, prune by the `ksync.dev/app` label | `--prune=false`, `--force` (see "Tracking, prune, and safety") |
+
+**Render — `clientRender: true`.** The default render is a server-side dry-run, so the apiserver maps
+every resource. An app whose chart ships a CRD together with custom resources of that kind then fails
+with `no matches for kind` until the CRD exists. `clientRender` renders that app client-side — keeping
+the cluster's capabilities but dropping the dry-run — the way ArgoCD renders, so one app can own both
+its CRDs and its custom resources. It **disables `helm lookup`** for the app, so use it only where the
+chart does not need lookup: a chart that uses `lookup` to keep a generated value stable (a webhook
+caBundle, an admin password) will regenerate it each sync. It still needs a reachable cluster.
+
+**Render — `--offline-render`.** Renders with no cluster at all (plain `helm`; `lookup` returns empty
+and capabilities fall back to helm's defaults), byte-matching `kustomize build --enable-helm
+--load-restrictor LoadRestrictionsNone`. For previewing without a cluster; accepted by `render`, `sync`,
+`watch`, `diff`, and `images`, and it overrides `clientRender` (every app renders plain).
+
+**Diff — `--client-diff`.** The server-side dry-run keeps a field the apiserver defaults or prunes (a
+StatefulSet `maxUnavailable` behind a disabled feature gate) from showing as drift. `--client-diff` uses
+the faster in-process merge instead, at the cost of showing such a field as a perpetual change — a
+harmless no-op on `sync`/`watch`, visible drift on `diff`.
 
 ### Output
 
@@ -247,7 +269,8 @@ Most errors name their own fix; the recurring ones:
 - **`<app> rendered 0 resources but manages N live resource(s)`** — the kustomization now renders
   nothing (a typo, a dropped `resources:` entry). Fix it, or `ksync destroy <app>` to remove the app.
 - **`cluster cannot map X (Y)`** — live render asks the cluster to map every kind; a CRD not yet
-  installed (a separate base layer) or an unserved apiVersion fails. Install the CRD, or use
+  installed (a separate base layer) or an unserved apiVersion fails. Install the CRD; if the app bundles
+  its own CRDs with custom resources of that kind, set `clientRender: true` on it; or use
   `--offline-render` (helm `lookup` results will be empty).
 - **Pods of a built image show `ErrImagePull`** — the kubelet tried to pull the local `ksync-…` tag.
   The image has no matching `build` entry, the cluster has a separate store with no `imageLoad`, or it

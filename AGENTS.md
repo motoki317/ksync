@@ -73,7 +73,12 @@ re-litigate only with new evidence):
   watch confirmation prompt); per-app `patches` (post-render JSON6902 patches — target by literal
   GVK+name(+ns), inline RFC6902 ops, op `value`s may use `${VAR}`; the DSL home for
   deploy-environment fields the kustomization can't carry, see render below and ADR
-  20260623-post-render-patches); `Config.Dir` (the `${KSYNC_WORKDIR}` anchor); `SortByNeeds`.
+  20260623-post-render-patches); per-app `clientRender` (render this app the ArgoCD way — `helm
+  template` with cluster capabilities but no server-side dry-run, so a chart that ships a CRD with
+  custom resources of that kind renders before the CRD exists, instead of failing the default render's
+  server-side mapping with "no matches for kind"; disables `helm lookup` for the app, render-only —
+  diff/apply unchanged since the server-side diff already falls back per-resource; ADR
+  20260630-client-render-per-app); `Config.Dir` (the `${KSYNC_WORKDIR}` anchor); `SortByNeeds`.
 - `internal/build` — source→image: docker build (or the `command` escape hatch producing
   `$KSYNC_IMAGE`), content-addressed dev tags `ksync-<12 hex of image ID>` (no persisted
   build state; `--provenance=false` keeps IDs deterministic), `.dockerignore`-scoped watch
@@ -100,7 +105,12 @@ re-litigate only with new evidence):
   `${KSYNC_WORKDIR}` = config dir; expansion touches only `value` strings (`NewVarLookup` builds the
   resolver). Because ksync runs next to the cluster, `${HOME}` self-resolves to the cluster host's
   home, so a wrapper needs no per-environment plumbing (ADRs 20260623-post-render-patches,
-  20260629-default-var-expansion).
+  20260629-default-var-expansion). `Render(dir, clientRender)` picks the helm command per app:
+  `Options.HelmCommand` (the default server-side dry-run / `lookup` wrapper) or
+  `Options.ClientRenderCommand` (the no-lookup wrapper an app's `clientRender` selects); `cmd/ksync`
+  (`helmlookup.go`) writes both wrappers as separate files — sharing one set of discovered
+  capabilities, the choice made by which path kustomize is handed, never a mutable env var that
+  concurrent renders would race (ADR 20260630-client-render-per-app).
 - `internal/ui` — human-facing output: a `logr.LogSink` that renders clean, colored,
   single-line records (a quiet variant drops Info/V noise; used for the engine and the routed
   klog/client-go stream), color helpers (NO_COLOR + TTY aware), and the live terminal block

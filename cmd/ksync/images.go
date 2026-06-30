@@ -73,7 +73,7 @@ func runImages(args []string) error {
 		namespaces []string
 	}
 	rendered, err := renderConcurrently(apps, *maxParallel, func(app config.App) (appResult, error) {
-		res, err := r.Render(app.Path)
+		res, err := r.Render(app.Path, app.ClientRender)
 		if err != nil {
 			return appResult{}, fmt.Errorf("app %s: %w", app.Name, err)
 		}

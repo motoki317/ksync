@@ -318,7 +318,7 @@ func runRender(args []string) error {
 	// Render and serialize concurrently — each is independent, and both the
 	// per-chart helm dry-runs and the YAML marshal are the per-app cost.
 	yamls, err := renderConcurrently(apps, *maxParallel, func(app config.App) ([]byte, error) {
-		res, err := r.Render(app.Path)
+		res, err := r.Render(app.Path, app.ClientRender)
 		if err != nil {
 			return nil, fmt.Errorf("app %s: %w", app.Name, err)
 		}
@@ -638,7 +638,7 @@ func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog
 			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: tag})
 		}
 	}
-	res, err := r.Render(app.Path)
+	res, err := r.Render(app.Path, app.ClientRender)
 	if err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
 	}

@@ -87,7 +87,7 @@ func runDiff(args []string) error {
 // are applied as on sync; for an un-overridden build image the current live dev
 // tag is carried forward so its per-build churn does not dominate the diff.
 func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string, bool), app config.App, overrides map[string]render.Image, prune, serverSide bool) (appDiff, error) {
-	res, err := r.Render(app.Path)
+	res, err := r.Render(app.Path, app.ClientRender)
 	if err != nil {
 		return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 	}

@@ -11,7 +11,7 @@ import (
 
 func renderPatchFixture(t *testing.T) *Result {
 	t.Helper()
-	res, err := New(Options{}).Render("testdata/patch")
+	res, err := New(Options{}).Render("testdata/patch", false)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}

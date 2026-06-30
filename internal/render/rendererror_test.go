@@ -17,8 +17,9 @@ import (
 // fixes. The fixtures below use invented identifiers so no live cluster name leaks.
 
 // A live render against a cluster lacking a chart's CRD fails server-side mapping;
-// cleanRenderError names the kind and points at the two fixes (install the CRD, or
-// render offline), dropping every byte of kustomize's exec noise.
+// cleanRenderError names the kind and points at the fixes — clientRender for a
+// chart that bundles its own CRD, installing the CRD when it belongs to another
+// app, or an offline render — dropping every byte of kustomize's exec noise.
 func TestCleanRenderError_MissingCRD(t *testing.T) {
 	raw := errors.New(`Error: unable to build kubernetes objects from release manifest: resource mapping not found for name: "shop-widget" namespace: "shop" from "": no matches for kind "Widget" in version "example.com/v1alpha1"
 ensure CRDs are installed first: unable to run: '/tmp/ksync-helm-123/helm template shop /repo/charts/local-shop --namespace shop -f /tmp/kustomize-helm-456/local-shop-kustomize-values.yaml --include-crds' with env=[HELM_CONFIG_HOME=/tmp/kustomize-helm-456/helm HELM_CACHE_HOME=/tmp/kustomize-helm-456/helm/.cache HELM_DATA_HOME=/tmp/kustomize-helm-456/helm/.data] (is '/tmp/ksync-helm-123/helm' installed?): exit status 1`)
@@ -26,14 +27,16 @@ ensure CRDs are installed first: unable to run: '/tmp/ksync-helm-123/helm templa
 	got := cleanRenderError(raw)
 	msg := got.Error()
 
-	for _, want := range []string{"Widget", "example.com/v1alpha1", "--offline-render"} {
+	// The bundled-CRD case is the symptom this feature targets, so the error must
+	// name clientRender — the durable per-app fix — alongside the offline escape.
+	for _, want := range []string{"Widget", "example.com/v1alpha1", "clientRender", "--offline-render"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message missing %q:\n%s", want, msg)
 		}
 	}
-	// Names the CRD fix first (the common cause), conditionally — the same helm
-	// error also covers an unserved built-in apiVersion, so it must not flatly
-	// assert "no CRD".
+	// Also names installing the CRD (when it belongs to another app), conditionally
+	// — the same helm error covers an unserved built-in apiVersion, so it must not
+	// flatly assert "no CRD".
 	if !strings.Contains(strings.ToLower(msg), "install") {
 		t.Errorf("message should point at installing the CRD:\n%s", msg)
 	}
