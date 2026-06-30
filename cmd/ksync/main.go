@@ -1244,9 +1244,15 @@ func (p *progress) finish(app string, info *ui.CommitInfo) {
 // keep the per-app context they are passed.
 func makeBuildFunc(runCtx context.Context, cfg *config.Config, prog *progress, kubeContext string) loop.BuildFunc {
 	groupCmd := make(map[string]string, len(cfg.BuildGroups))
+	groupParallel := make(map[string]bool, len(cfg.BuildGroups))
 	for _, g := range cfg.BuildGroups {
 		groupCmd[g.Name] = g.Command
+		groupParallel[g.Name] = g.Parallel
 	}
+	// One GroupGate shared across the parallel per-app builds. It serializes a
+	// build group's command across apps (a cold cargo-zigbuild and friends are not
+	// concurrency-safe; see build.GroupGate) unless the group sets parallel:true.
+	groupGate := &build.GroupGate{}
 	// imported remembers the refs already made visible to the cluster this
 	// session, so a rebuild that yields an unchanged ref (a save that does not
 	// change the image — a comment, a reformat — produces the same fingerprint)
@@ -1277,7 +1283,11 @@ func makeBuildFunc(runCtx context.Context, cfg *config.Config, prog *progress, k
 		var refs []string
 		var err error
 		if group := builds[0].Group; group != "" {
-			refs, err = (&build.Builder{Output: stage, KubeContext: kubeContext}).BuildGroup(ctx, groupCmd[group], builds)
+			err = groupGate.Run(group, groupParallel[group], func() error {
+				var e error
+				refs, e = (&build.Builder{Output: stage, KubeContext: kubeContext}).BuildGroup(ctx, groupCmd[group], builds)
+				return e
+			})
 		} else {
 			var ref string
 			ref, err = (&build.Builder{Output: stage, KubeContext: kubeContext}).Build(ctx, builds[0])

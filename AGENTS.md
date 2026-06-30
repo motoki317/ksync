@@ -86,8 +86,13 @@ re-litigate only with new evidence):
   set, for k3d/kind `image import` / k3s `ctr import` / registry push; always serializes its calls
   since k3d image import is not concurrency-safe, and **coalesces** — images that finish while a load
   runs are batched into the next invocation, so a bulk-capable command amortizes its per-call cost).
-  See ADRs 20260612-build-integration, 20260613-image-load-hook, 20260615-imageload-concurrency, and
-  20260617-imageload-batching.
+  `BuildGroup` runs one bulk command for a group's dirty members (a `docker buildx bake`, a host
+  compile producing many images); `GroupGate` **serializes a group's command across the concurrent
+  per-app builds by default** — a bulk command need not be concurrency-safe (a cold `cargo zigbuild`
+  races to create its shared wrapper cache → `File exists (os error 17)`, the same class of hazard the
+  Loader serializes for), opt out per group with `parallel: true` (ADR 20260630-serialize-build-groups).
+  See ADRs 20260612-build-integration, 20260613-image-load-hook, 20260615-imageload-concurrency,
+  20260617-imageload-batching, and 20260630-serialize-build-groups.
 - `internal/render` — in-process kustomize (krusty) replicating
   `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
   binary is enforced by test. `SetImages` (the build-tag injection path) also rewrites an

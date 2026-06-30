@@ -152,6 +152,11 @@ apps:
 A grouped command must leave each requested image tagged `<image>:ksync-build`; ksync content-tags
 each afterward. Double-quote `$KSYNC_IMAGE` (single quotes do not expand under `sh -c`).
 
+When two apps share a group, ksync runs that group's command for one app at a time by default — the
+apps build concurrently, and a bulk command need not be safe run against itself (a cold `cargo
+zigbuild`, for one, races to create its shared cache and fails one invocation). Set `parallel: true`
+on the `buildGroups` entry to keep the overlap when the command is concurrency-safe.
+
 ### Pre-built image overrides
 
 `ksync sync --image IMAGE=REF` (or `KSYNC_IMAGE_OVERRIDES`, also on `diff`) deploys an existing image

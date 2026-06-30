@@ -83,6 +83,10 @@ type ImageLoad struct {
 // happens once instead of once per image. A build entry joins a group by
 // setting its `group` field to the group's name. Design rationale:
 // docs/ADR/20260614-bulk-build-groups.md.
+//
+// ksync builds apps in parallel, so two apps that share a group would otherwise
+// run the group's command at the same time. By default they do not: the command
+// is serialized across apps (see Parallel and docs/ADR/20260630-serialize-build-groups.md).
 type BuildGroup struct {
 	// Name is what a build entry's `group` field references.
 	Name string `json:"name"`
@@ -93,6 +97,16 @@ type BuildGroup struct {
 	// `command` contract ($KSYNC_IMAGE), scaled to many images. It runs in the
 	// shared context directory of the group's members.
 	Command string `json:"command"`
+	// Parallel lets this group's command run for several apps at once. The
+	// default (false) serializes it — at most one invocation of this group runs
+	// at a time across the concurrent per-app builds — because a bulk command
+	// need not be concurrency-safe: cargo-zigbuild, for one, lazily creates a
+	// shared wrapper cache and two simultaneous cold invocations race to create
+	// it, failing one with "File exists (os error 17)" and leaving its image
+	// unbuilt. This mirrors the imageLoad Loader, which serializes for the same
+	// class of reason. Set Parallel only when the command is safe to run
+	// concurrently with itself.
+	Parallel bool `json:"parallel,omitempty"`
 }
 
 // App is one kustomization directory managed by ksync.
