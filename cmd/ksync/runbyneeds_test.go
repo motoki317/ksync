@@ -99,19 +99,25 @@ func TestRunByNeeds_FirstErrorStopsDependents(t *testing.T) {
 		{Name: "base"},
 		{Name: "app", Needs: []string{"base"}},
 	}
-	var ran sync.Map
-	err := runByNeeds(context.Background(), apps, 4, func(_ context.Context, a config.App) error {
-		ran.Store(a.Name, true)
-		if a.Name == "base" {
-			return errors.New("boom")
+	// The dependent-runs-after-failed-need bug is a non-deterministic select
+	// race (the need's done channel closes on failure too, and ctx is cancelled
+	// before that close, so both select cases are ready). It surfaced only ~1 run
+	// in 50 under -race; loop so a reintroduced regression fails reliably.
+	for i := 0; i < 500; i++ {
+		var ran sync.Map
+		err := runByNeeds(context.Background(), apps, 4, func(_ context.Context, a config.App) error {
+			ran.Store(a.Name, true)
+			if a.Name == "base" {
+				return errors.New("boom")
+			}
+			return nil
+		})
+		if err == nil {
+			t.Fatalf("iteration %d: expected error from failed base", i)
 		}
-		return nil
-	})
-	if err == nil {
-		t.Fatal("expected error from failed base")
-	}
-	if _, ok := ran.Load("app"); ok {
-		t.Errorf("app ran despite its need failing")
+		if _, ok := ran.Load("app"); ok {
+			t.Fatalf("iteration %d: app ran despite its need failing", i)
+		}
 	}
 }
 
