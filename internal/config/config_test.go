@@ -270,6 +270,9 @@ allowedContexts: [docker-desktop]
 buildGroups:
   - name: go-components
     command: docker buildx bake $KSYNC_IMAGES
+  - name: js-components
+    command: docker buildx bake $KSYNC_IMAGES
+    parallel: true
 apps:
   - path: apps/ns
     build:
@@ -281,17 +284,28 @@ apps:
         context: ..
         watch: [cmd, pkg]
         group: go-components
+      - image: ghcr.io/team-a/web
+        context: ..
+        watch: [web]
+        group: js-components
 `
 	cfg, err := Parse([]byte(yml), "/cfg")
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if len(cfg.BuildGroups) != 1 || cfg.BuildGroups[0].Name != "go-components" {
+	if len(cfg.BuildGroups) != 2 || cfg.BuildGroups[0].Name != "go-components" {
 		t.Fatalf("BuildGroups = %+v", cfg.BuildGroups)
 	}
+	// Parallel defaults to false (serialize) and round-trips when set.
+	if cfg.BuildGroups[0].Parallel {
+		t.Errorf("go-components Parallel = true, want false (the default is serialize)")
+	}
+	if !cfg.BuildGroups[1].Parallel {
+		t.Errorf("js-components Parallel = false, want true (parallel: true was set)")
+	}
 	for i, b := range cfg.Apps[0].Build {
-		if b.Group != "go-components" {
-			t.Errorf("build[%d].Group = %q, want go-components", i, b.Group)
+		if b.Group == "" {
+			t.Errorf("build[%d].Group is empty, want it to join a group", i)
 		}
 		if b.Dockerfile != "" {
 			t.Errorf("build[%d].Dockerfile = %q, want empty (the group builds it)", i, b.Dockerfile)
