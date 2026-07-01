@@ -27,16 +27,8 @@ type appDiff struct {
 // runDiff renders each selected app exactly as `sync` would (post-render patches,
 // image overrides, and live build-tag carry-forward) and prints a per-resource
 // unified YAML diff against live cluster state. Read-only: no apply, no build.
-func runDiff(args []string) error {
-	fs := newSubFlagSet("diff")
-	prune := fs.Bool("prune", true, "show tracked resources a sync would prune (delete)")
-	maxParallel := maxParallelFlag(fs)
-	offline := offlineRenderFlag(fs)
-	clientDiff := fs.Bool("client-diff", false, "diff in-process (client-side) instead of via a server-side dry-run apply; faster, but fields the cluster defaults or prunes can show as drift")
-	var images stringSlice
-	fs.Var(&images, "image", "diff as if this pre-built image were deployed: `IMAGE=REF` (repeatable; also via "+overrideEnv+")")
-	kctx := contextFlag(fs)
-	cfg, names, err := loadConfig(fs, args)
+func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *int, images stringSlice, names []string) error {
+	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}

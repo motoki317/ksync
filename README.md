@@ -67,8 +67,9 @@ apps:
     namespace: team-a
 ```
 
-The full guide — fields, commands, tracking/prune/hook behavior, troubleshooting — is in
-**[docs/usage.md](docs/usage.md)**.
+The full guide lives in the CLI itself: run **`ksync help`** for the command list and the
+concept guides (`ksync help config`, `builds`, `strategy`, `hooks`, `troubleshooting`), and
+`ksync <command> -h` for a command's flags and examples.
 
 ## Development
 

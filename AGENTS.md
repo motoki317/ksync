@@ -1,8 +1,10 @@
 # Agent guide
 
 Compact navigation aid for AI agents working on this repo — the "where do I look" sheet. Humans
-see [README.md](README.md) and the user guide ([docs/usage.md](docs/usage.md)); design rationale
-lives in ADRs ([docs/ADR/](docs/ADR/)). Keep this file scannable — push detail to those.
+see [README.md](README.md) and the CLI's own help (`ksync help`, `ksync help <topic>`, `ksync
+<command> -h` — the self-contained user guide; [docs/usage.md](docs/usage.md) is only a pointer into
+it); design rationale lives in ADRs ([docs/ADR/](docs/ADR/)). Keep this file scannable — push detail
+to those.
 
 ## What ksync is
 
@@ -36,8 +38,14 @@ re-litigate only with new evidence):
 
 ## Repo at a glance
 
-- `cmd/ksync/main.go` — CLI entry and subcommand wiring (`watch / sync / render / images / destroy /
-  diff` implemented). `signalContext` is the shared interrupt handler all entry points use: the
+- `cmd/ksync/main.go` — the command bodies (`watch / sync / render / images / destroy / diff` and
+  their `runX` pipelines) and `main`'s error→exit-code mapping. The **cobra** command tree, flags,
+  and groups live in `cli.go`; the CLI help prose — each command's Long/Example plus the `ksync help
+  <topic>` concept pages (config / builds / strategy / hooks / troubleshooting) that make the CLI its
+  own user guide — lives in `help.go`. Flags are GNU `--long` (pflag) with `-f`/`-v` shorthands;
+  `runX` bodies read pointer-bound flags so the framework swap changed parsing and help, not command
+  logic (ADR 20260701-cli-cobra-and-help-as-docs). `signalContext` is the shared interrupt handler
+  all entry points use: the
   first Ctrl-C cancels the context (graceful), the second `os.Exit(130)`s — so a non-context-aware
   step (engine.New's warm-cache LIST, render) can always be force-quit instead of swallowing every
   signal until it returns (ADR 20260627-double-signal-force-quit). `diff.go` is the **`ksync diff`**

@@ -9,12 +9,10 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
-	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -68,47 +66,15 @@ func signalContext() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
-type subcommand struct {
-	name, summary string
-	run           func(args []string) error
-}
-
-// subcommands is the CLI surface, in the order `ksync help` lists them. It is
-// populated in init rather than as a var initializer to avoid an
-// initialization cycle: summaryOf reads this slice, and the command functions
-// named here reach summaryOf through the shared flag-parsing helpers.
-var subcommands []subcommand
-
-func init() {
-	subcommands = []subcommand{
-		{"watch", "watch app directories and render/diff/apply on change (the main loop)", runWatch},
-		{"sync", "render and sync the given apps once", runSync},
-		{"diff", "render and show the diff against live cluster state", runDiff},
-		{"render", "render the given apps to stdout", runRender},
-		{"images", "list the container images the given apps deploy (canonical refs, for cache scoping)", runImages},
-		{"destroy", "delete all tracked resources of the given apps", runDestroy},
-		{"version", "print the ksync version", runVersion},
-	}
-}
-
 // version is the build version, stamped at release time via
 // -ldflags "-X main.version=...". goreleaser and the Nix flake both set it; a
 // plain `go build` from source keeps "dev".
 var version = "dev"
 
-func runVersion([]string) error {
-	fmt.Println(version)
-	return nil
-}
-
 func main() {
-	err := run(os.Args[1:])
+	err := newRootCmd().Execute()
 	switch {
 	case err == nil:
-		return
-	case errors.Is(err, flag.ErrHelp):
-		// `-h`/`--help` on a command: usage was already printed to stdout by the
-		// flag parse. A help request is success, not an error.
 		return
 	case errors.Is(err, context.Canceled):
 		// A Ctrl-C (or a sibling app's failure aborting the run) surfaces as a
@@ -120,90 +86,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "ksync:", err)
 		os.Exit(1)
 	}
-}
-
-func run(args []string) error {
-	if len(args) == 0 {
-		usage(os.Stderr)
-		return errors.New("no command given (run 'ksync help')")
-	}
-	switch args[0] {
-	case "-h", "--help", "help":
-		usage(os.Stdout)
-		return nil
-	case "-V", "--version", "-version":
-		return runVersion(nil)
-	}
-	for _, c := range subcommands {
-		if args[0] == c.name {
-			return c.run(args[1:])
-		}
-	}
-	usage(os.Stderr)
-	return fmt.Errorf("unknown command %q (run 'ksync help')", args[0])
-}
-
-func usage(w io.Writer) {
-	var b strings.Builder
-	b.WriteString("ksync — a local-development sync loop for Kubernetes\n\n")
-	b.WriteString("usage: ksync <command> [flags] [app...]\n\n")
-	b.WriteString("commands:\n")
-	for _, c := range subcommands {
-		fmt.Fprintf(&b, "  %-9s %s\n", c.name, c.summary)
-	}
-	b.WriteString("\nrun 'ksync <command> -h' for a command's flags.\n")
-	fmt.Fprint(w, b.String())
-}
-
-// summaryOf returns a subcommand's one-line description for its help banner.
-func summaryOf(name string) string {
-	for _, c := range subcommands {
-		if c.name == name {
-			return c.summary
-		}
-	}
-	return ""
-}
-
-// newSubFlagSet builds a subcommand flag set that prints its own help and parse
-// errors exactly once, on streams we choose. flag's auto-output is discarded and
-// its Usage suppressed; parseInterspersed prints help to stdout on `-h` and the
-// error (with a `-h` hint) to stderr otherwise — so neither is duplicated nor
-// sent to the wrong stream.
-func newSubFlagSet(name string) *flag.FlagSet {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fs.Usage = func() {}
-	return fs
-}
-
-// printSubUsage writes a command's help: its summary, a usage line, and the flag
-// defaults — what `ksync <command> -h` shows.
-func printSubUsage(w io.Writer, fs *flag.FlagSet) {
-	if s := summaryOf(fs.Name()); s != "" {
-		fmt.Fprintf(w, "%s\n\n", s)
-	}
-	fmt.Fprintf(w, "usage: ksync %s [flags] [app...]\n\nflags:\n", fs.Name())
-	fs.SetOutput(w)
-	fs.PrintDefaults()
-	fs.SetOutput(io.Discard)
-}
-
-// loadConfig adds the shared -f flag to fs, parses args, and loads the
-// config; the remaining positional args are returned for the subcommand
-// (usually app names). Subcommand-specific flags must be registered on fs
-// before calling.
-func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, []string, error) {
-	path := fs.String("f", "ksync.yaml", "path to the ksync config file")
-	names, err := parseInterspersed(fs, args)
-	if err != nil {
-		return nil, nil, err
-	}
-	cfg, err := config.Load(*path)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cfg, names, nil
 }
 
 // resolveContext picks the kubectl context a run targets — the explicit
@@ -235,67 +117,8 @@ func renderContext(cfg *config.Config, override string, offline bool) (string, e
 	return resolveContext(cfg, override)
 }
 
-// contextFlag registers the shared --context flag on a subcommand's flag set.
-func contextFlag(fs *flag.FlagSet) *string {
-	return fs.String("context", "", "kubectl context to target; must be listed in allowedContexts (default: the sole allowedContexts entry, when exactly one)")
-}
-
-// maxParallelFlag registers the shared --max-parallel flag. One definition keeps
-// the help identical across commands (it drifted before) and lets Go append the
-// real default (CPU count) instead of a hand-written, duplicated note. 0 lifts
-// the cap (one worker per app), the same in every command.
-func maxParallelFlag(fs *flag.FlagSet) *int {
-	return fs.Int("max-parallel", runtime.NumCPU(), "how many apps to process concurrently (0 = no limit)")
-}
-
-// offlineRenderFlag registers the shared --offline-render flag. "lookup" is not
-// backtick-quoted: a backtick would make flag treat it as the value placeholder,
-// printing the nonsensical "-offline-render lookup" for a boolean flag.
-func offlineRenderFlag(fs *flag.FlagSet) *bool {
-	return fs.Bool("offline-render", false, "render helm charts without live-cluster lookup (charts using helm lookup will not resolve)")
-}
-
-// clientDiffFlag registers the shared --client-diff flag for the apply paths
-// (sync, watch).
-func clientDiffFlag(fs *flag.FlagSet) *bool {
-	return fs.Bool("client-diff", false, "decide the apply set with the in-process (client-side) diff instead of a server-side dry-run apply; faster, but fields the cluster defaults or prunes are re-applied every sync")
-}
-
-// verboseFlag registers the shared -v flag.
-func verboseFlag(fs *flag.FlagSet) *bool {
-	return fs.Bool("v", false, "verbose: also log per-change tracing")
-}
-
-// parseInterspersed parses fs allowing flags and positional args (app names) in
-// any order — `sync app -timeout 5m` works as well as `sync -timeout 5m app`.
-// Go's flag package stops at the first positional, which surprises developers
-// who put the app name first; this permutes by re-parsing past each positional.
-func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
-	var names []string
-	for len(args) > 0 {
-		if err := fs.Parse(args); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				printSubUsage(os.Stdout, fs)
-				return nil, err
-			}
-			return nil, fmt.Errorf("%w (run 'ksync %s -h' for usage)", err, fs.Name())
-		}
-		args = fs.Args()
-		if len(args) == 0 {
-			break
-		}
-		names = append(names, args[0])
-		args = args[1:]
-	}
-	return names, nil
-}
-
-func runRender(args []string) error {
-	fs := newSubFlagSet("render")
-	offline := offlineRenderFlag(fs)
-	maxParallel := maxParallelFlag(fs)
-	kctx := contextFlag(fs)
-	cfg, names, err := loadConfig(fs, args)
+func runRender(path, kctx *string, offline *bool, maxParallel *int, names []string) error {
+	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
@@ -410,19 +233,8 @@ func setupLogging(verbose bool) (app, engineLog logr.Logger) {
 	return app, engineLog
 }
 
-func runSync(args []string) error {
-	fs := newSubFlagSet("sync")
-	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
-	force := fs.Bool("force", false, "re-run hooks even when manifests are unchanged (re-applies PostSync Jobs; a failed hook is retried regardless)")
-	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
-	maxParallel := maxParallelFlag(fs)
-	verbose := verboseFlag(fs)
-	offline := offlineRenderFlag(fs)
-	clientDiff := clientDiffFlag(fs)
-	var images stringSlice
-	fs.Var(&images, "image", "deploy a pre-built image instead of building it: `IMAGE=REF` (repeatable; also via "+overrideEnv+")")
-	kctx := contextFlag(fs)
-	cfg, names, err := loadConfig(fs, args)
+func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *bool, timeout *time.Duration, maxParallel *int, images stringSlice, names []string) error {
+	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
@@ -878,18 +690,8 @@ func withTimeout(ctx context.Context, d time.Duration) (context.Context, context
 	return context.WithTimeout(ctx, d)
 }
 
-func runWatch(args []string) error {
-	fs := newSubFlagSet("watch")
-	prune := fs.Bool("prune", true, "delete tracked resources missing from the rendered output")
-	debounce := fs.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
-	maxParallel := maxParallelFlag(fs)
-	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
-	auto := fs.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
-	verbose := verboseFlag(fs)
-	offline := offlineRenderFlag(fs)
-	clientDiff := clientDiffFlag(fs)
-	kctx := contextFlag(fs)
-	cfg, names, err := loadConfig(fs, args)
+func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *bool, debounce, timeout *time.Duration, maxParallel *int, names []string) error {
+	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
@@ -1378,12 +1180,8 @@ func makeBuildFunc(runCtx context.Context, cfg *config.Config, prog *progress, k
 	}
 }
 
-func runDestroy(args []string) error {
-	fs := newSubFlagSet("destroy")
-	yes := fs.Bool("yes", false, "confirm deleting every tracked resource of the selected apps")
-	timeout := fs.Duration("timeout", defaultSyncTimeout, "max time to wait for one app's resources to delete (0 = no limit)")
-	kctx := contextFlag(fs)
-	cfg, names, err := loadConfig(fs, args)
+func runDestroy(path, kctx *string, yes *bool, timeout *time.Duration, names []string) error {
+	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
@@ -1396,7 +1194,7 @@ func runDestroy(args []string) error {
 		return err
 	}
 	if !*yes {
-		return fmt.Errorf("destroy deletes every tracked resource of: %s — re-run with -yes to confirm", strings.Join(appNames(apps), ", "))
+		return fmt.Errorf("destroy deletes every tracked resource of: %s — re-run with --yes to confirm", strings.Join(appNames(apps), ", "))
 	}
 	// Always echo the scope: a bare `destroy -yes` (no app names) deletes every
 	// app, so the user must see what is about to go and on which cluster.

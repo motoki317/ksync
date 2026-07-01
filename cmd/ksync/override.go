@@ -27,6 +27,9 @@ func (s *stringSlice) Set(v string) error {
 	return nil
 }
 
+// Type is pflag.Value's placeholder shown in help (`--image IMAGE=REF`).
+func (s *stringSlice) Type() string { return "IMAGE=REF" }
+
 // imageOverrides resolves the image overrides for a run from the KSYNC_IMAGE_OVERRIDES
 // env var and the repeatable --image flags (flags win per image), returning a map
 // keyed by the build entry's Image. An override naming an image that no app builds

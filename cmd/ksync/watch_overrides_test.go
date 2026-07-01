@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,18 @@ import (
 	"github.com/motoki317/ksync/internal/engine"
 )
 
+// executeKsync runs the real cobra command tree with args and returns the command
+// error, so a test exercises flag parsing and dispatch exactly as the binary does.
+// Output is discarded (the root already silences cobra's own error/usage printing).
+func executeKsync(t *testing.T, args ...string) error {
+	t.Helper()
+	root := newRootCmd()
+	root.SetArgs(args)
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	return root.Execute()
+}
+
 // watch rebuilds from source, so it must refuse image overrides outright rather
 // than silently ignore them: a set KSYNC_IMAGE_OVERRIDES fails the command fast,
 // before it touches the cluster.
@@ -16,9 +29,9 @@ func TestRunWatch_RejectsEnvOverrides(t *testing.T) {
 	cfgPath := writeMinimalConfig(t)
 	t.Setenv(overrideEnv, "ghcr.io/org/api-b=prebuilt-tag")
 
-	err := runWatch([]string{"-f", cfgPath})
+	err := executeKsync(t, "watch", "-f", cfgPath)
 	if err == nil {
-		t.Fatal("runWatch accepted a set KSYNC_IMAGE_OVERRIDES; want a fail-fast error")
+		t.Fatal("watch accepted a set KSYNC_IMAGE_OVERRIDES; want a fail-fast error")
 	}
 	if !strings.Contains(err.Error(), "does not accept image overrides") {
 		t.Errorf("error %q does not explain that watch rejects overrides", err)
@@ -28,9 +41,9 @@ func TestRunWatch_RejectsEnvOverrides(t *testing.T) {
 // The --image flag is a sync-only affordance; watch must not even define it, so
 // passing it is a flag error (not a silently-accepted override).
 func TestRunWatch_RejectsImageFlag(t *testing.T) {
-	err := runWatch([]string{"--image", "ghcr.io/org/api-b=prebuilt-tag"})
+	err := executeKsync(t, "watch", "--image", "ghcr.io/org/api-b=prebuilt-tag")
 	if err == nil {
-		t.Fatal("runWatch accepted --image; want it undefined on watch")
+		t.Fatal("watch accepted --image; want it undefined on watch")
 	}
 	if !strings.Contains(err.Error(), "image") {
 		t.Errorf("error %q does not name the rejected flag", err)

@@ -32,13 +32,8 @@ import (
 // pulled, so caching them is pointless. With --live, images of pods in the apps'
 // namespaces are added too, which is how operator-derived images (an ECK
 // Elasticsearch data image named only by spec.version) get covered.
-func runImages(args []string) error {
-	fs := newSubFlagSet("images")
-	live := fs.Bool("live", false, "also include images of pods in the apps' namespaces (captures operator-derived images, e.g. ECK Elasticsearch, that rendered manifests never name)")
-	offline := offlineRenderFlag(fs)
-	maxParallel := maxParallelFlag(fs)
-	kctx := contextFlag(fs)
-	cfg, names, err := loadConfig(fs, args)
+func runImages(path, kctx *string, live, offline *bool, maxParallel *int, names []string) error {
+	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}

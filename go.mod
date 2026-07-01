@@ -9,6 +9,8 @@ require (
 	github.com/go-logr/logr v1.4.3
 	github.com/moby/patternmatcher v0.6.1
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
+	github.com/spf13/cobra v1.10.1
+	github.com/spf13/pflag v1.0.10
 	golang.org/x/term v0.39.0
 	golang.org/x/text v0.33.0
 	k8s.io/api v0.34.0
@@ -65,8 +67,6 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
-	github.com/spf13/cobra v1.10.1 // indirect
-	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xlab/treeprint v1.2.0 // indirect
 	go.opentelemetry.io/otel v1.38.0 // indirect
