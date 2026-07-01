@@ -15,9 +15,10 @@ import (
 const rootLong = `ksync — a local-development sync loop for Kubernetes.
 
 It watches local kustomize directories and, on change, renders, diffs, and applies the
-affected app to a local cluster with ArgoCD-parity sync semantics: helm hooks, sync
-waves, prune, server-side apply, and health gating. An app that builds from source is
-rebuilt, tagged by content, and rolled in the same loop.
+affected app to a local cluster — matching how ArgoCD deploys: it orders hooks, uses
+server-side apply, deletes resources you removed from the manifests (prune), and waits
+until the resources are healthy. An app that builds from source is rebuilt, tagged by
+content, and redeployed in the same loop.
 
 A minimal ksync.yaml:
 
@@ -35,7 +36,10 @@ and never deletes a namespace.
 
 Requirements: a local cluster and its kubectl context; helm on PATH only when a
 kustomization inflates helmCharts (kustomize is built in); docker only when an app
-builds from source.`
+builds from source.
+
+First run: write a ksync.yaml (see 'ksync help config'), preview it with 'ksync diff',
+apply it with 'ksync sync', then 'ksync watch' to re-sync on every change.`
 
 // Per-command Long text and Examples. Each is a self-contained page: what the
 // command does, its sharp edges, and worked invocations — the detail the flag
@@ -52,8 +56,8 @@ skips. --auto, or a non-terminal, rebuilds automatically. Builds run ahead of ne
 order, and a deploy never applies an image that has not finished building.
 
 watch rebuilds images from source, so it rejects image overrides: the --image flag is not
-offered, and a set KSYNC_IMAGE_OVERRIDES fails fast — use 'ksync sync' to deploy a
-pre-built image.
+offered, and setting KSYNC_IMAGE_OVERRIDES makes it fail fast — use 'ksync sync' to deploy
+a pre-built image.
 
 See 'ksync help builds' and 'ksync help strategy'.`
 
@@ -62,10 +66,10 @@ const watchExample = `  ksync watch                # watch and sync every app
   ksync watch --auto         # no prompt; rebuild on every change`
 
 const syncLong = `Build, render, and apply each selected app once, then exit. With no app names, every app
-is synced in needs order. Apps run concurrently within the needs DAG; an app finishes
-only when its resources are Healthy (up to --timeout).
+is synced in needs order. Apps run concurrently, in the order set by needs; an app
+finishes only when its resources are Healthy (up to --timeout).
 
-On timeout — or on Ctrl-C of a wedged sync — ksync names the still-unhealthy resources
+On timeout — or if you Ctrl-C a stuck sync — ksync names the still-unhealthy resources
 and dumps their events and pod logs, so a stuck rollout is diagnosable without a separate
 kubectl session.
 
@@ -77,12 +81,12 @@ hook and sync-wave ordering.`
 const syncExample = `  ksync sync                                  # sync every app once
   ksync sync web                              # just one app
   ksync sync --force                          # re-run hooks even with no manifest change
-  ksync sync --image ghcr.io/app=web:pr-42    # deploy a pre-built image, skip its build`
+  ksync sync --image ghcr.io/app/web=pr-42    # deploy tag pr-42 of web instead of building`
 
-const diffLong = `Render each selected app exactly as sync would — post-render patches, image overrides,
-and live build-tag carry-forward — and print a per-resource unified YAML diff against
-live cluster state: what a sync would create, update, or prune. Read-only: no build, no
-apply. Secrets are masked.
+const diffLong = `Render each selected app exactly as sync would, then print a per-resource unified YAML
+diff against live cluster state: what a sync would create, update, or prune. Read-only:
+no build, no apply. Secrets are masked. The render applies the same post-render patches,
+image overrides, and build-tag carry-forward as a real sync.
 
 By default the diff is a server-side dry-run apply, so a field the apiserver defaults or
 prunes is not shown as drift; --client-diff uses the faster in-process diff instead.
@@ -93,7 +97,7 @@ const diffExample = `  ksync diff             # preview changes for every app
   ksync diff web api     # just these apps`
 
 const renderLong = `Print each selected app's rendered manifests (kustomize + helm) to stdout. Read-only and
-no docker, so images ksync builds locally are absent.
+no docker, so a built image appears at its declared ref, not the locally-built dev tag.
 
 By default it renders against the cluster so helm 'lookup' resolves and capabilities
 match; --offline-render uses plain 'helm template' (no cluster; lookup returns empty) and
@@ -104,17 +108,17 @@ Manifests go to stdout and status to stderr, so 'ksync render web > web.yaml' is
 const renderExample = `  ksync render web > web.yaml
   ksync render --offline-render web    # no cluster needed`
 
-const imagesLong = `Print the canonical, containerd-normalized references of the images the selected apps
-deploy — one per line, sorted and deduplicated — the exact set a cache or pre-pull tool
-should scope to. Images ksync builds locally (any build: entry) are excluded: they are
-local-only dev tags that are never pulled.
+const imagesLong = `Print the images the selected apps deploy — one per line, sorted and deduplicated — each
+as a canonical (containerd-normalized) reference, so a cache or pre-pull tool matches the
+cluster's image store by string equality. Images ksync builds locally (any build: entry)
+are excluded: they are local-only dev tags that are never pulled.
 
 --live also reads the images of running pods in the apps' namespaces, capturing
 operator-derived images that the manifests never name (an ECK Elasticsearch data image
 from spec.version).`
 
-const imagesExample = `  ksync images                 # images every app deploys
-  ksync images --live | sort   # include operator-derived running-pod images`
+const imagesExample = `  ksync images          # images every app deploys
+  ksync images --live   # also include operator-derived running-pod images`
 
 const destroyLong = `Delete every resource ksync tracks (labeled ksync.dev/app) for the selected apps, in
 reverse needs order. It prints its scope and the target context first and requires --yes
@@ -126,10 +130,11 @@ the whole stack.`
 const destroyExample = `  ksync destroy web --yes    # delete one app's resources
   ksync destroy --yes        # tear down every app`
 
-// Concept topics. Each is a help-only command (no Run): 'ksync help <topic>' or
-// 'ksync <topic>' prints its Long. They carry the conceptual material that used
-// to live in docs/usage.md — the ksync.yaml schema and the behavior no per-flag
-// description can express.
+// Concept topics. Each is a help-only command: 'ksync <topic>' prints its Long and
+// 'ksync help <topic>' shows the same text. They do no cluster work but carry a Run
+// (see helpTopic). They hold the conceptual material that used to live in
+// docs/usage.md — the ksync.yaml schema and the behavior no per-flag description can
+// express.
 
 const configTopic = `ksync reads one ksync.yaml (default: the working directory; -f <path> overrides).
 
@@ -215,7 +220,8 @@ Build fields:
   watch         paths under context that trigger a rebuild. Default: the whole context.
   watchIgnore   .dockerignore-syntax paths kept in the context but excluded from
                 triggering a rebuild.
-  command       replaces docker build (must leave the image under $KSYNC_IMAGE).
+  command       replaces docker build (must leave the image under $KSYNC_IMAGE); excludes
+                dockerfile/group.
   group         builds via a top-level buildGroups entry (excludes command/dockerfile).
 
 One image name has at most one build definition across all apps.
@@ -255,8 +261,8 @@ Custom and grouped builds
   A grouped command must leave each requested image tagged <image>:ksync-build; ksync
   content-tags each afterward. Double-quote "$KSYNC_IMAGE" (single quotes do not expand
   under sh -c). When two apps share a group, ksync runs that group's command for one app
-  at a time by default (a bulk command need not be safe run against itself); set
-  parallel: true on the buildGroups entry when it is concurrency-safe.
+  at a time by default (a bulk command need not be safe to run concurrently with
+  itself); set parallel: true on the buildGroups entry when it is concurrency-safe.
 
 Pre-built image overrides
   'ksync sync --image IMAGE=REF' (or KSYNC_IMAGE_OVERRIDES, also on diff) deploys an
@@ -288,7 +294,7 @@ for when that default is wrong for one app or one run.
   Render   helm template against the cluster (lookup works) clientRender: true (per app)
                                                             --offline-render (per run)
   Diff     server-side dry-run apply (no false drift)       --client-diff (per run)
-  Apply    server-side apply; prune by the ksync.dev/app    --prune=false; --force
+  Apply    server-side apply; prune by the ksync.dev/app    --prune=false; --force (sync)
            label
 
 Render — clientRender: true
@@ -297,7 +303,9 @@ Render — clientRender: true
   matches for kind' until the CRD exists. clientRender renders that app client-side —
   keeping the cluster's capabilities but dropping the dry-run, the way ArgoCD renders — so
   one app can own both its CRDs and its custom resources. It disables helm lookup for the
-  app, so use it only where the chart does not need lookup.
+  app, so use it only where the chart does not need lookup — a chart using lookup to keep
+  a value stable would regenerate it each sync. clientRender still renders against the
+  cluster.
 
 Render — --offline-render
   Renders with no cluster at all (plain helm; lookup returns empty), byte-matching
@@ -328,6 +336,9 @@ Output
   build's output line by line instead.`
 
 const hooksTopic = `ksync follows ArgoCD's hook rules, not Helm's.
+
+A sync wave is an ordering group: ksync applies one wave and waits for it to be Healthy
+before applying the next.
 
   - Hooks are read from argocd.argoproj.io/hook, falling back to helm.sh/hook (excluding
     crd-install).

@@ -1196,7 +1196,7 @@ func runDestroy(path, kctx *string, yes *bool, timeout *time.Duration, names []s
 	if !*yes {
 		return fmt.Errorf("destroy deletes every tracked resource of: %s — re-run with --yes to confirm", strings.Join(appNames(apps), ", "))
 	}
-	// Always echo the scope: a bare `destroy -yes` (no app names) deletes every
+	// Always echo the scope: a bare `destroy --yes` (no app names) deletes every
 	// app, so the user must see what is about to go and on which cluster.
 	fmt.Fprintf(os.Stderr, "destroying %d app(s) on context %s: %s\n", len(apps), kubeContext, strings.Join(appNames(apps), ", "))
 	// Dependents go down before their dependencies.

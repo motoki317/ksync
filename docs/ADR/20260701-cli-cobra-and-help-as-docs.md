@@ -100,3 +100,17 @@ placeholder; `ksync help strategy` and `ksync config` print their guides; `-V`/`
 agree; an unknown flag or command exits 1 with a one-line `ksync:` error and no usage dump. `just
 test` (incl. the leak guard, so no private name reached the help copy) and `just check` (gofmt, vet)
 pass.
+
+A flag-parse error appends `run 'ksync <command> --help' for usage` (via `SetFlagErrorFunc` on the
+root, inherited by every subcommand) so a mistyped flag has a next step without reprinting the whole
+usage block.
+
+Known quirks, accepted:
+
+- `-force`/`-file` (single-dash) are *not* rejected the way other single-dash long flags are, because
+  `-f` is a value-taking shorthand: pflag reads `ksync sync -force` as `--file=orce`, which then fails
+  as a config-load error ("no config file at orce"), not a flag-parse error — so the flag-error hint
+  above does not fire for it. Inherent to a value-taking shorthand; the supported form is `--force`.
+- Bare `ksync` (no command) prints the root help to stdout and exits 0, where the old stdlib dispatcher
+  printed usage to stderr and exited 1. This matches kubectl/helm/docker and is harmless to the one
+  wrapper (which always passes a subcommand); kept as cobra's default.

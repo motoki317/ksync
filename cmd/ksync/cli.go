@@ -63,6 +63,12 @@ func verboseFlag(f *pflag.FlagSet) *bool {
 	return p
 }
 
+func pruneFlag(f *pflag.FlagSet) *bool {
+	p := new(bool)
+	f.BoolVar(p, "prune", true, "delete tracked resources missing from the rendered output")
+	return p
+}
+
 func newWatchCmd() *cobra.Command {
 	var (
 		path, kctx                             *string
@@ -84,7 +90,7 @@ func newWatchCmd() *cobra.Command {
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
-	prune = f.Bool("prune", true, "delete tracked resources missing from the rendered output")
+	prune = pruneFlag(f)
 	debounce = f.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
 	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
 	maxParallel = maxParallelFlag(f)
@@ -117,7 +123,7 @@ func newSyncCmd() *cobra.Command {
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
-	prune = f.Bool("prune", true, "delete tracked resources missing from the rendered output")
+	prune = pruneFlag(f)
 	force = f.Bool("force", false, "re-run hooks even when manifests are unchanged (re-applies PostSync Jobs; a failed hook is retried regardless)")
 	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
 	maxParallel = maxParallelFlag(f)
@@ -257,6 +263,14 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		Version:       version,
 	}
+	// A flag parse error is a usage mistake, so point the user at the command's help
+	// (SilenceUsage suppresses the full usage dump). Set on the root, FlagErrorFunc is
+	// inherited by every subcommand and fires regardless of SilenceErrors. It reaches
+	// only genuine flag-parse errors: `-force` parses as `--file=orce` (a config error),
+	// so that muscle-memory case is not covered here — see ADR known quirks.
+	root.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
+		return fmt.Errorf("%w\nrun '%s --help' for usage", err, c.CommandPath())
+	})
 	// `ksync --version` prints just the version, matching the `version` command.
 	root.SetVersionTemplate("{{.Version}}\n")
 	// Give --version the -V shorthand so -v stays free for --verbose on the
