@@ -105,6 +105,15 @@ A flag-parse error appends `run 'ksync <command> --help' for usage` (via `SetFla
 root, inherited by every subcommand) so a mistyped flag has a next step without reprinting the whole
 usage block.
 
+An unknown top-level verb (`ksync frob`) similarly appends `run 'ksync help' for the command list`.
+cobra returns it untyped as `unknown command "frob" for "ksync"`, and `cobra.NoArgs` formats extra
+args on a real command the same way (`unknown command "extra" for "ksync version"`) — so the hint is
+anchored to the root command path (`… for "ksync"`), not the bare prefix: a stray argument on a valid
+command is *not* nudged toward the command list, which is the wrong fix for it. Matched by message
+since cobra exports no sentinel; if the wording changes the hint is absent, never wrong. The
+error→exit mapping (`context.Canceled` → interrupt/130, unknown verb → the hint, else `ksync:
+<err>`/1) lives in `exitStatus` (`cmd/ksync/main.go`), split out from `main` so it is unit-tested.
+
 Known quirks, accepted:
 
 - `-force`/`-file` (single-dash) are *not* rejected the way other single-dash long flags are, because

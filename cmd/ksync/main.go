@@ -22,6 +22,7 @@ import (
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
 	"github.com/go-logr/logr"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2"
@@ -72,27 +73,38 @@ func signalContext() (context.Context, context.CancelFunc) {
 var version = "dev"
 
 func main() {
-	err := newRootCmd().Execute()
+	root := newRootCmd()
+	err := root.Execute()
+	if msg, code := exitStatus(err, root); code != 0 {
+		fmt.Fprintln(os.Stderr, msg)
+		os.Exit(code)
+	}
+}
+
+// exitStatus maps a root-command error to the stderr line and process exit code.
+// Extracted from main so the error→exit contract is unit-testable without os.Exit.
+func exitStatus(err error, root *cobra.Command) (msg string, code int) {
 	switch {
 	case err == nil:
-		return
+		return "", 0
 	case errors.Is(err, context.Canceled):
 		// A Ctrl-C (or a sibling app's failure aborting the run) surfaces as a
 		// context cancellation, not a real failure: report it as an interrupt with
 		// the conventional 130, never a stack of "timed out" / "context canceled".
-		fmt.Fprintln(os.Stderr, "ksync: interrupted")
-		os.Exit(130)
+		return "ksync: interrupted", 130
 	default:
-		msg := err.Error()
-		// cobra returns an unknown-command error untyped; give it the same next-step
-		// nudge SetFlagErrorFunc adds for a bad flag, but pointing at the command list
-		// (a wrong verb, not a wrong flag). Matched by message since cobra exports no
-		// sentinel; if the wording ever changes the hint is simply absent, never wrong.
-		if strings.HasPrefix(msg, "unknown command ") {
-			msg += "\nrun 'ksync help' for the command list"
+		m := err.Error()
+		// Give a genuinely-unknown top-level verb (`ksync frob`) the same next-step
+		// nudge SetFlagErrorFunc adds for a bad flag, but pointing at the command
+		// list. cobra reports it untyped as `unknown command "frob" for "ksync"`;
+		// anchoring on the root path keeps extra args on a real command
+		// (`ksync version extra` → `... for "ksync version"`) from getting a hint
+		// that points at the wrong fix. Matched by message since cobra exports no
+		// sentinel; if the wording changes the hint is simply absent, never wrong.
+		if strings.HasPrefix(m, "unknown command ") && strings.HasSuffix(m, `for "`+root.CommandPath()+`"`) {
+			m += "\nrun 'ksync help' for the command list"
 		}
-		fmt.Fprintln(os.Stderr, "ksync:", msg)
-		os.Exit(1)
+		return "ksync: " + m, 1
 	}
 }
 
