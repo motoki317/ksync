@@ -170,7 +170,7 @@ func TestBuilder_BuildGroup(t *testing.T) {
 		t.Fatalf("BuildGroup: %v", err)
 	}
 	// Both images share the fake fingerprint, so they share a dev tag — valid,
-	// since they are distinct repositories (NeoShowcase's components likewise
+	// since they are distinct repositories (a monorepo's services likewise
 	// share layers and differ only by image name).
 	tag := "ksync-" + fpHash(fingerprint)
 	want := []string{"ghcr.io/team-a/api-b:" + tag, "ghcr.io/team-a/api-c:" + tag}

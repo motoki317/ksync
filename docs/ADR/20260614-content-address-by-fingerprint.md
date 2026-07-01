@@ -38,7 +38,7 @@ across rebuilds of identical content and sensitive to real change:
   Entrypoint, Cmd, Env, WorkingDir, ExposedPorts, User, Volumes, Labels. It contains none of the
   drifting `created`/`history` timestamps (those live in fields `docker image inspect` omits), so it
   is stable across rebuilds, yet it captures config-only changes the layers miss — notably an
-  `ENTRYPOINT` edit on an image whose filesystem is unchanged. NeoShowcase's Go components share one
+  `ENTRYPOINT` edit on an image whose filesystem is unchanged. A monorepo's services can share one
   compiled binary and differ *only* by `ENTRYPOINT`; layers alone would tie their tags together, so
   including `.Config` is load-bearing, not belt-and-suspenders.
 

@@ -61,18 +61,18 @@ func TestWatchReporter_CommitsSummaryPerBatch(t *testing.T) {
 // developer knows the loop is idle and ready.
 func TestWatchReporter_SingleAppHasNoPlanOrSummary(t *testing.T) {
 	var buf bytes.Buffer
-	apps := []config.App{{Name: "duo"}}
+	apps := []config.App{{Name: "shop"}}
 	colors := ui.NewColors(&buf)
 	log := ui.New(ui.Options{Writer: &buf})
 	r := startWatchReporter(&buf, colors, log, newProgress(&buf, colors, apps), apps, "prod-cluster")
 	t.Cleanup(r.stop) // the reporter starts a heartbeat goroutine; don't leak it past the test
-	r.report("duo", loop.SyncStats{Applied: 3}, 0)
+	r.report("shop", loop.SyncStats{Applied: 3}, 0)
 	r.onIdle(time.Second)
 	out := buf.String()
 	if strings.Contains(out, "Plan") || strings.Contains(out, "Summary") {
 		t.Errorf("single-app watch must not frame Plan/Summary: %q", out)
 	}
-	if !strings.Contains(out, "duo") || !strings.Contains(out, "3 applied") {
+	if !strings.Contains(out, "shop") || !strings.Contains(out, "3 applied") {
 		t.Errorf("single-app watch = %q, want the ship line", out)
 	}
 	if !strings.Contains(out, "watching for changes") {

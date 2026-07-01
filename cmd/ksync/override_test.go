@@ -53,7 +53,7 @@ func TestParseOverrideRef_Errors(t *testing.T) {
 
 func TestImageOverrides_EnvAndFlagsMerge(t *testing.T) {
 	cfg := &config.Config{Apps: []config.App{{
-		Name: "duo",
+		Name: "shop",
 		Build: []config.Build{
 			{Image: "ghcr.io/org/api-b"},
 			{Image: "ghcr.io/org/ui-b"},
@@ -80,7 +80,7 @@ func TestImageOverrides_EnvAndFlagsMerge(t *testing.T) {
 // wrapper can supply a superset of refs without tracking ksync's build list.
 func TestImageOverrides_DropsUnknownImage(t *testing.T) {
 	cfg := &config.Config{Apps: []config.App{{
-		Name:  "duo",
+		Name:  "shop",
 		Build: []config.Build{{Image: "ghcr.io/org/api-b"}},
 	}}}
 	got, err := imageOverrides(cfg, []string{
@@ -99,7 +99,7 @@ func TestImageOverrides_DropsUnknownImage(t *testing.T) {
 }
 
 func TestImageOverrides_RejectsMalformed(t *testing.T) {
-	cfg := &config.Config{Apps: []config.App{{Name: "duo", Build: []config.Build{{Image: "img"}}}}}
+	cfg := &config.Config{Apps: []config.App{{Name: "shop", Build: []config.Build{{Image: "img"}}}}}
 	if _, err := imageOverrides(cfg, []string{"no-equals-sign"}, logr.Discard()); err == nil {
 		t.Error("imageOverrides accepted a token with no '='; want an error")
 	}

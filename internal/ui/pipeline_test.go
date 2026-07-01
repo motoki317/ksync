@@ -211,13 +211,13 @@ func TestPipeline_CommittedLineCarriesDeployWord(t *testing.T) {
 func TestPipeline_LiveHeaderShowsGroupTotal(t *testing.T) {
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
-	p := newPipe(&buf, "sistema", true, clk)
+	p := newPipe(&buf, "depot", true, clk)
 	p.Deploy()
 	p.Build("ui") // running from t=0
 	clk.add(12 * time.Second)
 
 	header := p.lines('⠹')[0]
-	if !strings.Contains(header, "sistema") || !strings.Contains(header, "12s") {
+	if !strings.Contains(header, "depot") || !strings.Contains(header, "12s") {
 		t.Errorf("live header should show the app and its running group total, got %q", header)
 	}
 }
@@ -229,7 +229,7 @@ func TestPipeline_LiveHeaderShowsGroupTotal(t *testing.T) {
 func TestPipeline_OverrideOnlyDeployCollapses(t *testing.T) {
 	clk := &clock{t: time.Unix(0, 0)}
 	var buf bytes.Buffer
-	p := newPipe(&buf, "duo", true, clk) // expand: has builds in config, all overridden this run
+	p := newPipe(&buf, "shop", true, clk) // expand: has builds in config, all overridden this run
 	d := p.Deploy()
 
 	if got := p.lines('⠼'); len(got) != 2 {
@@ -245,7 +245,7 @@ func TestPipeline_OverrideOnlyDeployCollapses(t *testing.T) {
 		t.Errorf("an app that only deployed should report no build stages")
 	}
 	line := p.committedLine(CommitInfo{Summary: "6 applied", Symbol: "✓"})
-	if !strings.Contains(line, "Deploy") || !strings.Contains(line, "duo") || !strings.Contains(line, "6 applied") {
+	if !strings.Contains(line, "Deploy") || !strings.Contains(line, "shop") || !strings.Contains(line, "6 applied") {
 		t.Errorf("override-only app should commit as a single Deploy line, got %q", line)
 	}
 }

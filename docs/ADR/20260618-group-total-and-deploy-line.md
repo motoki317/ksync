@@ -15,7 +15,7 @@ when the app had also built and imported.
 Three gaps remained, surfaced dogfooding a whole-stack sync:
 
 - **The tree header showed only the app name.** There was no single number for "how long did
-  `sistema` take" — only the per-stage rows. Comparing apps meant eyeballing the slowest row.
+  `depot` take" — only the per-stage rows. Comparing apps meant eyeballing the slowest row.
 - **An override-only app still committed as a one-child tree.** An app whose images were all supplied
   as overrides (ADR 20260616-image-override) builds nothing, so its pipeline holds only the deploy
   stage — yet because the app *has* build entries in config (`expand`), it committed as a header over

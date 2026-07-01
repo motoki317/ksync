@@ -65,7 +65,7 @@ func TestStartEagerBuilds_BuildsConcurrentlyIgnoringNeeds(t *testing.T) {
 // has nothing to build (a zero outcome at once).
 func TestStartEagerBuilds_SkipsOverriddenImages(t *testing.T) {
 	apps := []config.App{
-		{Name: "duo", Build: []config.Build{{Image: "img-api"}, {Image: "img-ui"}}},
+		{Name: "shop", Build: []config.Build{{Image: "img-api"}, {Image: "img-ui"}}},
 		{Name: "all-ovr", Build: []config.Build{{Image: "img-x"}}},
 	}
 	var mu sync.Mutex
@@ -86,15 +86,15 @@ func TestStartEagerBuilds_SkipsOverriddenImages(t *testing.T) {
 	}
 	await, wait := startEagerBuilds(context.Background(), apps, buildFn, 4, overrides)
 
-	bo := await("duo")
+	bo := await("shop")
 	if bo.err != nil {
-		t.Fatalf("duo outcome err: %v", bo.err)
+		t.Fatalf("shop outcome err: %v", bo.err)
 	}
 	if _, ok := bo.tags[0]; !ok {
-		t.Errorf("duo entry 0 (img-api) should be built: %+v", bo.tags)
+		t.Errorf("shop entry 0 (img-api) should be built: %+v", bo.tags)
 	}
 	if _, ok := bo.tags[1]; ok {
-		t.Errorf("duo entry 1 (img-ui) is overridden and must not be built: %+v", bo.tags)
+		t.Errorf("shop entry 1 (img-ui) is overridden and must not be built: %+v", bo.tags)
 	}
 	if bo := await("all-ovr"); bo.tags != nil || bo.err != nil {
 		t.Errorf("all-overridden app outcome = %+v, want zero", bo)

@@ -35,12 +35,12 @@ func newConsole(w *bytes.Buffer) *console {
 func TestConsole_AllActiveItemsRendered(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	c.addItem(&buf, cols80, bigRows, item("build duo"))
-	c.addItem(&buf, cols80, bigRows, item("build sistema"))
+	c.addItem(&buf, cols80, bigRows, item("build shop"))
+	c.addItem(&buf, cols80, bigRows, item("build depot"))
 	c.stopTicker() // halt animation so the buffer is stable
 
 	got := buf.String()
-	if !strings.Contains(got, "build duo") || !strings.Contains(got, "build sistema") {
+	if !strings.Contains(got, "build shop") || !strings.Contains(got, "build depot") {
 		t.Errorf("both active items should be rendered, got:\n%q", got)
 	}
 }
@@ -50,7 +50,7 @@ func TestConsole_AllActiveItemsRendered(t *testing.T) {
 func TestConsole_LinePrintsAboveBlock(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	c.addItem(&buf, cols80, bigRows, item("build duo"))
+	c.addItem(&buf, cols80, bigRows, item("build shop"))
 	buf.Reset() // ignore the initial paint; focus on what line() emits
 	c.line(SectionLog, &buf, "✓ postgres  0 applied\n")
 	c.stopTicker()
@@ -61,7 +61,7 @@ func TestConsole_LinePrintsAboveBlock(t *testing.T) {
 	if !strings.HasPrefix(got, eraseLine) {
 		t.Errorf("line() should erase the block first, got:\n%q", got)
 	}
-	if i := strings.Index(got, "✓ postgres"); i < 0 || strings.Index(got, "build duo") < i {
+	if i := strings.Index(got, "✓ postgres"); i < 0 || strings.Index(got, "build shop") < i {
 		t.Errorf("status line should be printed above the repainted block, got:\n%q", got)
 	}
 }
@@ -70,18 +70,18 @@ func TestConsole_LinePrintsAboveBlock(t *testing.T) {
 func TestConsole_FinishPrintsDoneAndKeepsOthers(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	t1, t2 := item("build duo"), item("build sistema")
+	t1, t2 := item("build shop"), item("build depot")
 	c.addItem(&buf, cols80, bigRows, t1)
 	c.addItem(&buf, cols80, bigRows, t2)
 	buf.Reset()
-	c.finishItem(t1, "✓ build duo  (6.1s)\n")
+	c.finishItem(t1, "✓ build shop  (6.1s)\n")
 	c.stopTicker()
 
 	got := buf.String()
-	if !strings.Contains(got, "✓ build duo  (6.1s)") {
+	if !strings.Contains(got, "✓ build shop  (6.1s)") {
 		t.Errorf("committed line missing: %q", got)
 	}
-	if !strings.Contains(got, "build sistema") {
+	if !strings.Contains(got, "build depot") {
 		t.Errorf("remaining item should still be rendered: %q", got)
 	}
 }
@@ -103,15 +103,15 @@ func TestConsole_LinePlainWhenNoBlock(t *testing.T) {
 func TestConsole_FooterRendersBelowAndPersists(t *testing.T) {
 	var buf bytes.Buffer
 	c := newConsole(&buf)
-	build := item("build duo")
+	build := item("build shop")
 	c.addItem(&buf, cols80, bigRows, build)
 	c.setFooter(&buf, cols80, bigRows, func() []string { return []string{"Summary", "  Apps  1/2 synced"} })
 	buf.Reset()
-	c.finishItem(build, "✓ build duo  (4s)\n") // last item done; footer remains
+	c.finishItem(build, "✓ build shop  (4s)\n") // last item done; footer remains
 	c.stopTicker()
 
 	got := buf.String()
-	if !strings.Contains(got, "✓ build duo  (4s)") {
+	if !strings.Contains(got, "✓ build shop  (4s)") {
 		t.Errorf("finished item's committed line missing: %q", got)
 	}
 	if !strings.Contains(got, "Summary") || !strings.Contains(got, "1/2 synced") {
@@ -147,7 +147,7 @@ func TestConsole_DrawBlockClampsToWidth(t *testing.T) {
 	const width = 24
 	c := &console{w: &buf, cols: func() int { return width }, rows: bigRows}
 	c.items = append(c.items,
-		item("🔨 rust-services (duo)  loading metadata for a very long image reference :nonroot"),
+		item("🔨 bundle (shop)  loading metadata for a very long image reference :nonroot"),
 		item("📦 some-other-build"),
 	)
 	c.drawBlock()

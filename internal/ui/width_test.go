@@ -31,7 +31,7 @@ func TestDisplayWidth(t *testing.T) {
 // and throw off the cursor-up erase. This is the exact regression: the 🔨 icon
 // (two columns, previously counted as one) pushed lines one past the edge.
 func TestClampANSI_KeepsLineWithinBudget(t *testing.T) {
-	line := "🔨 rust-services (duo)  loading metadata for a very long image reference"
+	line := "🔨 bundle (shop)  loading metadata for a very long image reference"
 	for _, budget := range []int{8, 12, 20, 30, 40} {
 		got := clampANSI(line, budget)
 		if w := displayWidth(got); w > budget {
@@ -41,7 +41,7 @@ func TestClampANSI_KeepsLineWithinBudget(t *testing.T) {
 }
 
 func TestClampANSI_PassesShortLinesThrough(t *testing.T) {
-	s := "✓ duo  0 applied"
+	s := "✓ shop  0 applied"
 	if got := clampANSI(s, 80); got != s {
 		t.Errorf("clampANSI should not touch a fitting line: %q", got)
 	}
