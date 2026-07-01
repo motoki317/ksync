@@ -23,11 +23,17 @@ short step identifier. The log itself is the liveness signal — no synthetic pe
 Adopt the buildx model for the non-terminal path: stream each command's output live, prefixed by the
 app and stage it belongs to, and remove the heartbeat. The terminal path is unchanged.
 
-- **Stream build output, prefixed.** Off a terminal, `Stage.Write` accumulates bytes and emits each
-  complete line as one console write, prefixed `app/label <phase> │ ` — `shop/ui build │ Compiling foo`.
-  The phase word (`build`/`import`/`deploy`) is greppable and disambiguates a build from an import that
-  share a label; a label equal to the app name collapses (`web build`, not `web/web build`). Concurrent
-  apps' lines interleave, exactly as buildx does — grouping by app would hide liveness again.
+- **Stream build output, prefixed, with running elapsed.** Off a terminal, `Stage.Write` accumulates
+  bytes and emits each complete line as one console write, prefixed `app/label <phase> [<elapsed>] │ ` —
+  `shop/ui build [45s] │ Compiling foo`. The phase word (`build`/`import`/`deploy`) is greppable and
+  disambiguates a build from an import that share a label; a label equal to the app name collapses
+  (`web build`, not `web/web build`). The per-line elapsed is the stage's running time, mirroring
+  buildx's `#12 45.3s text`, so a reader sees how long a build has run at a glance — without the
+  heartbeat reprint this ADR removed. It sits **inside the prefix, left of the `│`**, so everything
+  left of the bar is metadata and everything right is the command's own output — a bare `45s` right of
+  the bar would read as a line of build output. The result line follows the same shape
+  (`shop/ui build [1m01s] │ ✓`), so the bracket is always the same column. Concurrent apps' lines
+  interleave, exactly as buildx does — grouping by app would hide liveness again.
 - **No heartbeat.** The 30s ticker, its snapshot plumbing (`RunningStage`, `Pipeline.Snapshot`,
   `progress.snapshot`), and `internal/ui/heartbeat.go` are removed. The streamed log lines *are* the
   liveness signal, so there is nothing to reprint.
@@ -38,7 +44,8 @@ app and stage it belongs to, and remove the heartbeat. The terminal path is unch
   short (the build is the long pole), so nothing material is lost.
 - **Deploys stream on change, not on a timer.** A deploy has no command output; its progress is the
   health gate. `Stage.SetTail` (called each poll) streams a line only when the not-ready status
-  *changes* — `db deploy │ waiting for health: 1 not ready (…)` — so a deploy stuck on the same resource
+  *changes* — `db deploy [12s] │ waiting for health: 1 not ready (…)` (same bracketed running-elapsed
+  prefix as a build line) — so a deploy stuck on the same resource
   stays silent, exactly as buildx does for a step that produces no output. The engine reports the
   not-ready set (`SyncOptions.OnWait`) from **both** wait phases: the sync operation loop (a
   health-gated wave or a non-hook Job) and the final post-apply health gate. The operation-loop call is
@@ -78,8 +85,9 @@ app and stage it belongs to, and remove the heartbeat. The terminal path is unch
 # Impact
 
 - `internal/ui/pipeline.go`: `Stage` gains a `partial` line buffer; `Write` streams off a terminal
-  (`writeOff`/`takeLines`/`emitLine`/`streamPrefix`) for build stages and buffers import output;
-  `SetTail` streams a changed deploy status off a terminal; `Done` (`doneOff`) flushes the partial line
+  (`writeOff`/`takeLines`/`emitLine`/`streamPrefix`) for build stages and buffers import output; each
+  streamed content line (`emitLine`, `SetTail`) is prefixed with the stage's running `Elapsed` (read
+  under `s.mu`); `SetTail` streams a changed deploy status off a terminal; `Done` (`doneOff`) flushes the partial line
   and prints a per-stage result, dumping the buffer only for a failed import; `committed` routes an
   off-terminal build app to its deploy line (the stages already streamed); `Snapshot`/`RunningStage`
   and `plainResult` are removed. `Recap`/`oneLine` stay (recap-only now).

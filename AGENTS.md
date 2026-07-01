@@ -133,8 +133,10 @@ re-litigate only with new evidence):
   committed deploy time is the deploy stage's own, via `ui.CommitInfo`). `ui.DeployLine`'s `kind`
   arg carries that word — sync passes "Deploy", `ksync destroy` passes "" (it is not a deploy). **Off
   a terminal the block is inert; instead each build streams its command output live, line by line,
-  prefixed `app/label <phase> │ ` (the docker-buildx model — the log itself is the liveness signal,
-  no heartbeat)**; imports buffer and report a result line (a coalesced load tees one command to every
+  prefixed `app/label <phase> [<elapsed>] │ ` (the docker-buildx model, `#12 45.3s text` — the log
+  itself is the liveness signal, no heartbeat, and the per-line running elapsed, bracketed left of the
+  bar so it is never mistaken for build output, shows how long a stage has run at a glance)**; imports
+  buffer and report a result line (a coalesced load tees one command to every
   waiting app, so per-stage streaming would duplicate it — dumped only on failure); a deploy streams a
   health-gate line only when its not-ready status changes; the run ends with the slowest-first
   `Timings` recap after the Summary (ADR 20260701-non-terminal-log-streaming). The console also owns

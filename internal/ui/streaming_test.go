@@ -34,13 +34,38 @@ func TestStage_OffTerminalStreamsBuildLines(t *testing.T) {
 
 	out := buf.String()
 	for _, want := range []string{
-		"shop/ui build │ Compiling foo v0.1.0",
-		"shop/ui build │ Compiling bar v0.2.0",
-		"shop/ui build │ ✓",
-		"1m01s",
+		"shop/ui build [0.0s] │ Compiling foo v0.1.0",
+		"shop/ui build [0.0s] │ Compiling bar v0.2.0",
+		"shop/ui build [1m01s] │ ✓",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("streamed build output should contain %q, got:\n%s", want, out)
+		}
+	}
+}
+
+// Each streamed line carries the stage's running elapsed (buildx's per-line
+// "#12 45.3s text"), so the elapsed climbs as the build runs — a reader sees how
+// long a stage has been going at a glance without a heartbeat reprint.
+func TestStage_OffTerminalPrefixesRunningElapsed(t *testing.T) {
+	t.Cleanup(resetLiveTerm)
+	resetLiveTerm()
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "shop", true, clk)
+	b := p.Build("ui")
+	_, _ = b.Write([]byte("early\n"))
+	clk.add(15 * time.Second)
+	_, _ = b.Write([]byte("later\n"))
+	b.Done(nil)
+
+	out := buf.String()
+	for _, want := range []string{
+		"shop/ui build [0.0s] │ early",
+		"shop/ui build [15s] │ later",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("streamed line should carry its running elapsed, want %q, got:\n%s", want, out)
 		}
 	}
 }
@@ -56,7 +81,7 @@ func TestStage_OffTerminalFlushesPartialLineOnDone(t *testing.T) {
 	b := p.Build("ui")
 	_, _ = b.Write([]byte("final line without newline"))
 	b.Done(nil)
-	if !strings.Contains(buf.String(), "shop/ui build │ final line without newline") {
+	if !strings.Contains(buf.String(), "shop/ui build [0.0s] │ final line without newline") {
 		t.Errorf("a trailing partial line should flush on Done, got:\n%s", buf.String())
 	}
 }
@@ -99,7 +124,7 @@ func TestStage_OffTerminalCollapsesCarriageReturnRedraw(t *testing.T) {
 	b.Done(nil)
 
 	out := buf.String()
-	if !strings.Contains(out, "shop/ui build │ Downloading 100%") {
+	if !strings.Contains(out, "shop/ui build [0.0s] │ Downloading 100%") {
 		t.Errorf("a carriage-return redraw should stream its final text, got:\n%s", out)
 	}
 	if strings.Contains(out, "Downloading 10%Downloading 100%") {
@@ -121,10 +146,10 @@ func TestStage_OffTerminalBuildFailureNoReDump(t *testing.T) {
 	b.Done(errors.New("exit 1"))
 
 	out := buf.String()
-	if !strings.Contains(out, "shop/ui build │ ERROR: it broke") {
+	if !strings.Contains(out, "shop/ui build [0.0s] │ ERROR: it broke") {
 		t.Errorf("the failing line should have streamed, got:\n%s", out)
 	}
-	if !strings.Contains(out, "shop/ui build │ ✗") {
+	if !strings.Contains(out, "shop/ui build [0.0s] │ ✗") {
 		t.Errorf("a build failure should print a ✗ result line, got:\n%s", out)
 	}
 	if strings.Contains(out, "output ───") {
@@ -151,7 +176,7 @@ func TestStage_OffTerminalImportNoStreamDumpsOnFailure(t *testing.T) {
 	if strings.Contains(buf.String(), "importing image abc") {
 		t.Errorf("import output should not stream line-by-line off a terminal, got:\n%s", buf.String())
 	}
-	if !strings.Contains(buf.String(), "shop/ui import │ ✓") {
+	if !strings.Contains(buf.String(), "shop/ui import [0.0s] │ ✓") {
 		t.Errorf("a successful import should print a result line, got:\n%s", buf.String())
 	}
 
@@ -166,7 +191,7 @@ func TestStage_OffTerminalImportNoStreamDumpsOnFailure(t *testing.T) {
 	if !strings.Contains(out, "load error: no space") {
 		t.Errorf("an import failure should dump its captured output, got:\n%s", out)
 	}
-	if !strings.Contains(out, "shop/ui import │ ✗") {
+	if !strings.Contains(out, "shop/ui import [0.0s] │ ✗") {
 		t.Errorf("an import failure should print a ✗ result line, got:\n%s", out)
 	}
 }
@@ -189,13 +214,13 @@ func TestStage_OffTerminalDeployStreamsOnChangeOnly(t *testing.T) {
 	d.Done(nil)
 
 	out := buf.String()
-	if n := strings.Count(out, "db deploy │ waiting for health 2 not ready"); n != 1 {
+	if n := strings.Count(out, "db deploy [0.0s] │ waiting for health 2 not ready"); n != 1 {
 		t.Errorf("an unchanged deploy status must not reprint (want 1, got %d):\n%s", n, out)
 	}
-	if !strings.Contains(out, "db deploy │ waiting for health 1 not ready: a") {
+	if !strings.Contains(out, "db deploy [0.0s] │ waiting for health 1 not ready: a") {
 		t.Errorf("a changed deploy status should stream, got:\n%s", out)
 	}
-	if strings.Contains(out, "deploy │ ✓") || strings.Contains(out, "deploy │ ✗") {
+	if strings.Contains(out, "✓") || strings.Contains(out, "✗") {
 		t.Errorf("the deploy stage prints no result line of its own off a terminal, got:\n%s", out)
 	}
 }

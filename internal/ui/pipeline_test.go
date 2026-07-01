@@ -125,7 +125,7 @@ func TestPipeline_NonTTYBuildStreamsThenCommitsDeployLine(t *testing.T) {
 	clk.add(time.Second)
 	b.Done(nil)
 	// The build's result line streamed as it finished, so the buffer is not empty.
-	if !strings.Contains(buf.String(), "ns-system/img build │ ✓") {
+	if !strings.Contains(buf.String(), "ns-system/img build [1.0s] │ ✓") {
 		t.Errorf("a build's result line should stream as it finishes, got %q", buf.String())
 	}
 	d := p.Deploy()
@@ -264,9 +264,9 @@ func TestPipeline_FailureShowsCapturedOutput(t *testing.T) {
 	if !strings.Contains(out, "ERROR: it broke") {
 		t.Errorf("failure should stream the captured output, got %q", out)
 	}
-	// Each streamed line is app/label/phase-prefixed, so a failure names which app
-	// built what.
-	if !strings.Contains(out, "ns-system/img build │") {
+	// Each streamed line is app/label/phase-prefixed (with the stage's bracketed
+	// elapsed), so a failure names which app built what.
+	if !strings.Contains(out, "ns-system/img build [0.0s] │") {
 		t.Errorf("streamed lines should be app/label/phase-prefixed, got %q", out)
 	}
 }

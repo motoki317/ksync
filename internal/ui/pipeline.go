@@ -87,9 +87,11 @@ func (s *Stage) SetTail(line string) {
 	s.mu.Lock()
 	changed := line != s.tail
 	s.tail = line
+	start := s.start
 	s.mu.Unlock()
 	if changed && line != "" && !s.pipe.tty {
-		liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix()+line+"\n")
+		el := s.pipe.now().Sub(start)
+		liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix(el)+line+"\n")
 	}
 }
 
@@ -136,9 +138,13 @@ func (s *Stage) writeOff(p []byte) (int, error) {
 	s.mu.Lock()
 	s.partial = append(s.partial, p...)
 	lines := s.takeLines()
+	start := s.start
 	s.mu.Unlock()
-	for _, line := range lines {
-		s.emitLine(line)
+	if len(lines) > 0 {
+		el := s.pipe.now().Sub(start)
+		for _, line := range lines {
+			s.emitLine(line, el)
+		}
 	}
 	return len(p), nil
 }
@@ -161,28 +167,32 @@ func (s *Stage) takeLines() []string {
 	return lines
 }
 
-// emitLine prints one streamed output line with its stage prefix, skipping a line
-// blank after cleaning so a build tool's empty line never becomes a bare prefix.
-// Called without s.mu held — it writes through the console.
-func (s *Stage) emitLine(line string) {
+// emitLine prints one streamed output line with its stage prefix (which carries the
+// stage's running elapsed), skipping a line blank after cleaning so a build tool's
+// empty line never becomes a bare prefix. Called without s.mu held — it writes
+// through the console.
+func (s *Stage) emitLine(line string, elapsed time.Duration) {
 	if line = streamClean(line); line == "" {
 		return
 	}
-	liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix()+line+"\n")
+	liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix(elapsed)+line+"\n")
 }
 
-// streamPrefix tags a streamed line with the app, the build/import label, and the
-// phase word — "shop/ui build │ ", "shop/ui import │ ", "db deploy │ " — so the
-// interleaved lines of concurrent apps stay attributable and greppable by phase
-// (the word disambiguates a build from an import that share a label). A label equal
-// to the app name (a single unnamed build whose image's last segment is the app) is
-// dropped, so "web/web build" reads as "web build".
-func (s *Stage) streamPrefix() string {
+// streamPrefix tags a streamed line with the app, the build/import label, the phase
+// word, and the stage's elapsed in brackets — "shop/ui build [45s] │ ", "db deploy
+// [12s] │ " — so interleaved lines of concurrent apps stay attributable and greppable
+// by phase (the word disambiguates a build from an import that share a label). The
+// bracketed elapsed sits inside the prefix, left of the "│", so all metadata is on one
+// side of the bar and the command's own output on the other — the time is never
+// mistaken for a line of build output. A label equal to the app name (a single unnamed
+// build whose image's last segment is the app) is dropped, so "web/web build" reads as
+// "web build".
+func (s *Stage) streamPrefix(elapsed time.Duration) string {
 	name := s.pipe.app
 	if s.label != "" && s.label != s.pipe.app {
 		name += "/" + s.label
 	}
-	return name + " " + strings.ToLower(s.kind) + " " + s.pipe.c.Dim("│") + " "
+	return name + " " + strings.ToLower(s.kind) + " [" + Elapsed(s.pipe.c, elapsed) + "] " + s.pipe.c.Dim("│") + " "
 }
 
 // Done finishes the stage as succeeded or failed and stamps its elapsed time.
@@ -222,7 +232,8 @@ func (s *Stage) Done(err error) {
 // doneOff finishes a stage off a terminal. The deploy stage prints nothing here —
 // its result is the committed deploy line (Pipeline.Finish). A build/import stage
 // flushes any trailing partial line, then prints one prefixed result line
-// ("shop/ui build │ ✓ 1m01s"). A failure prints the captured output first when
+// ("shop/ui build [1m01s] │ ✓" — the elapsed rides in the prefix bracket, the mark
+// after the bar). A failure prints the captured output first when
 // there is any — an import never streamed its output, so its buffer is dumped;
 // a build already streamed every line, so its buffer is empty and only the ✗
 // result prints.
@@ -230,7 +241,7 @@ func (s *Stage) doneOff(err error, elapsed time.Duration, out, partial string) {
 	if s.phase == phaseDeploy {
 		return
 	}
-	s.emitLine(partial)
+	s.emitLine(partial, elapsed)
 	if err != nil && out != "" {
 		liveTerm.line(SectionPipeline, s.pipe.w, fmt.Sprintf("%s\n%s\n", s.pipe.c.Dim("─── "+s.heading()+" output ───"), out))
 	}
@@ -238,7 +249,7 @@ func (s *Stage) doneOff(err error, elapsed time.Duration, out, partial string) {
 	if err != nil {
 		mark = "✗"
 	}
-	liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix()+mark+" "+Elapsed(s.pipe.c, elapsed)+"\n")
+	liveTerm.line(SectionPipeline, s.pipe.w, s.streamPrefix(elapsed)+mark+"\n")
 }
 
 // heading names the stage for the failure-log header and the non-terminal result
