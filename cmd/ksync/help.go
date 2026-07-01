@@ -14,15 +14,14 @@ import (
 
 const rootLong = `ksync — a local-development sync loop for Kubernetes.
 
-It watches local kustomize directories and, on change, renders, diffs, and applies the
-affected app to a local cluster — matching how ArgoCD deploys: it orders hooks, uses
-server-side apply, deletes resources you removed from the manifests (prune), and waits
-until the resources are healthy. An app that builds from source is rebuilt, tagged by
-content, and redeployed in the same loop.
+Watch local kustomize directories. On change, render, diff, and apply the affected app
+to a local cluster the way ArgoCD does: hooks, sync waves, server-side apply, prune
+(delete resources you removed from the manifests), and a wait until resources are
+Healthy. An app that builds from source is rebuilt and redeployed in the same loop.
 
 A minimal ksync.yaml:
 
-  allowedContexts: [docker-desktop]    # the only clusters ksync may touch
+  allowedContexts: [docker-desktop]    # kubectl contexts ksync may use
   apps:
     - path: apps/web                   # a kustomize dir; name defaults to "web"
     - path: apps/api
@@ -30,16 +29,14 @@ A minimal ksync.yaml:
     - name: db
       path: apps/postgres
 
-Safety: ksync acts only on a context listed in allowedContexts and never reads your
-kubeconfig current-context. It prunes only resources it applied (labeled ksync.dev/app)
-and never deletes a namespace.
+First run:
 
-Requirements: a local cluster and its kubectl context; helm on PATH only when a
-kustomization inflates helmCharts (kustomize is built in); docker only when an app
-builds from source.
+  1. write a ksync.yaml here     list your apps and cluster
+  2. ksync diff                  preview what a sync would change
+  3. ksync sync                  apply it once
+  4. ksync watch                 re-sync on every change
 
-First run: write a ksync.yaml (see 'ksync help config'), preview it with 'ksync diff',
-apply it with 'ksync sync', then 'ksync watch' to re-sync on every change.`
+New to ksync? Read 'ksync help config' to write your ksync.yaml.`
 
 // Per-command Long text and Examples. Each is a self-contained page: what the
 // command does, its sharp edges, and worked invocations — the detail the flag
@@ -136,256 +133,238 @@ const destroyExample = `  ksync destroy web --yes    # delete one app's resource
 // docs/usage.md — the ksync.yaml schema and the behavior no per-flag description can
 // express.
 
-const configTopic = `ksync reads one ksync.yaml (default: the working directory; -f <path> overrides).
+const configTopic = `ksync reads one ksync.yaml from the working directory (use -f <path> for another).
+
+## A complete example
 
   allowedContexts:
-    - docker-desktop
-    # - k3s-*                   # glob: matches a family of contexts
+    - docker-desktop            # kubectl context names (required)
 
   apps:
-    - path: apps/web            # name defaults to the directory name ("web")
+    - path: apps/web            # name defaults to the dir: "web"
+
     - name: api
       path: apps/api
-      namespace: team-a
-      needs: [db]
-      build:
-        - { image: ghcr.io/app/api, context: ../src/api }
+      namespace: shop           # default namespace for this app
+      needs: [db]               # sync only after db is Healthy
+      build:                    # build from source (ksync help builds)
+        - image: ghcr.io/app/api
+          context: ../src/api
+
     - name: db
       path: apps/postgres
-      namespace: team-a
+      namespace: shop
 
-Top-level fields:
-  allowedContexts   kubectl contexts ksync may target (>=1, required). The safety gate.
-  apps              the app list (required).
-  imageLoad         command that loads built images into a separate-store cluster.
-  buildGroups       named bulk-build commands shared by build entries.
+## Required
+  allowedContexts   kubectl context names ksync may target. This is the safety gate.
+  apps[].path       a directory with a kustomization file.
 
-App fields:
-  path          directory with a kustomization file, relative to the config (required).
-  name          app name (default: the directory name); used in commands, logs, labels.
-  namespace     default namespace for resources that declare none.
-  needs         apps that must sync and be Healthy before this one. Cycles are rejected.
-  build         images built from local source (see 'ksync help builds').
-  patches       post-render edits to one rendered object (below).
-  clientRender  render this app client-side so it can bundle its own CRDs and CRs
-                (see 'ksync help strategy').
+## Common app fields
+  name         app name (default: the directory name).
+  namespace    default namespace for resources that set none.
+  needs        apps that must be Healthy before this one syncs.
+  build        images built from local source (ksync help builds).
 
-Unknown fields are rejected.
+## Requirements
+  A local cluster and its kubectl context. helm on PATH only when a kustomization
+  inflates helmCharts (kustomize is built in). docker only when an app builds.
 
-Context selection
-  allowedContexts is the safety gate: ksync targets only a listed context and never reads
-  the kubeconfig current-context. A sole concrete entry is auto-targeted; with several
-  entries or a glob you must pass --context <name>, and it must match an entry. Entries
-  are shell globs — k3s-* matches a family of per-worktree clusters — and a --context
-  matched by glob (not an exact entry) warns, since a glob is a broader grant. '*' matches
-  everything and defeats the gate.
+─── Advanced ──────────────────────────────────────────────
 
-Default namespace
+## Context selection (the safety gate)
+  ksync targets only a listed context and never reads your kubeconfig current-context.
+  One concrete entry is used automatically. With several entries, or a glob, you must
+  pass --context <name>, and it must match an entry. Entries are shell globs, so 'k3s-*'
+  matches a family of clusters. '*' matches everything and removes the safety gate.
+
+## Namespaces
   namespace sets the default for rendered resources that declare none (like ArgoCD's
-  destination.namespace); applying a namespaceless resource without it fails. Resources
-  with their own metadata.namespace keep it. ksync creates the namespace if missing; no
-  namespace is ever labeled, pruned, or deleted.
+  destination.namespace). ksync creates a namespace if it is missing, but never labels,
+  prunes, or deletes one.
 
-Per-environment patches
-  patches edits a rendered field the kustomization cannot express per environment — a
-  hostPath whose value depends on where ksync runs. The edit applies after render, before
-  image injection.
+## Per-environment patches
+  patches edits a rendered field that the kustomization cannot set per environment (for
+  example a hostPath that depends on where ksync runs). It runs after render, before
+  image injection, and must match exactly one object.
 
     patches:
-      - target: { kind: Deployment, name: cache }   # exact kind+name(+group/version/ns)
-        patch: |                                    # must match exactly one object
+      - target: { kind: Deployment, name: cache }
+        patch: |
           - op: replace
             path: /spec/template/spec/volumes/0/hostPath/path
             value: ${HOME}/.cache/web
 
-  patch is an inline RFC 6902 op list; lead with a test op on a stable field, since it
-  indexes arrays. ${VAR} in a value expands at render time (the environment plus
-  ${KSYNC_WORKDIR}, the config dir): ${VAR:-default} falls back when unset or empty, a
-  bare undefined ${VAR} fails the render, and $$ is a literal $. ${HOME} is the cluster
-  host's home, since ksync runs next to it.`
+  patch is an inline RFC 6902 op list. ${VAR} in a value expands at render time:
+  ${VAR:-default} falls back when unset or empty, a bare undefined ${VAR} fails the render,
+  and $$ is a literal $. ${KSYNC_WORKDIR} is the config directory.
 
-const buildsTopic = `A build entry rebuilds an image from local source on change, content-tags it, injects the
-tag, and rolls the pods.
+## More app fields
+  clientRender             render this app client-side (ksync help strategy).
+  imageLoad, buildGroups   top-level build helpers (ksync help builds).
+
+Unknown fields are rejected.`
+
+const buildsTopic = `A build entry rebuilds an image from local source on change, tags it by content,
+injects the tag, and rolls the pods.
 
   build:
-    - image: ghcr.io/app/api    # as the manifests reference it, without a tag
+    - image: ghcr.io/app/api    # the ref your manifests use, without a tag
       context: ../src/api       # docker build context; watched for changes
 
-Build fields:
-  image         image name as manifests reference it (no tag/digest); ksync replaces the
-                tag of every match. Required.
-  context       build context directory, relative to the config; watched. Required.
-  name          label in progress and prompt output. Default: the image's last segment.
+## Fields
+  image         image name as manifests reference it, no tag. Required.
+  context       build context directory, relative to the config. Watched. Required.
+  name          label shown in progress output. Default: the image's last segment.
   dockerfile    Dockerfile relative to context. Default: Dockerfile.
-  watch         paths under context that trigger a rebuild. Default: the whole context.
-  watchIgnore   .dockerignore-syntax paths kept in the context but excluded from
-                triggering a rebuild.
-  command       replaces docker build (must leave the image under $KSYNC_IMAGE); excludes
-                dockerfile/group.
-  group         builds via a top-level buildGroups entry (excludes command/dockerfile).
+  watch         paths under context that trigger a rebuild. Default: all of context.
+  watchIgnore   paths kept in the build but excluded from triggering a rebuild.
 
-One image name has at most one build definition across all apps.
+## Good to know
+  - The tag is 'ksync-<hash of the image>', so identical content keeps the same tag and
+    does not restart the pods.
+  - imagePullPolicy: Always on a built image becomes IfNotPresent (the local tag is in no
+    registry, so a pull would fail).
+  - On kind, k3d, or a remote cluster, built images must be loaded. See imageLoad below.
 
-Key behavior
-  - The tag is 'ksync-' plus a hash of the image's layers and config, so identical content
-    keeps the same tag (no pod restart) even when the build tool restamps the image ID. No
-    build state is persisted; startup rebuilds once via docker's layer cache.
-  - An explicit imagePullPolicy: Always on a built image is rewritten to IfNotPresent —
-    the local tag exists in no registry, so Always would force a failing pull.
-    Manifest-only edits skip docker.
-  - .dockerignore-excluded files are not watched. A staged build output the Dockerfile
-    COPYs but that must not retrigger the build goes in watchIgnore.
+─── Advanced ──────────────────────────────────────────────
 
-Custom and grouped builds
-  command replaces docker build for one image; a top-level buildGroups entry builds
-  several with one command (a multi-target 'docker buildx bake', or a host compile
-  producing many binaries). Members reference the group by name; a one-shot sync builds
-  every selected entry, while an incremental watch change rebuilds only the dirty members.
-  Both run via 'sh -c' in the context and receive $KSYNC_IMAGES (the refs to produce,
-  newline-separated), $KSYNC_IMAGE (the first), and $KSYNC_CONTEXT.
-
-    buildGroups:
-      - name: services
-        command: |
-          for ref in $KSYNC_IMAGES; do
-            t=${ref%:*}; t=${t##*/}; sets="$sets --set ${t}.tags=${ref}"; targets="$targets $t"
-          done
-          docker buildx bake --load $sets $targets
-    apps:
-      - name: services
-        path: manifests/services
-        build:
-          - { image: ghcr.io/app/api, context: ../.., watch: [services/api, lib], group: services }
-          - { image: ghcr.io/app/web, context: ../.., watch: [services/web, lib], group: services }
-
-  A grouped command must leave each requested image tagged <image>:ksync-build; ksync
-  content-tags each afterward. Double-quote "$KSYNC_IMAGE" (single quotes do not expand
-  under sh -c). When two apps share a group, ksync runs that group's command for one app
-  at a time by default (a bulk command need not be safe to run concurrently with
-  itself); set parallel: true on the buildGroups entry when it is concurrency-safe.
-
-Pre-built image overrides
-  'ksync sync --image IMAGE=REF' (or KSYNC_IMAGE_OVERRIDES, also on diff) deploys an
-  existing image instead of building it — a CI artifact, registry tag, or pinned digest.
-  REF may be a bare tag, name:tag, or @digest. The build and its imageLoad are skipped, so
-  making the ref cluster-visible is the supplier's job; an override for an unbuilt image
-  is ignored. watch rejects overrides.
-
-Making built images visible (imageLoad)
-  ksync builds into the local docker daemon. Docker Desktop runs pods from it directly;
-  k3d, kind, and remote clusters keep a separate image store, so a built tag must be
-  loaded. imageLoad.command runs (with $KSYNC_IMAGES, $KSYNC_IMAGE, $KSYNC_CONTEXT) only
-  when an image is rebuilt; calls are serialized and coalesced.
+## Load built images into the cluster (imageLoad)
+  ksync builds into the local docker daemon. Docker Desktop runs pods from it directly.
+  kind, k3d, and remote clusters keep a separate store, so a built tag must be loaded.
+  The command runs only when an image is rebuilt.
 
     imageLoad:
       command: k3d image import --cluster dev $KSYNC_IMAGES
       # kind:     kind load docker-image --name dev $KSYNC_IMAGES
-      # k3s:      docker save $KSYNC_IMAGES | k3s ctr -n k8s.io images import -
       # registry: for i in $KSYNC_IMAGES; do docker push "$i"; done
 
-  With k3d/kind, set pods to imagePullPolicy: Never or IfNotPresent. Branch on
-  $KSYNC_CONTEXT to share one config between a shared-daemon and a separate-store cluster
-  (exit 0 when there is nothing to load).`
+  It receives $KSYNC_IMAGES (refs, newline-separated), $KSYNC_IMAGE (the first), and
+  $KSYNC_CONTEXT. With kind or k3d, set pods to imagePullPolicy: Never or IfNotPresent.
 
-const strategyTopic = `ksync runs three phases. Each defaults to the cluster-aware behavior and has an opt-out
-for when that default is wrong for one app or one run.
+## Custom build command
+  command replaces docker build for one image. It runs via 'sh -c' in the context and
+  must leave the image tagged as "$KSYNC_IMAGE". It excludes dockerfile and group.
 
-  Phase    Default                                          Opt-out
-  Render   helm template against the cluster (lookup works) clientRender: true (per app)
-                                                            --offline-render (per run)
-  Diff     server-side dry-run apply (no false drift)       --client-diff (per run)
-  Apply    server-side apply; prune by the ksync.dev/app    --prune=false
-           label
+## Bulk builds (buildGroups)
+  A buildGroups entry builds several images with one command (for example a
+  'docker buildx bake', or a compile that produces many binaries). Members reference the
+  group by name.
 
-Render — clientRender: true
-  The default render is a server-side dry-run, so the apiserver maps every resource. An app
-  whose chart ships a CRD together with custom resources of that kind then fails with 'no
-  matches for kind' until the CRD exists. clientRender renders that app client-side —
-  keeping the cluster's capabilities but dropping the dry-run, the way ArgoCD renders — so
-  one app can own both its CRDs and its custom resources. It disables helm lookup for the
-  app, so use it only where the chart does not need lookup — a chart using lookup to keep
-  a value stable would regenerate it each sync. clientRender still renders against the
-  cluster.
+    buildGroups:
+      - name: services
+        command: docker buildx bake --load ...   # tag each as <image>:ksync-build
+    apps:
+      - name: services
+        path: manifests/services
+        build:
+          - { image: ghcr.io/app/api, context: ../.., group: services }
+          - { image: ghcr.io/app/web, context: ../.., group: services }
 
-Render — --offline-render
-  Renders with no cluster at all (plain helm; lookup returns empty), byte-matching
-  'kustomize build --enable-helm --load-restrictor LoadRestrictionsNone'. Accepted by
-  render, sync, watch, diff, and images; it overrides clientRender (every app renders
-  plain).
+  The command gets $KSYNC_IMAGES, $KSYNC_IMAGE, and $KSYNC_CONTEXT, and must tag each
+  requested image as <image>:ksync-build. ksync content-tags them afterward. A group's
+  command runs one app at a time by default; set 'parallel: true' when it is safe to run
+  concurrently.
 
-Diff — --client-diff
-  The server-side dry-run keeps a field the apiserver defaults or prunes (a StatefulSet
-  maxUnavailable behind a disabled feature gate) from showing as drift. --client-diff uses
-  the faster in-process merge instead, at the cost of showing such a field as a perpetual
-  change — harmless on sync/watch, visible drift on diff.
+## Deploy a pre-built image (overrides)
+  'ksync sync --image IMAGE=REF' (or KSYNC_IMAGE_OVERRIDES, also on diff) deploys an
+  existing image instead of building it. REF may be a bare tag, name:tag, or @digest. The
+  build and its imageLoad are skipped. watch does not accept overrides.`
 
-Tracking, prune, and safety
-  Every applied non-Namespace resource gets the label ksync.dev/app: <app name>
-  (server-side apply, field manager ksync). Prune (on sync/watch) and destroy act only on
-  resources carrying it with the matching app name; everything else is invisible to them.
-  - ksync targets only an allowedContexts entry and ignores the kubeconfig current-context.
-  - Namespaces are never labeled, pruned, or deleted — even one an app renders.
-  - An app that renders zero resources while it still owns live ones will not prune them
-    away: ksync refuses and points at 'ksync destroy <app>' for an intentional teardown.
+const strategyTopic = `ksync runs three phases. Each defaults to cluster-aware behavior, with an opt-out for
+when that default is wrong for one app or one run.
+
+  Phase    Default                                     Opt-out
+  Render   helm template against the cluster           clientRender: true (per app)
+                                                       --offline-render (per run)
+  Diff     server-side dry-run apply (no false drift)  --client-diff (per run)
+  Apply    server-side apply; prune by ksync.dev/app   --prune=false
+
+## Safety
+  - ksync targets only an allowedContexts entry, never your kubeconfig current-context.
+  - It labels every applied resource (except Namespaces) ksync.dev/app: <app>. Prune and
+    destroy touch only resources with that label. Everything else is invisible to them.
+  - Namespaces are never labeled, pruned, or deleted.
   - destroy requires --yes and prints its scope first.
+  - An app that renders nothing while it still owns live resources will not prune them.
+    ksync stops and points you at 'ksync destroy <app>'.
 
-Output
-  Status goes to stderr; render manifests go to stdout. Color is on for an interactive
-  terminal and off under NO_COLOR. On a terminal, each app is a live pipeline
-  (Build -> Import -> Deploy) ending in a one-line summary; a pipe or CI streams each
-  build's output line by line instead.`
+─── Advanced ──────────────────────────────────────────────
 
-const hooksTopic = `ksync follows ArgoCD's hook rules, not Helm's.
+## clientRender: true (per app)
+  The default render is a server-side dry-run, so the cluster must know every kind. An app
+  whose chart ships a CRD together with custom resources of that kind fails with 'no
+  matches for kind' until the CRD exists. clientRender renders that app client-side (the
+  way ArgoCD does), so it can carry both. It still uses the cluster's capabilities; only
+  --offline-render skips the cluster entirely. It disables helm lookup for the app, so use
+  it only where the chart does not need lookup.
 
-A sync wave is an ordering group: ksync applies one wave and waits for it to be Healthy
-before applying the next.
+## --offline-render (per run)
+  Renders with no cluster at all (plain helm; lookup returns empty). It byte-matches
+  'kustomize build --enable-helm --load-restrictor LoadRestrictionsNone', and overrides
+  clientRender.
+
+## --client-diff (per run)
+  The server-side dry-run hides fields the apiserver defaults or prunes, so they do not
+  look like drift. --client-diff uses a faster in-process diff, but then such a field
+  shows as a permanent change.
+
+## Output
+  Manifests go to stdout; status goes to stderr. Color is on for a terminal, off under
+  NO_COLOR. On a terminal each app is a live pipeline (Build -> Import -> Deploy); a pipe
+  or CI streams each build's output line by line instead.`
+
+const hooksTopic = `ksync follows ArgoCD's hook rules, not Helm's. You need this only if your charts use
+hooks.
+
+A sync wave is an ordering group: ksync applies one wave, waits for it to be Healthy,
+then applies the next.
 
   - Hooks are read from argocd.argoproj.io/hook, falling back to helm.sh/hook (excluding
     crd-install).
-  - post-install / post-upgrade become PostSync and run on every sync, after the main
+  - post-install and post-upgrade become PostSync. They run on every sync, after the main
     resources are Healthy.
   - helm.sh/hook-weight is the sync wave when argocd.argoproj.io/sync-wave is absent.
   - helm.sh/hook-delete-policy maps as in ArgoCD (default BeforeHookCreation).
 
 A no-change sync skips hooks, unless a hook's Job is currently failed (it re-runs so a
-transiently-failed PostSync self-heals) or --force re-runs them all (ArgoCD manual-sync
-parity).`
+transiently-failed PostSync self-heals), or --force re-runs them all.`
 
-const troubleshootingTopic = `Most errors name their own fix; the recurring ones:
+const troubleshootingTopic = `Most errors name their own fix. The common ones:
 
-  <app> rendered 0 resources but manages N live resource(s)
-    The kustomization now renders nothing (a typo, a dropped resources: entry). Fix it, or
-    'ksync destroy <app>' to remove the app.
+## <app> rendered 0 resources but manages N live resource(s)
+  The kustomization now renders nothing (a typo, a dropped resources: entry). Fix it, or
+  run 'ksync destroy <app>' to remove the app.
 
-  cluster cannot map X (Y)
-    Live render asks the cluster to map every kind; a CRD not yet installed or an unserved
-    apiVersion fails. Install the CRD; if the app bundles its own CRDs with custom
-    resources of that kind, set clientRender: true on it; or use --offline-render (helm
-    lookup results will be empty).
+## cluster cannot map X
+  A live render asks the cluster to map every kind. A missing CRD, or an apiVersion the
+  cluster does not serve, makes it fail. Install the CRD, set clientRender: true on the app
+  if it bundles its own CRDs, or use --offline-render (ksync help strategy).
 
-  Pods of a built image show ErrImagePull
-    The kubelet tried to pull the local ksync-... tag. The image has no matching build
-    entry, the cluster has a separate store with no imageLoad, or it cannot see the docker
-    daemon.
+## Pods of a built image show ErrImagePull
+  The kubelet tried to pull the local ksync-... tag. Either the image has no build entry,
+  or the cluster has a separate store with no imageLoad (ksync help builds).
 
-  Pods restart on every rebuild with no source change
-    The image ID changes each build (usually a provenance attestation). ksync's docker
-    build disables it; with a command, add --provenance=false.
+## Pods restart on every rebuild with no source change
+  ksync tags an image by a fingerprint of its layers and runtime config, so a rebuild that
+  changes neither keeps the same tag. If pods still roll, the build bakes something new in
+  every time (often a timestamp or random value in a layer or a label). Make that part
+  reproducible.
 
-  A change is not picked up by watch
-    ksync watches the app directory and what the kustomization references, minus
-    .dockerignore and watch: exclusions. For anything outside, run 'ksync sync'.
+## A change is not picked up by watch
+  ksync watches each app's directory, the paths its kustomization references, and each
+  build's context (or its watch: roots), minus .dockerignore and watchIgnore. For anything
+  outside that, run 'ksync sync'.
 
-  First sync after start is slow
-    ksync lists the cluster once to warm its cache. Keep watch running; later syncs reuse
-    it.`
+## First sync after start is slow
+  ksync lists the cluster once to warm its cache. Keep watch running: later syncs in the
+  same session reuse it, while a one-shot 'ksync sync' warms it again each run.`
 
 // helpTopic is one concept page. Running 'ksync <name>' prints its guide, and
 // 'ksync help <name>' shows the same text through cobra's help. It carries a Run
 // (not merely a Long) so cobra lists it under the topics group rather than its
 // catch-all "Additional help topics" section.
 func helpTopic(name, short, long string) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:     name,
 		Short:   short,
 		Long:    long,
@@ -398,15 +377,23 @@ func helpTopic(name, short, long string) *cobra.Command {
 			return err
 		},
 	}
+	// A concept guide is prose, not an invocable command: print just the guide, with
+	// none of cobra's "Usage:/Flags:" trailer (there are no real flags — it is only
+	// noise on a guide). This makes all three paths render the identical clean page:
+	// 'ksync <topic>' (RunE), 'ksync help <topic>', and 'ksync <topic> -h'.
+	cmd.SetHelpFunc(func(c *cobra.Command, _ []string) {
+		_, _ = fmt.Fprintln(c.OutOrStdout(), c.Long)
+	})
+	return cmd
 }
 
 // helpTopics returns the concept pages, in the order the root help lists them.
 func helpTopics() []*cobra.Command {
 	return []*cobra.Command{
-		helpTopic("config", "ksync.yaml schema: apps, contexts, namespaces, patches", configTopic),
-		helpTopic("builds", "building images from source: build, buildGroups, imageLoad, overrides", buildsTopic),
-		helpTopic("strategy", "how render, diff, apply, prune, and safety behave", strategyTopic),
-		helpTopic("hooks", "ArgoCD hook mapping and sync-wave ordering", hooksTopic),
+		helpTopic("config", "write your ksync.yaml: apps, contexts, namespaces", configTopic),
+		helpTopic("builds", "build images from source, and load them into the cluster", buildsTopic),
+		helpTopic("strategy", "how render, diff, apply, and prune behave", strategyTopic),
+		helpTopic("hooks", "ArgoCD hooks and sync waves", hooksTopic),
 		helpTopic("troubleshooting", "common errors and their fixes", troubleshootingTopic),
 	}
 }
