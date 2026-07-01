@@ -83,7 +83,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "ksync: interrupted")
 		os.Exit(130)
 	default:
-		fmt.Fprintln(os.Stderr, "ksync:", err)
+		msg := err.Error()
+		// cobra returns an unknown-command error untyped; give it the same next-step
+		// nudge SetFlagErrorFunc adds for a bad flag, but pointing at the command list
+		// (a wrong verb, not a wrong flag). Matched by message since cobra exports no
+		// sentinel; if the wording ever changes the hint is simply absent, never wrong.
+		if strings.HasPrefix(msg, "unknown command ") {
+			msg += "\nrun 'ksync help' for the command list"
+		}
+		fmt.Fprintln(os.Stderr, "ksync:", msg)
 		os.Exit(1)
 	}
 }
@@ -1194,7 +1202,7 @@ func runDestroy(path, kctx *string, yes *bool, timeout *time.Duration, names []s
 		return err
 	}
 	if !*yes {
-		return fmt.Errorf("destroy deletes every tracked resource of: %s — re-run with --yes to confirm", strings.Join(appNames(apps), ", "))
+		return fmt.Errorf("destroy deletes every tracked resource of: %s on context %s — re-run with --yes to confirm", strings.Join(appNames(apps), ", "), kubeContext)
 	}
 	// Always echo the scope: a bare `destroy --yes` (no app names) deletes every
 	// app, so the user must see what is about to go and on which cluster.

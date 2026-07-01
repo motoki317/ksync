@@ -247,7 +247,7 @@ func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("no config file at %s — create a ksync.yaml here, or pass -f <path>", path)
+			return nil, fmt.Errorf("no config file at %s — create a ksync.yaml here, or pass -f <path>; run 'ksync help config' for the format", path)
 		}
 		return nil, err
 	}

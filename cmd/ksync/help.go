@@ -81,7 +81,7 @@ hook and sync-wave ordering.`
 const syncExample = `  ksync sync                                  # sync every app once
   ksync sync web                              # just one app
   ksync sync --force                          # re-run hooks even with no manifest change
-  ksync sync --image ghcr.io/app/web=pr-42    # deploy tag pr-42 of web instead of building`
+  ksync sync --image ghcr.io/app/api=pr-42    # deploy tag pr-42 of api instead of building`
 
 const diffLong = `Render each selected app exactly as sync would, then print a per-resource unified YAML
 diff against live cluster state: what a sync would create, update, or prune. Read-only:
@@ -294,7 +294,7 @@ for when that default is wrong for one app or one run.
   Render   helm template against the cluster (lookup works) clientRender: true (per app)
                                                             --offline-render (per run)
   Diff     server-side dry-run apply (no false drift)       --client-diff (per run)
-  Apply    server-side apply; prune by the ksync.dev/app    --prune=false; --force (sync)
+  Apply    server-side apply; prune by the ksync.dev/app    --prune=false
            label
 
 Render — clientRender: true

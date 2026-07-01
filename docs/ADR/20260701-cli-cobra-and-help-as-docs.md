@@ -108,9 +108,12 @@ usage block.
 Known quirks, accepted:
 
 - `-force`/`-file` (single-dash) are *not* rejected the way other single-dash long flags are, because
-  `-f` is a value-taking shorthand: pflag reads `ksync sync -force` as `--file=orce`, which then fails
-  as a config-load error ("no config file at orce"), not a flag-parse error — so the flag-error hint
-  above does not fire for it. Inherent to a value-taking shorthand; the supported form is `--force`.
+  `-f` is a value-taking shorthand: pflag binds any `-f…` token to `--file` and takes the rest as the
+  path (`-force` → `--file=orce`, `-file=x` → `--file=ile=x`). Usually that path does not exist and the
+  run fails at config load ("no config file at orce"), not at flag parse — so the flag-error hint above
+  does not fire. In the rare case the swallowed path names a real config file, it is loaded silently,
+  overriding even an explicit `-f`. Inherent to a value-taking shorthand; the supported forms are
+  `--force` and, for the config path, `--file`/`-f`.
 - Bare `ksync` (no command) prints the root help to stdout and exits 0, where the old stdlib dispatcher
   printed usage to stderr and exited 1. This matches kubectl/helm/docker and is harmless to the one
   wrapper (which always passes a subcommand); kept as cobra's default.
