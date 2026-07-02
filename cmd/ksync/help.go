@@ -52,9 +52,9 @@ Rebuild-all is the default (Enter), Space narrows to a subset, and an empty sele
 skips. --auto, or a non-terminal, rebuilds automatically. Builds run ahead of needs
 order, and a deploy never applies an image that has not finished building.
 
-watch rebuilds images from source, so it rejects image overrides: the --image flag is not
-offered, and setting KSYNC_IMAGE_OVERRIDES makes it fail fast — use 'ksync sync' to deploy
-a pre-built image.
+--image (or KSYNC_IMAGE_OVERRIDES) seeds a pre-built image instead of building it on the
+first sync, exactly as 'ksync sync' does. watch keeps watching that image's source, so the
+first edit rebuilds it and takes over from the supplied ref — the inner loop resumes.
 
 See 'ksync help builds' and 'ksync help strategy'.`
 
@@ -268,7 +268,9 @@ injects the tag, and rolls the pods.
 ## Deploy a pre-built image (overrides)
   'ksync sync --image IMAGE=REF' (or KSYNC_IMAGE_OVERRIDES, also on diff) deploys an
   existing image instead of building it. REF may be a bare tag, name:tag, or @digest. The
-  build and its imageLoad are skipped. watch does not accept overrides.`
+  build and its imageLoad are skipped. watch takes the same flag but keeps watching the
+  image's source: it deploys the supplied ref on the first sync, then the first source edit
+  rebuilds it and later syncs use the freshly built tag (takeover).`
 
 const strategyTopic = `ksync runs three phases. Each defaults to cluster-aware behavior, with an opt-out for
 when that default is wrong for one app or one run.

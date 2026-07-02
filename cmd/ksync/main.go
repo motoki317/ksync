@@ -710,17 +710,10 @@ func withTimeout(ctx context.Context, d time.Duration) (context.Context, context
 	return context.WithTimeout(ctx, d)
 }
 
-func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *bool, debounce, timeout *time.Duration, maxParallel *int, names []string) error {
+func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *bool, debounce, timeout *time.Duration, maxParallel *int, images stringSlice, names []string) error {
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
-	}
-	// watch exists to rebuild the stack from source, so an image override (which
-	// deploys a pre-built image instead of building) contradicts its purpose. The
-	// --image flag is not offered here; reject the env form too, fail-fast, rather
-	// than silently ignore a set value (use `ksync sync` to deploy pre-built images).
-	if strings.TrimSpace(os.Getenv(overrideEnv)) != "" {
-		return fmt.Errorf("%s is set, but watch does not accept image overrides: it rebuilds images from source — use `ksync sync` to deploy a pre-built image", overrideEnv)
 	}
 	apps, err := cfg.Select(names)
 	if err != nil {
@@ -737,6 +730,14 @@ func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *boo
 	defer cancel()
 
 	log, engineLog := setupLogging(*verbose)
+	// Image overrides seed the loop: an overridden build deploys the supplied ref
+	// on first convergence (as `ksync sync` does) instead of building, but its
+	// sources are still watched — the first source edit takes over and rebuilds it
+	// from then on. See ADR 20260702-watch-image-override-takeover.
+	overrides, err := imageOverrides(cfg, images, log)
+	if err != nil {
+		return err
+	}
 	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
 		return err
@@ -802,6 +803,7 @@ func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *boo
 		Render:      renderOpts,
 		WorkDir:     cfg.Dir(),
 		Build:       makeBuildFunc(ctx, cfg, prog, kubeContext),
+		Overrides:   overrides,
 		Log:         log,
 		Report:      reporter.report,
 		// A build/render failure (or a failed sync) ends the run without a Report;

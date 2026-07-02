@@ -97,13 +97,16 @@ type Options struct {
 	// WorkDir is the config file's directory, the value of the ${KSYNC_WORKDIR}
 	// anchor when expanding an app's patch values (see config.Patch).
 	WorkDir string
-	Build   BuildFunc // required when any app declares builds (that aren't all overridden)
-	// Overrides pins externally-supplied image refs instead of building them: a
-	// build entry whose Image is a key here is never built (its source changes are
-	// not watched) and the given ref is injected at deploy in place of a built
-	// tag. Keyed by the build entry's Image. This lets a pre-built image (a CI
-	// artifact, a registry pull resolved by a wrapper) stand in for a local build.
-	// See ADR 20260616-image-override.
+	Build   BuildFunc // required when any app declares builds (takeover may rebuild even an all-overridden app)
+	// Overrides seeds a matching build entry with an externally-supplied image ref
+	// instead of building it on first convergence: the ref is injected at deploy in
+	// place of a built tag, and the entry is not built at startup (the same
+	// first-time behavior as `ksync sync`). Its sources are still watched, though —
+	// the first source change drops the override and the entry rebuilds from then
+	// on ("takeover"), returning the watched image to the inner loop. Keyed by the
+	// build entry's Image. This lets a pre-built image (a CI artifact, a registry
+	// pull resolved by a wrapper) stand in until its source is touched.
+	// See ADR 20260702-watch-image-override-takeover and 20260616-image-override.
 	Overrides map[string]render.Image
 	Log       logr.Logger
 	// Report renders one app's completed sync. The loop calls it on success so
@@ -161,8 +164,9 @@ type buildState struct {
 	dirty bool
 	tag   string
 	// override, when set, is the externally-supplied image ref for this entry
-	// (Options.Overrides). It is never built and its sources are not watched; the
-	// ref is injected at deploy in place of a built tag.
+	// (Options.Overrides): injected at deploy in place of a built tag, and not built
+	// on first convergence. Its sources are still watched — the first source change
+	// clears this field and the entry rebuilds from then on (takeover).
 	override *render.Image
 }
 
@@ -180,19 +184,24 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	byName := make(map[string]config.App, len(apps))
 	scheduleApps := make([]schedule.App, len(apps)) // deploy phase: needs-gated
 	var buildApps []schedule.App                    // build phase: no needs edges
-	buildable := make(map[string]bool, len(apps))   // apps with ≥1 entry to actually build (not overridden)
+	hasBuild := make(map[string]bool, len(apps))    // apps with ≥1 build entry (some may be overridden)
+	buildable := make(map[string]bool, len(apps))   // apps with ≥1 entry to build at startup (not overridden)
 	for i, a := range apps {
 		byName[a.Name] = a
 		scheduleApps[i] = schedule.App{Name: a.Name, Needs: a.Needs}
 		for j := range a.Build {
+			hasBuild[a.Name] = true
 			if _, ov := opts.Overrides[a.Build[j].Image]; !ov {
 				buildable[a.Name] = true
-				break
 			}
 		}
-		// A build func is needed only for entries actually built; an app whose
-		// every build is overridden deploys the supplied refs with no builder.
-		if buildable[a.Name] {
+		// Register every build-declaring app in the build scheduler, even one whose
+		// every entry is currently overridden: a later takeover (a source edit that
+		// drops the override) rebuilds it locally, and MarkDirty on an unregistered
+		// app is a silent no-op — which would gate that app's deploy forever, waiting
+		// on a build that never schedules. For the same reason a build func is
+		// required whenever an app declares builds, overridden or not.
+		if hasBuild[a.Name] {
 			if opts.Build == nil {
 				return fmt.Errorf("app %s declares builds but no build function is configured", a.Name)
 			}
@@ -204,9 +213,8 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	deriveScopes := func(app config.App) {
 		states := builds[app.Name]
 		for j := range states {
-			if states[j].override != nil {
-				continue // overridden entries are never watched or built
-			}
+			// Overridden entries are watched too, so the first source change can drop
+			// the override and take the build over (see Options.Overrides).
 			scope, err := build.WatchScope(app.Build[j])
 			if err != nil {
 				log.Error(err, "Deriving build watch scope; watching without ignore rules", "app", app.Name, "image", app.Build[j].Image)
@@ -248,9 +256,8 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		entries := append([]watch.AppRoots{}, appRoots...)
 		for _, a := range apps {
 			for j, st := range builds[a.Name] {
-				if st.override != nil {
-					continue // not built → not watched
-				}
+				// Overridden entries are watched too — a source change takes the build
+				// over — so they get a mapping entry like any other build.
 				entries = append(entries, watch.AppRoots{
 					App:    buildKey(a.Name, j),
 					Roots:  st.scope.Roots,
@@ -269,9 +276,8 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		}
 		for _, a := range apps {
 			for _, st := range builds[a.Name] {
-				if st.override != nil {
-					continue // not built → not watched
-				}
+				// Overridden entries are watched too, so their source edits reach the
+				// loop and can take the build over (see Options.Overrides).
 				for _, r := range st.scope.Roots {
 					roots = append(roots, watch.Root{Path: r, Skip: st.scope.SkipDir})
 				}
@@ -331,18 +337,26 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 	}
 
 	// resyncAll marks every app for a full rebuild-and-redeploy. It re-dirties each
-	// buildable entry as well as redeploying, because the callers (a programmatic
-	// Resync, a dropped-event recovery) cannot trust the dirty set: a missed edit
-	// may have been a build source, so redeploying alone would ship the stale tag.
-	// The external gate then holds each build-app's deploy until its rebuild lands.
+	// still-buildable entry as well as redeploying, because the callers (a
+	// programmatic Resync, a dropped-event recovery) cannot trust the dirty set: a
+	// missed edit may have been a build source, so redeploying alone would ship the
+	// stale tag. An overridden entry is left untouched — takeover is triggered only
+	// by a real source change, never by a resync — so a resync just redeploys the
+	// override. Whether to dirty the build scheduler is recomputed here from the
+	// current override state rather than the startup snapshot, because takeover
+	// changes an entry's override at runtime: an app that has since taken over an
+	// entry must rebuild it on resync, and one still fully overridden must not
+	// schedule a build (which would gate its deploy on a rebuild that never comes).
 	resyncAll := func(now time.Time) {
 		for _, a := range apps {
+			anyBuild := false
 			for j := range builds[a.Name] {
 				if builds[a.Name][j].override == nil {
 					builds[a.Name][j].dirty = true
+					anyBuild = true
 				}
 			}
-			if buildable[a.Name] {
+			if anyBuild {
 				buildSched.MarkDirty(a.Name, now)
 			}
 			deploySched.MarkDirty(a.Name, now)
@@ -449,6 +463,10 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				delete(pendingBuilds, it.App)
 			}
 		}
+		// Confirming a build entry also takes over any override on it: the user chose
+		// to rebuild this image, so drop the supplied ref and build from source now
+		// (this and later deploys inject the built tag). A nil override is a no-op.
+		builds[it.App][it.Build].override = nil
 		builds[it.App][it.Build].dirty = true
 		buildSched.MarkDirty(it.App, now)
 		deploySched.MarkDirty(it.App, now)
@@ -607,6 +625,9 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				}
 				if isBuild {
 					log.V(1).Info("source change detected", "path", path, "app", name, "image", byName[name].Build[entry].Image)
+					// A source change to an overridden entry takes over: drop the
+					// supplied ref so this and later deploys use the freshly built tag.
+					builds[name][entry].override = nil
 					builds[name][entry].dirty = true
 					buildSched.MarkDirty(name, now)
 				} else {

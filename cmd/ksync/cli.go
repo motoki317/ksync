@@ -76,6 +76,7 @@ func newWatchCmd() *cobra.Command {
 		debounce, timeout                      *time.Duration
 		maxParallel                            *int
 	)
+	images := new(stringSlice)
 	cmd := &cobra.Command{
 		Use:     "watch [app...]",
 		Short:   "watch app directories and sync affected apps on change (the main loop)",
@@ -83,7 +84,7 @@ func newWatchCmd() *cobra.Command {
 		Example: watchExample,
 		GroupID: groupCommands,
 		RunE: func(_ *cobra.Command, names []string) error {
-			return runWatch(path, kctx, prune, auto, verbose, offline, clientD, debounce, timeout, maxParallel, names)
+			return runWatch(path, kctx, prune, auto, verbose, offline, clientD, debounce, timeout, maxParallel, *images, names)
 		},
 	}
 	f := cmd.Flags()
@@ -94,6 +95,7 @@ func newWatchCmd() *cobra.Command {
 	debounce = f.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
 	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
 	maxParallel = maxParallelFlag(f)
+	f.Var(images, "image", "seed a pre-built image instead of building it, until its source changes: IMAGE=REF (repeatable; also via "+overrideEnv+")")
 	auto = f.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
 	offline = offlineRenderFlag(f)
 	clientD = clientDiffFlag(f)

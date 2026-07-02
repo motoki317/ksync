@@ -22,31 +22,28 @@ func executeKsync(t *testing.T, args ...string) error {
 	return root.Execute()
 }
 
-// watch rebuilds from source, so it must refuse image overrides outright rather
-// than silently ignore them: a set KSYNC_IMAGE_OVERRIDES fails the command fast,
-// before it touches the cluster.
-func TestRunWatch_RejectsEnvOverrides(t *testing.T) {
-	cfgPath := writeMinimalConfig(t)
-	t.Setenv(overrideEnv, "ghcr.io/org/api-b=prebuilt-tag")
-
-	err := executeKsync(t, "watch", "-f", cfgPath)
-	if err == nil {
-		t.Fatal("watch accepted a set KSYNC_IMAGE_OVERRIDES; want a fail-fast error")
-	}
-	if !strings.Contains(err.Error(), "does not accept image overrides") {
-		t.Errorf("error %q does not explain that watch rejects overrides", err)
+// watch accepts image overrides with takeover semantics, so it defines the same
+// --image flag `ksync sync` does (an overridden build is seeded, not built, on the
+// first sync; its source is still watched so the first edit takes it over).
+func TestRunWatch_DefinesImageFlag(t *testing.T) {
+	if newWatchCmd().Flags().Lookup("image") == nil {
+		t.Error("watch does not define --image; want it accepted (takeover semantics)")
 	}
 }
 
-// The --image flag is a sync-only affordance; watch must not even define it, so
-// passing it is a flag error (not a silently-accepted override).
-func TestRunWatch_RejectsImageFlag(t *testing.T) {
-	err := executeKsync(t, "watch", "--image", "ghcr.io/org/api-b=prebuilt-tag")
-	if err == nil {
-		t.Fatal("watch accepted --image; want it undefined on watch")
+// A set KSYNC_IMAGE_OVERRIDES is no longer rejected wholesale: watch parses it the
+// way `ksync sync` does. A malformed value surfaces the shared parse error before
+// any cluster work — proof the env is read as overrides, not refused outright.
+func TestRunWatch_AcceptsEnvOverrides(t *testing.T) {
+	cfgPath := writeMinimalConfig(t)
+	t.Setenv(overrideEnv, "not-an-assignment")
+
+	err := executeKsync(t, "watch", "-f", cfgPath)
+	if err == nil || !strings.Contains(err.Error(), "invalid override") {
+		t.Fatalf("watch did not parse KSYNC_IMAGE_OVERRIDES as sync does: err = %v", err)
 	}
-	if !strings.Contains(err.Error(), "image") {
-		t.Errorf("error %q does not name the rejected flag", err)
+	if strings.Contains(err.Error(), "does not accept image overrides") {
+		t.Errorf("watch still rejects overrides wholesale: %v", err)
 	}
 }
 

@@ -319,10 +319,13 @@ func TestRun_ResyncRebuildsBuildApps(t *testing.T) {
 	}
 }
 
-// An overridden build is never built: its supplied ref is injected at deploy and
-// its sources are not watched, so a source edit triggers neither a build nor a
-// redeploy (only a manifest edit redeploys, re-injecting the override).
-func TestRun_OverriddenImageNotBuiltAndRefInjected(t *testing.T) {
+// An overridden build seeds the deploy on first convergence but is still watched:
+// the first source change drops the override and the entry rebuilds from then on
+// (takeover). This app's only build is overridden, so the test also proves a
+// fully-overridden app is registered in the build scheduler at startup — without
+// that registration the takeover's MarkDirty is a silent no-op, the rebuild never
+// schedules, and the deploy gates on it forever.
+func TestRun_OverriddenImageTakesOverOnSourceChange(t *testing.T) {
 	tmp := t.TempDir()
 	app := buildApp(t, tmp)
 	builder := &fakeBuilder{}
@@ -334,27 +337,134 @@ func TestRun_OverriddenImageNotBuiltAndRefInjected(t *testing.T) {
 		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Overrides: overrides})
 	}()
 
-	// Startup deploys with the supplied ref, building nothing.
+	// Startup deploys the supplied ref and builds nothing (same first-time behavior
+	// as `ksync sync`).
 	waitFor(t, func() bool { return len(sink.synced()) == 1 })
 	if got := sink.synced()[0]; got != "api-b:supplied-1" {
-		t.Errorf("synced image = %q, want the supplied override", got)
+		t.Errorf("startup synced image = %q, want the supplied override", got)
 	}
 	if got := builder.builds(); got != 0 {
-		t.Errorf("builds = %d, want 0 (overridden image must not be built)", got)
+		t.Errorf("startup builds = %d, want 0 (an overridden image is not built)", got)
 	}
 
-	// A source edit to the overridden image is not watched; only a manifest edit
-	// redeploys. Pair them so the observed second sync proves the source edit ran
-	// no build.
-	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	// A manifest-only edit redeploys but does not take over: the override still
+	// stands, so the supplied ref is re-injected and still nothing builds.
 	writeFile(t, filepath.Join(tmp, "app1", "deployment.yaml"),
 		strings.Replace(deploymentYAML, "name: api", "name: api-renamed", 1))
 	waitFor(t, func() bool { return len(sink.synced()) == 2 })
-	if got := builder.builds(); got != 0 {
-		t.Errorf("builds = %d, want 0 (a source change to an overridden image must not build)", got)
-	}
 	if got := sink.synced()[1]; got != "api-b:supplied-1" {
-		t.Errorf("redeploy image = %q, want the supplied override re-injected", got)
+		t.Errorf("after manifest edit synced image = %q, want the override re-injected", got)
+	}
+	if got := builder.builds(); got != 0 {
+		t.Errorf("after manifest edit builds = %d, want 0 (only a source change takes over)", got)
+	}
+
+	// A source edit takes over: the entry rebuilds and the deploy injects the built
+	// tag from now on. The build only schedules because the fully-overridden app
+	// was registered in the build scheduler despite having nothing to build at start.
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	waitFor(t, func() bool { return builder.builds() == 1 && len(sink.synced()) == 3 })
+	if got := sink.synced()[2]; got != "api-b:ksync-000000000001" {
+		t.Errorf("after source edit synced image = %q, want the freshly built tag", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// With the manual gate, an overridden build's source change is held for the user's
+// decision — the override stands while it waits — and confirming it takes over: the
+// override drops and the entry rebuilds, so the deploy switches from the supplied
+// ref to the freshly built tag ("prompts first, then takes over").
+func TestRun_GateReleaseTakesOverOverride(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	app.Build[0].Name = "api-b" // config.Parse defaults this; set it directly here
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	overrides := map[string]render.Image{"api-b": {Name: "api-b", NewTag: "supplied-1"}}
+	g := newFakeGate()
+	defer g.close()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Overrides: overrides, Gate: g.gate()})
+	}()
+
+	// Startup converges automatically (the gate holds only incremental change),
+	// deploying the supplied ref.
+	waitFor(t, func() bool { return len(sink.synced()) == 1 })
+	if got := sink.synced()[0]; got != "api-b:supplied-1" {
+		t.Errorf("startup synced image = %q, want the supplied override", got)
+	}
+
+	// A source edit is held for confirmation; the override still stands, so nothing
+	// is built or redeployed yet.
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	items := g.lastAsk()
+	if len(items) != 1 || items[0].App != "app1" || items[0].Build != 0 || items[0].Label != "api-b" {
+		t.Fatalf("ask items = %+v, want one build item (app1, entry 0, api-b)", items)
+	}
+	if got := builder.builds(); got != 0 {
+		t.Fatalf("build ran before confirmation: builds=%d, want 0 (held)", got)
+	}
+
+	// Confirming takes over: the override drops, the entry rebuilds, and the deploy
+	// injects the built tag instead of the supplied ref.
+	g.decided <- Decision{Selected: items}
+	waitFor(t, func() bool { return builder.builds() == 1 && len(sink.synced()) == 2 })
+	if got := sink.synced()[1]; got != "api-b:ksync-000000000001" {
+		t.Errorf("after takeover synced image = %q, want the freshly built tag", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// After a fully-overridden app takes over its entry, a full resync must rebuild
+// that entry (a fresh tag, not the stale one) and must not deadlock. This guards
+// resyncAll's decision to recompute buildability from the current override state:
+// the startup `buildable` snapshot is false for a fully-overridden app, so reusing
+// it here would skip the build scheduler and gate the redeploy forever.
+func TestRun_ResyncAfterTakeoverRebuilds(t *testing.T) {
+	tmp := t.TempDir()
+	app := buildApp(t, tmp)
+	builder := &fakeBuilder{}
+	sink := &objectSink{}
+	overrides := map[string]render.Image{"api-b": {Name: "api-b", NewTag: "supplied-1"}}
+	resync := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []config.App{app}, sink.sync, Options{Debounce: 20 * time.Millisecond, Build: builder.build, Overrides: overrides, Resync: resync})
+	}()
+
+	// Startup deploys the supplied ref and builds nothing.
+	waitFor(t, func() bool { return len(sink.synced()) == 1 })
+	if got := sink.synced()[0]; got != "api-b:supplied-1" {
+		t.Fatalf("startup synced image = %q, want the supplied override", got)
+	}
+
+	// A source edit takes the (only, overridden) entry over: it rebuilds and the
+	// deploy switches to the built tag.
+	writeFile(t, filepath.Join(tmp, "src", "main.go"), "package main // edited\n")
+	waitFor(t, func() bool { return builder.builds() == 1 && len(sink.synced()) == 2 })
+	if got := sink.synced()[1]; got != "api-b:ksync-000000000001" {
+		t.Fatalf("after takeover synced image = %q, want the first built tag", got)
+	}
+
+	// A resync must now rebuild the taken-over entry (a fresh tag), not redeploy the
+	// stale one — and must not hang. Reaching a second build proves resyncAll marked
+	// the build scheduler for this once-fully-overridden, now-registered app.
+	resync <- struct{}{}
+	waitFor(t, func() bool { return builder.builds() == 2 && len(sink.synced()) == 3 })
+	if got := sink.synced()[2]; got != "api-b:ksync-000000000002" {
+		t.Errorf("after resync synced image = %q, want the freshly rebuilt tag", got)
 	}
 
 	cancel()

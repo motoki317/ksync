@@ -1,8 +1,16 @@
 ---
 date: "2026-06-23"
 author: "motoki317"
-status: "accepted"
+status: "superseded"
 ---
+
+> Superseded 2026-07-02 by [20260702-watch-image-override-takeover](20260702-watch-image-override-takeover.md):
+> `watch` now **accepts** image overrides with takeover semantics — it seeds an overridden entry from
+> the supplied ref on first convergence (like `sync`) but keeps watching its source, and the first
+> source edit drops the override and rebuilds. The `--image` flag is defined on `watch` again and a
+> set `KSYNC_IMAGE_OVERRIDES` is parsed, not rejected. The contradiction the analysis below names is
+> in the *pin-for-the-whole-session* reading only, which remains `ksync sync`'s job; takeover resolves
+> it rather than forbidding overrides on `watch`.
 
 # Context
 
