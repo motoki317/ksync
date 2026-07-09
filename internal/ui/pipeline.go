@@ -95,6 +95,37 @@ func (s *Stage) SetTail(line string) {
 	}
 }
 
+// SetTailQuiet updates the transient tail like SetTail but never streams it off a
+// terminal — for a value that changes every tick (a retry countdown) whose every
+// step is not worth a committed line. On a terminal the next repaint shows it;
+// off a terminal there is no live row, so it is a no-op (the committed Event
+// lines carry the retry story there).
+func (s *Stage) SetTailQuiet(line string) {
+	s.mu.Lock()
+	s.tail = line
+	s.mu.Unlock()
+}
+
+// Event commits a persistent notice for the stage — a failure/retry or recovery
+// the developer must see in scrollback and CI logs alike, unlike the transient
+// tail. On a terminal it writes "<symbol> <app>  <text>" above the live block;
+// off a terminal it writes the stage's stream prefix then the text, so the
+// notice sits in the same attributable, greppable stream as the build/deploy
+// output. The caller dedupes by the underlying failure, so a slow failure yields
+// a few lines, not one per attempt.
+func (s *Stage) Event(symbol, text string) {
+	var line string
+	if s.pipe.tty {
+		line = symbol + " " + s.pipe.c.Bold(s.pipe.app) + "  " + text + "\n"
+	} else {
+		s.mu.Lock()
+		start := s.start
+		s.mu.Unlock()
+		line = s.streamPrefix(s.pipe.now().Sub(start)) + text + "\n"
+	}
+	liveTerm.line(SectionPipeline, s.pipe.w, line)
+}
+
 // getState reads the stage's lifecycle state under its lock — used by the
 // pipeline's collapse decision, which must tell a started deploy from a pending one.
 func (s *Stage) getState() stageState {

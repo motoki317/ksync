@@ -364,6 +364,7 @@ func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *boo
 		// time on the committed row is the deploy stage's own (read from the
 		// pipeline), so per-app build and apply times both survive the run.
 		summary, symbol := applyParts(out, stats)
+		summary = withRetryCount(summary, prog.retriesFor(app.Name))
 		prog.finish(app.Name, &ui.CommitInfo{Summary: summary, Symbol: symbol, Above: failureLines(out, results, degraded), NameW: nameW})
 		return nil
 	})
@@ -496,7 +497,7 @@ func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog
 	deploy.Start()
 	syncCtx, cancel := withTimeout(ctx, timeout)
 	defer cancel()
-	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Force: force, Namespace: app.Namespace, ServerSide: serverSide, OnWait: deployWait(deploy)})
+	results, err := eng.Sync(syncCtx, app.Name, res.Objects, engine.SyncOptions{Prune: prune, Force: force, Namespace: app.Namespace, ServerSide: serverSide, OnWait: deployWait(deploy), OnRetry: deployRetry(deploy, prog.colors, app.Name, prog)})
 	deploy.Done(err)
 	if err != nil {
 		// Dump what wedged the sync — on a timeout, and on a real user Ctrl-C too (the
@@ -597,6 +598,67 @@ func waitingTail(pending []engine.ResourceStatus) string {
 		tail += fmt.Sprintf(", +%d", len(pending)-show)
 	}
 	return tail
+}
+
+// deployRetry reports the sync's convergence retries on the app's deploy row and
+// in scrollback: a failing apply is retried until it succeeds or --timeout, and
+// a first-time user watching either output must know what failed, what ksync is
+// doing about it, and when. Each attempt updates the live row (the transient
+// countdown), and each *distinct* failure — plus the eventual recovery — commits
+// one persistent line, so a slow failure yields a few lines, not one per attempt.
+// The retry total is recorded so the committed deploy line can show "(N retries)".
+func deployRetry(deploy *ui.Stage, c ui.Colors, app string, prog *progress) func(engine.RetryEvent) {
+	var lastReason string
+	return func(ev engine.RetryEvent) {
+		prog.recordRetries(app, ev.Retries)
+		if ev.Recovered {
+			deploy.SetTailQuiet("") // drop the countdown; a following health wait sets its own tail
+			deploy.Event(c.Green("✓"), retryLine(ev))
+			lastReason = ""
+			return
+		}
+		deploy.SetTailQuiet(retryTail(ev))
+		if ev.Reason != lastReason {
+			lastReason = ev.Reason
+			deploy.Event(c.Yellow("⚠"), retryLine(ev))
+		}
+	}
+}
+
+// retryLine is the committed failure/recovery text for a convergence retry, in
+// first-time-user language — it names what ksync is doing, not the internals.
+func retryLine(ev engine.RetryEvent) string {
+	if ev.Recovered {
+		return fmt.Sprintf("apply recovered after %d %s", ev.Retries, retryNoun(ev.Retries))
+	}
+	return fmt.Sprintf("apply failed (attempt %d, retrying in %s): %s", ev.Attempt, ev.NextDelay, ev.Reason)
+}
+
+// retryTail is the transient live-row countdown shown on a terminal while a retry
+// backs off.
+func retryTail(ev engine.RetryEvent) string {
+	return fmt.Sprintf("retrying after apply failure (attempt %d, next in %s)", ev.Attempt, ev.NextDelay)
+}
+
+// withRetryCount appends "(N retries)" to a deploy summary when the sync retried,
+// so the committed line and the Timings recap show it took work to converge.
+func withRetryCount(summary string, retries int) string {
+	if retries <= 0 {
+		return summary
+	}
+	suffix := fmt.Sprintf("(%d %s)", retries, retryNoun(retries))
+	if summary == "" {
+		return suffix
+	}
+	return summary + "  " + suffix
+}
+
+// retryNoun is "retry" for one, "retries" otherwise.
+func retryNoun(n int) string {
+	if n == 1 {
+		return "retry"
+	}
+	return "retries"
 }
 
 // excludedNeedsNote warns when a targeted sync (explicit app names) omits apps
@@ -765,7 +827,7 @@ func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *boo
 		defer cancel()
 		deploy := prog.pipeline(app).Deploy()
 		deploy.Start()
-		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], ServerSide: !*clientDiff, OnWait: deployWait(deploy)})
+		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], ServerSide: !*clientDiff, OnWait: deployWait(deploy), OnRetry: deployRetry(deploy, out, app, prog)})
 		deploy.Done(err)
 		stats := syncStats(results)
 		if err == nil {
@@ -960,6 +1022,7 @@ func startWatchReporter(w io.Writer, out ui.Colors, log logr.Logger, prog *progr
 // stage's own, read from the pipeline, so took is not needed here.
 func (r *watchReporter) report(app string, stats loop.SyncStats, _ time.Duration) {
 	summary, symbol := applyParts(r.out, stats)
+	summary = withRetryCount(summary, r.prog.retriesFor(app))
 	info := &ui.CommitInfo{Summary: summary, Symbol: symbol, NameW: r.nameW}
 	r.mu.Lock()
 	r.synced++
@@ -1025,7 +1088,8 @@ type progress struct {
 
 	mu      sync.Mutex
 	pipes   map[string]*ui.Pipeline
-	timings []timingEntry // off-terminal: finished apps' recap lines, drained per batch
+	timings []timingEntry  // off-terminal: finished apps' recap lines, drained per batch
+	retries map[string]int // app -> times its last sync retried, for the committed "(N retries)" suffix
 }
 
 // timingEntry is one app's contribution to the slowest-first timing recap: its
@@ -1054,6 +1118,28 @@ func (p *progress) takeTimings() []timingEntry {
 	p.mu.Unlock()
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].total > entries[j].total })
 	return entries
+}
+
+// recordRetries stores how many times app's current sync retried, read back by
+// retriesFor when the deploy line is committed. Set every retry event so the
+// final value is the sync's total.
+func (p *progress) recordRetries(app string, n int) {
+	p.mu.Lock()
+	if p.retries == nil {
+		p.retries = make(map[string]int)
+	}
+	p.retries[app] = n
+	p.mu.Unlock()
+}
+
+// retriesFor returns and clears app's recorded retry count, so the next run
+// starts from zero.
+func (p *progress) retriesFor(app string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := p.retries[app]
+	delete(p.retries, app)
+	return n
 }
 
 // pipeline returns the app's live pipeline, creating it (with a pending Deploy

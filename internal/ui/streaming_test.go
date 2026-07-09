@@ -17,6 +17,67 @@ func resetLiveTerm() {
 	liveTerm.mu.Unlock()
 }
 
+// Off a terminal a convergence retry Event streams as a committed line with the
+// deploy stream prefix, so a CI log shows what failed and that ksync is retrying
+// — the story a first-time reader needs when a sync is not converging.
+func TestStage_OffTerminalEventStreamsWithPrefix(t *testing.T) {
+	t.Cleanup(resetLiveTerm)
+	resetLiveTerm()
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "shop", false, clk)
+	d := p.Deploy()
+	d.Start()
+	clk.add(2 * time.Second)
+	d.Event("⚠", "apply failed (attempt 1, retrying in 1s): Route/team-a/main: no matches for kind")
+
+	out := buf.String()
+	if !strings.Contains(out, "shop deploy [2.0s] "+p.c.Dim("│")+" apply failed (attempt 1, retrying in 1s): Route/team-a/main: no matches for kind") {
+		t.Errorf("off-terminal Event should stream with the deploy prefix, got:\n%s", out)
+	}
+}
+
+// On a terminal the same Event commits a "<symbol> <app>  <text>" line above the
+// live block, so the failure and recovery survive in scrollback.
+func TestStage_TerminalEventCommitsSymbolAppText(t *testing.T) {
+	t.Cleanup(resetLiveTerm)
+	resetLiveTerm()
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "shop", false, clk)
+	p.tty = true // force the terminal branch; with no block active, the commit just writes the line
+	d := p.Deploy()
+	d.Start()
+	d.Event("⚠", "apply failed (attempt 1, retrying in 1s): reason")
+
+	if out := buf.String(); !strings.Contains(out, "⚠ shop  apply failed (attempt 1, retrying in 1s): reason") {
+		t.Errorf("terminal Event should commit '<symbol> <app>  <text>', got:\n%s", out)
+	}
+}
+
+// SetTailQuiet updates only the transient row: unlike SetTail it must not stream
+// off a terminal, or the per-attempt retry countdown would emit a line every tick
+// and drown the CI log.
+func TestStage_SetTailQuietDoesNotStreamOffTerminal(t *testing.T) {
+	t.Cleanup(resetLiveTerm)
+	resetLiveTerm()
+	clk := &clock{t: time.Unix(0, 0)}
+	var buf bytes.Buffer
+	p := newPipe(&buf, "shop", false, clk)
+	d := p.Deploy()
+	d.Start()
+
+	d.SetTailQuiet("retrying after apply failure (attempt 2, next in 2s)")
+	if strings.Contains(buf.String(), "retrying after apply failure") {
+		t.Errorf("SetTailQuiet must not stream off a terminal, got:\n%s", buf.String())
+	}
+	// Contrast: SetTail does stream a changed tail off a terminal.
+	d.SetTail("waiting for health  1 not ready")
+	if !strings.Contains(buf.String(), "waiting for health  1 not ready") {
+		t.Errorf("SetTail should still stream off a terminal, got:\n%s", buf.String())
+	}
+}
+
 // Off a terminal a build stage streams each complete line of its output live,
 // prefixed with the app, label, and phase word, then a result line on Done — the
 // buildx model, so a long build's progress shows in a pipe or CI log without any
