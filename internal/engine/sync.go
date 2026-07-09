@@ -53,6 +53,12 @@ type SyncOptions struct {
 	// for health" progress line. It is never called with an empty set, so an
 	// already-healthy sync returns without ever invoking it.
 	OnWait func(pending []ResourceStatus)
+	// OnRetry, when set, is called once per failed convergence attempt (Recovered
+	// false) and once when the sync first applies cleanly after >=1 failure
+	// (Recovered true). It drives the failure/retry/recovery lines the command
+	// layer shows in realtime; it is never called for a sync that never fails, so
+	// the clean path carries no overhead. UI-neutral, like OnWait.
+	OnRetry func(ev RetryEvent)
 	// ServerSide decides the apply set from a dry-run server-side apply on the
 	// first reconcile (so a field the cluster defaults or prunes is not seen as
 	// drift and re-applied every sync), matching what `ksync diff` previews. The
@@ -111,13 +117,30 @@ func (r ResourceStatus) Line() string {
 type TimeoutError struct {
 	App     string
 	Pending []ResourceStatus
+	// Retries is how many times the sync re-attempted before the deadline, and
+	// LastFailure is the most recent apply failure (empty when the sync never
+	// failed, only never became healthy). Together they let a timeout after
+	// repeated apply failures name the cause, not just the symptom.
+	Retries     int
+	LastFailure string
 }
 
 func (e *TimeoutError) Error() string {
-	if len(e.Pending) == 0 {
-		return fmt.Sprintf("sync of %q timed out before converging", e.App)
+	var b strings.Builder
+	fmt.Fprintf(&b, "sync of %q timed out", e.App)
+	if e.Retries > 0 {
+		fmt.Fprintf(&b, " after %d %s", e.Retries, retryNoun(e.Retries))
 	}
-	return fmt.Sprintf("sync of %q timed out; still not healthy:\n  %s", e.App, strings.Join(statusLines(e.Pending), "\n  "))
+	if e.LastFailure != "" {
+		fmt.Fprintf(&b, "; last failure: %s", e.LastFailure)
+	}
+	switch {
+	case len(e.Pending) > 0:
+		fmt.Fprintf(&b, "; still not healthy:\n  %s", strings.Join(statusLines(e.Pending), "\n  "))
+	case e.Retries == 0 && e.LastFailure == "":
+		b.WriteString(" before converging")
+	}
+	return b.String()
 }
 
 // EmptyRenderError reports a prune refused because the app rendered to zero
@@ -239,6 +262,17 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		defer cleanup()
 		ssd = d
 	}
+	// Converge until the app is applied-and-healthy or --timeout expires. A
+	// failed attempt (a CR whose CRD is still registering, an admission webhook
+	// not yet serving, an SSA conflict, a failed hook) is retried rather than
+	// returned: the failed results are stripped so the next NewSyncContext
+	// re-attempts exactly those tasks, and a backoff paces the attempts. On a
+	// warm cluster nothing fails, so this runs byte-identically to before — the
+	// retry state is only touched in an already-failing branch.
+	conv := newConvergence(retryBase, retryCap)
+	recovered := false // guards the single OnRetry recovery event
+	missingPolls, missingBudget := 0, missingReapplyPolls
+converge:
 	for {
 		live, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 		if err != nil {
@@ -289,103 +323,121 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		phase, message, results = syncCtx.GetState()
 		cleanup()
 
-		if phase.Completed() {
-			// gitops-engine reports task-level apply failures via the result
-			// phase, not the operation error, so surface them explicitly — else
-			// a failed apply looks like success and the watch loop never retries.
-			if phase == common.OperationError || phase == common.OperationFailed {
-				return results, syncFailedError(app, phase, message, results)
+		if !phase.Completed() {
+			// The operation is still applying a health-gated wave or awaiting a
+			// hook/non-hook Job (a migration) it created — often the longest
+			// stretch of a sync, and silent off a terminal without this. Stream the
+			// same wait line the final gate does; SetTail de-dupes, so an unchanged
+			// pending set prints nothing. Skip an empty set: hooks are excluded from
+			// pendingHealth, so a lone PostSync Job yields none and a "0 not ready"
+			// line would mislead. Re-reconcile next cycle so a hook created this
+			// cycle has its live health read.
+			if opts.OnWait != nil {
+				if p := e.pendingHealth(target, isManaged); len(p) > 0 {
+					opts.OnWait(p)
+				}
 			}
-			if err := failedResultsError(results); err != nil {
+			if err := interruptibleWait(ctx, operationRefresh, func() error {
+				// A health-gated wave or a hook waiting on a stuck workload
+				// (ErrImagePull, CrashLoop) holds the operation here; name what it
+				// is stuck on, and carry the retry count into the timeout.
+				return notConverged(ctx, e.timeoutError(app, target, isManaged, conv.retries, conv.lastReason))
+			}); err != nil {
 				return results, err
 			}
-			break
+			continue converge
 		}
 
-		// The operation loop awaits health-gated waves and non-hook Jobs (a
-		// migration) — often the longest stretch of a sync, and silent off a
-		// terminal without this. Stream the same wait line the final gate does;
-		// SetTail de-dupes, so an unchanged pending set prints nothing. Skip an
-		// empty set: hooks are excluded from pendingHealth, so a lone PostSync Job
-		// yields none and a "0 not ready" line would mislead.
-		if opts.OnWait != nil {
-			if p := e.pendingHealth(target, isManaged); len(p) > 0 {
-				opts.OnWait(p)
+		if operationFailed(phase, results) {
+			// gitops-engine reports task-level apply failures via the result phase,
+			// not the operation error. Retry rather than give up: strip the failed
+			// results so the next attempt re-runs exactly those tasks (the fresh
+			// per-iteration REST mapper re-resolves a just-registered CRD's kind),
+			// back off, and try again until the app converges or --timeout expires.
+			reason := failureReason(message, results)
+			delay := conv.fail(failedResultKeys(results), reason)
+			if opts.OnRetry != nil {
+				opts.OnRetry(RetryEvent{Attempt: conv.retries, NextDelay: delay, Reason: reason, Retries: conv.retries})
+			}
+			results = stripFailedResults(results)
+			phase, message = common.OperationRunning, ""
+			if err := interruptibleWait(ctx, delay, func() error {
+				return notConverged(ctx, e.timeoutError(app, target, isManaged, conv.retries, conv.lastReason))
+			}); err != nil {
+				return results, err
+			}
+			continue converge
+		}
+
+		// The apply succeeded. If it took retries to get here, announce the
+		// recovery once before gating on health.
+		if !recovered && conv.retries > 0 {
+			recovered = true
+			if opts.OnRetry != nil {
+				opts.OnRetry(RetryEvent{Recovered: true, Attempt: conv.retries, Retries: conv.retries})
 			}
 		}
 
-		select {
-		case <-ctx.Done():
-			// A health-gated wave or a hook waiting on a stuck workload
-			// (ErrImagePull, CrashLoop) holds the operation here until the
-			// deadline; name the resource the sync is stuck on.
-			return results, notConverged(ctx, e.timeoutError(app, target, isManaged))
-		case <-time.After(operationRefresh):
+		// gitops-engine marks the operation Succeeded the moment the FINAL wave is
+		// applied — for an app with no sync waves or hooks it explicitly does not
+		// wait for those resources to become Healthy ("a sync equates to simply an
+		// asynchronous kubectl apply", sync_context.go). Gate the rest here so a
+		// completed Sync means applied AND healthy — what makes a `needs` edge
+		// meaningful and lets a still-converging app show as in progress instead of
+		// a premature success.
+		for {
+			pending := e.pendingHealth(target, isManaged)
+			if len(pending) == 0 {
+				return results, nil
+			}
+			if opts.OnWait != nil {
+				opts.OnWait(pending)
+			}
+			// A target still Missing after the apply reported success may have
+			// silently never been created (a CR applied against a stale REST mapping
+			// before its CRD registered). Re-apply it — a fresh apply re-resolves the
+			// mapping — but only once it has stayed Missing across a few polls, so a
+			// resource merely not yet observed by the cache on the clean path is not
+			// re-applied; and back the poll budget off so a genuinely wedged resource
+			// does not re-apply on a hot loop. Its result reads Succeeded, so strip
+			// it by key to force the re-attempt.
+			if hasMissing(pending) {
+				missingPolls++
+				if missingPolls >= missingBudget {
+					missingPolls = 0
+					if missingBudget < missingReapplyMax {
+						missingBudget *= 2
+					}
+					results = stripResultKeys(results, missingKeys(pending))
+					phase, message = common.OperationRunning, ""
+					continue converge
+				}
+			} else {
+				missingPolls, missingBudget = 0, missingReapplyPolls
+			}
+			if err := interruptibleWait(ctx, operationRefresh, func() error {
+				return notConverged(ctx, notHealthyError(app, pending, conv.retries, conv.lastReason))
+			}); err != nil {
+				return results, err
+			}
 		}
 	}
-
-	// The apply succeeded, but gitops-engine marks the operation Succeeded the
-	// moment the FINAL wave is applied — for an app with no sync waves or hooks
-	// it explicitly does not wait for those resources to become Healthy ("a sync
-	// equates to simply an asynchronous kubectl apply", sync_context.go). Hooks
-	// and health-gated waves were already awaited in the loop above; gate the
-	// rest here so a completed Sync means applied AND healthy. That is what makes
-	// a `needs` edge meaningful — a dependent must not start until what it needs
-	// is actually serving — and what lets a still-converging app show as in
-	// progress instead of a premature success.
-	for {
-		pending := e.pendingHealth(target, isManaged)
-		if len(pending) == 0 {
-			return results, nil
-		}
-		if opts.OnWait != nil {
-			opts.OnWait(pending)
-		}
-		select {
-		case <-ctx.Done():
-			return results, notConverged(ctx, notHealthyError(app, pending))
-		case <-time.After(operationRefresh):
-		}
-	}
-}
-
-// syncFailedError explains an operation that ended in Failed/Error, preferring
-// the per-resource failures (the actionable detail) over the bare phase message.
-func syncFailedError(app string, phase common.OperationPhase, message string, results []common.ResourceSyncResult) error {
-	if err := failedResultsError(results); err != nil {
-		return err
-	}
-	return fmt.Errorf("sync of %q %s: %s", app, phase, message)
-}
-
-// failedResultsError condenses task-level failures into one error, or nil if
-// every task succeeded.
-func failedResultsError(results []common.ResourceSyncResult) error {
-	var failed []string
-	for _, res := range results {
-		if res.Status == common.ResultCodeSyncFailed {
-			failed = append(failed, fmt.Sprintf("%s: %s", res.ResourceKey.String(), res.Message))
-		}
-	}
-	if len(failed) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%d resource(s) failed to sync:\n%s", len(failed), strings.Join(failed, "\n"))
 }
 
 // timeoutError explains a sync that did not converge before the deadline by
 // naming the app's managed resources that are not yet Healthy — the ones the
 // sync was waiting on. Health is read from the warm cache (full manifests are
 // cached for managed resources), so this costs no extra API calls.
-func (e *Engine) timeoutError(app string, target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool) error {
-	return notHealthyError(app, e.unhealthyManaged(target, isManaged))
+func (e *Engine) timeoutError(app string, target []*unstructured.Unstructured, isManaged func(*cache.Resource) bool, retries int, lastFailure string) error {
+	return notHealthyError(app, e.unhealthyManaged(target, isManaged), retries, lastFailure)
 }
 
 // notHealthyError frames a deadline-exceeded sync as a *TimeoutError carrying
-// the resources still not healthy, so the command layer can both print the
-// message and, via errors.As, gather a diagnostic dump for them.
-func notHealthyError(app string, pending []ResourceStatus) error {
-	return &TimeoutError{App: app, Pending: pending}
+// the resources still not healthy plus how many times it retried and the last
+// apply failure, so the command layer can both print the message and, via
+// errors.As, gather a diagnostic dump for them.
+func notHealthyError(app string, pending []ResourceStatus, retries int, lastFailure string) error {
+	return &TimeoutError{App: app, Pending: pending, Retries: retries, LastFailure: lastFailure}
 }
 
 // notConverged maps a ctx-cancelled wait to its error. Only the app's own
