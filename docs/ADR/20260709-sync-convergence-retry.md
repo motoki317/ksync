@@ -74,9 +74,11 @@ terminal and off it.
   namespace, so an empty-namespaced target never matches the live object and reads `Missing`
   forever. Without always-retry this was invisible: the sync failed fast and never reached a
   persistent health gate. Convergence exposed it — a sync that *had* applied-and-healthy resources
-  timed out. The fix re-fills each cycle: once the CRD is served, `IsNamespaced` returns true, the
-  target key gains the real namespace, and the gate matches the live object. Idempotent (fills only
-  an empty namespace), so the clean path is a no-op after the first fill.
+  timed out. The fix keeps the pre-loop fill (so `revision()` and every once-before-the-loop
+  consumer still hash the filled target) and *adds* a re-fill at the top of each cycle: once the CRD
+  is served, `IsNamespaced` returns true, the target key gains the real namespace, and the gate
+  matches the live object. Idempotent (fills only an empty namespace), so the clean path is a no-op
+  after the pre-loop fill.
 - **Name the cause in the timeout (D8).** `TimeoutError` gains the retry count and the last apply
   failure, so a timeout after repeated failures reports *why* it never converged, not just which
   resource is still not healthy.

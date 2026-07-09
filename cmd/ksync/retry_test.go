@@ -50,6 +50,24 @@ func TestWithRetryCount(t *testing.T) {
 	}
 }
 
+// A clean re-sync must not inherit a stale "(N retries)" suffix from an earlier
+// failed sync of the same app. In watch mode the same progress outlives many
+// syncs, and OnRetry only fires on failure, so the syncFn resets the count to 0
+// before each sync (main.go). This pins that recordRetries(app, 0) *overwrites*
+// (a clean sync shows 0), rather than accumulating or treating 0 as a no-op —
+// the reset would silently regress if the counter were ever made additive.
+func TestRecordRetries_ResetClearsStaleCount(t *testing.T) {
+	prog, _ := offProgress([]config.App{{Name: "shop"}})
+	prog.recordRetries("shop", 3) // an earlier failed sync left a count
+	if got := prog.retriesFor("shop"); got != 3 {
+		t.Fatalf("precondition: retriesFor = %d, want 3", got)
+	}
+	prog.recordRetries("shop", 0) // the reset the next sync performs before it starts
+	if got := prog.retriesFor("shop"); got != 0 {
+		t.Errorf("after reset, retriesFor = %d, want 0 — a clean re-sync would otherwise show a stale (N retries)", got)
+	}
+}
+
 // The retry handler commits one persistent line per *distinct* failure (deduped
 // by reason, so a slow failure does not spam the log), one recovery line, and
 // records the retry total for the committed "(N retries)" suffix.
