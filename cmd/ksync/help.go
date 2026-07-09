@@ -290,6 +290,16 @@ when that default is wrong for one app or one run.
   - An app that renders nothing while it still owns live resources will not prune them.
     ksync stops and points you at 'ksync destroy <app>'.
 
+## Retries
+  Apply keeps trying until the app is applied and healthy, or --timeout runs out (default
+  5m). A transient failure heals on a later attempt instead of failing the whole run: a CRD
+  still registering on a fresh cluster, an admission webhook not yet serving, a hook that
+  failed once. Each failure and the eventual recovery is printed as it happens — "apply
+  failed (attempt 1, retrying in 1s): <resource>: <error>", then "apply recovered after 1
+  retry" — on a terminal and in a CI log alike, so you always see what failed and what ksync
+  is doing about it. A genuinely broken manifest fails at --timeout, with the last error
+  named; Ctrl-C stops it sooner and prints diagnostics.
+
 ─── Advanced ──────────────────────────────────────────────
 
 ## clientRender: true (per app)
@@ -341,6 +351,14 @@ const troubleshootingTopic = `Most errors name their own fix. The common ones:
   A live render asks the cluster to map every kind. A missing CRD, or an apiVersion the
   cluster does not serve, makes it fail. Install the CRD, set clientRender: true on the app
   if it bundles its own CRDs, or use --offline-render (ksync help strategy).
+
+## sync timed out after N retries; last failure: ...
+  Apply retried until --timeout and never converged. The message names the last apply error
+  and the resources still not healthy — start there. Common causes: a CRD that never got
+  installed, an admission webhook that never came up, or a workload wedged (ErrImagePull,
+  CrashLoopBackOff). ksync prints a diagnostic dump (events, pod logs) for what wedged it;
+  Ctrl-C during the wait prints the same dump early. If the app is simply slow to become
+  healthy, raise --timeout.
 
 ## Pods of a built image show ErrImagePull
   The kubelet tried to pull the local ksync-... tag. Either the image has no build entry,
