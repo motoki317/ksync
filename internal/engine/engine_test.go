@@ -105,14 +105,15 @@ func TestFillDefaultNamespace(t *testing.T) {
 	}
 }
 
-// A CR whose CRD registers mid-convergence (a Route racing its own CRD) reads
-// as cluster-scoped at Sync start, so the pre-loop namespace fill skips it and
-// its target key keeps an empty namespace — while the live object lands under
-// the app's real namespace. The converge loop re-fills each cycle, so once the
-// CRD is served the target key matches the live object and the health gate stops
-// reporting a converged resource as Missing. This is the regression the
-// convergence retry exposed: without the re-fill the sync times out though the
-// resource exists and is healthy.
+// Regression for the CRD-race health-gate bug. It verifies the fill+match
+// MECHANISM the convergence loop depends on — not the per-cycle placement of the
+// fill call, which lives in Sync's loop and is covered by the live e2e. A
+// namespaced CR whose CRD is not yet served reads as cluster-scoped, so
+// fillDefaultNamespace skips it and its target key keeps an empty namespace while
+// the live object is under the app namespace — so pending() reports the (present)
+// resource Missing. Once the CRD is served a re-fill sets the namespace, the key
+// matches the live object, and pending() clears. The bug was that the fill ran
+// only once, before the CRD registered; the loop now re-fills each cycle.
 func TestFillDefaultNamespace_RefillMatchesLiveOnceCRDRegisters(t *testing.T) {
 	route := func() *unstructured.Unstructured {
 		return &unstructured.Unstructured{Object: map[string]any{

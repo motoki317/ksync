@@ -56,15 +56,15 @@ type RetryEvent struct {
 // shrinks), so a sync that is slowly converging is not penalized like one that
 // is wedged.
 type convergence struct {
-	base, cap  time.Duration
-	streak     int                 // consecutive failed attempts since the last progress; drives the backoff exponent
-	retries    int                 // total failed attempts, for the user-facing count and TimeoutError
-	prev       map[string]struct{} // the previous attempt's failing-resource keys, for progress detection
-	lastReason string              // the most recent failure summary, for TimeoutError
+	base, ceiling time.Duration
+	streak        int                 // consecutive failed attempts since the last progress; drives the backoff exponent
+	retries       int                 // total failed attempts, for the user-facing count and TimeoutError
+	prev          map[string]struct{} // the previous attempt's failing-resource keys, for progress detection
+	lastReason    string              // the most recent failure summary, for TimeoutError
 }
 
-func newConvergence(base, cap time.Duration) *convergence {
-	return &convergence{base: base, cap: cap}
+func newConvergence(base, ceiling time.Duration) *convergence {
+	return &convergence{base: base, ceiling: ceiling}
 }
 
 // fail records a failed attempt over the given failing-resource keys and
@@ -82,20 +82,20 @@ func (c *convergence) fail(keys []string, reason string) time.Duration {
 	if reason != "" {
 		c.lastReason = reason
 	}
-	return backoffDelay(c.base, c.cap, c.streak)
+	return backoffDelay(c.base, c.ceiling, c.streak)
 }
 
-// backoffDelay is base*2^(streak-1) capped at cap (streak is 1-based).
-func backoffDelay(base, cap time.Duration, streak int) time.Duration {
+// backoffDelay is base*2^(streak-1) capped at ceiling (streak is 1-based).
+func backoffDelay(base, ceiling time.Duration, streak int) time.Duration {
 	d := base
 	for i := 1; i < streak; i++ {
 		d *= 2
-		if d >= cap {
-			return cap
+		if d >= ceiling {
+			return ceiling
 		}
 	}
-	if d > cap {
-		return cap
+	if d > ceiling {
+		return ceiling
 	}
 	return d
 }
@@ -123,15 +123,30 @@ func strictSubset(a, b map[string]struct{}) bool {
 	return true
 }
 
+// failedResult reports whether a carried result is a task that failed — the "is
+// it failing" predicate shared by the retry reason, the backoff progress set, and
+// operationFailed, so all three agree. A failure shows up two ways: a completed-
+// but-unsuccessful HookPhase (an apply failure is HookPhase Error; a failed hook
+// is HookPhase Failed, whose Status is nonetheless Synced — so keying off
+// HookPhase, not Status, covers a failed PostSync hook), or a SyncFailed status
+// with an empty HookPhase (a dry-run/permission-validator failure). This is
+// deliberately broader than the strip predicate below: a resource can be failing
+// (must be reported) yet re-run without being stripped.
+func failedResult(r common.ResourceSyncResult) bool {
+	return r.Status == common.ResultCodeSyncFailed || (r.HookPhase.Completed() && !r.HookPhase.Successful())
+}
+
 // stripFailedResults returns the carried results with every completed-but-
 // unsuccessful entry removed, so the next NewSyncContext re-attempts exactly
-// those tasks. A carried result seeds the task's operation state from its
-// HookPhase, and a completed-unsuccessful task short-circuits the whole
-// operation back to Failed without re-running (gitops-engine sync_context.go);
-// dropping the result leaves the task pending, so it is applied again.
-// Succeeded resources and completed hooks (HookPhase Succeeded) are kept, so
-// they are not re-run. This covers both an apply failure (HookPhase Error) and
-// a failed hook (HookPhase Failed, whose Status is nonetheless Synced).
+// those tasks. Its predicate is narrower than failedResult by design: a carried
+// result seeds the task's operation state from its HookPhase, and only a
+// *completed*-unsuccessful task (HookPhase Error or Failed) short-circuits the
+// whole operation back to Failed without re-running (gitops-engine
+// sync_context.go) — that is what must be dropped to re-run. A SyncFailed result
+// with an empty HookPhase re-runs on its own (operationState "" ⇒ pending), so it
+// need not be stripped. Succeeded resources and completed hooks (HookPhase
+// Succeeded) are kept, so they are not re-run. This covers both an apply failure
+// (HookPhase Error) and a failed hook (HookPhase Failed, whose Status is Synced).
 func stripFailedResults(results []common.ResourceSyncResult) []common.ResourceSyncResult {
 	var out []common.ResourceSyncResult
 	for _, r := range results {
@@ -172,7 +187,7 @@ func operationFailed(phase common.OperationPhase, results []common.ResourceSyncR
 		return true
 	}
 	for _, r := range results {
-		if r.Status == common.ResultCodeSyncFailed {
+		if failedResult(r) {
 			return true
 		}
 	}
@@ -186,7 +201,7 @@ func operationFailed(phase common.OperationPhase, results []common.ResourceSyncR
 func failureReason(message string, results []common.ResourceSyncResult) string {
 	var lines []string
 	for _, r := range results {
-		if r.Status == common.ResultCodeSyncFailed {
+		if failedResult(r) {
 			lines = append(lines, fmt.Sprintf("%s: %s", r.ResourceKey.String(), r.Message))
 		}
 	}
@@ -196,12 +211,12 @@ func failureReason(message string, results []common.ResourceSyncResult) string {
 	return message
 }
 
-// failedResultKeys is the set of resource keys of the SyncFailed tasks, for the
+// failedResultKeys is the set of resource keys of the failed tasks, for the
 // convergence progress check (did the failing set shrink between attempts?).
 func failedResultKeys(results []common.ResourceSyncResult) []string {
 	var keys []string
 	for _, r := range results {
-		if r.Status == common.ResultCodeSyncFailed {
+		if failedResult(r) {
 			keys = append(keys, r.ResourceKey.String())
 		}
 	}
@@ -232,14 +247,48 @@ func missingKeys(pending []ResourceStatus) []string {
 	return keys
 }
 
+// missingReapply paces the health gate's re-apply of a target still Missing
+// after a successful apply. A poll budget starts at missingReapplyPolls and
+// backs off (doubling, clamped to missingReapplyMax) after each re-apply, so a
+// resource merely not yet observed by the cache on the clean path is not
+// re-applied, and a genuinely wedged one does not re-apply on a hot loop.
+type missingReapply struct {
+	polls, budget int
+}
+
+func newMissingReapply() *missingReapply {
+	return &missingReapply{budget: missingReapplyPolls}
+}
+
+// due records one Missing poll and reports whether the target has stayed Missing
+// long enough to re-apply. On a due poll it resets the count and backs the budget
+// off (doubling, clamped to missingReapplyMax so the interval never exceeds it).
+func (m *missingReapply) due() bool {
+	m.polls++
+	if m.polls < m.budget {
+		return false
+	}
+	m.polls = 0
+	m.budget = min(m.budget*2, missingReapplyMax)
+	return true
+}
+
+// reset returns the pacing to its initial budget, called when the target is no
+// longer Missing so a later Missing starts the count fresh.
+func (m *missingReapply) reset() {
+	m.polls, m.budget = 0, missingReapplyPolls
+}
+
 // interruptibleWait blocks for d or until ctx ends. On ctx end it returns the
 // caller's mapped error (a *TimeoutError on deadline, the cancellation
 // otherwise), so a backoff never swallows a Ctrl-C or a sibling-app abort.
 func interruptibleWait(ctx context.Context, d time.Duration, onDone func() error) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
 	select {
 	case <-ctx.Done():
 		return onDone()
-	case <-time.After(d):
+	case <-t.C:
 		return nil
 	}
 }

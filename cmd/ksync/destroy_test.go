@@ -13,9 +13,11 @@ import (
 	"github.com/motoki317/ksync/internal/engine"
 )
 
-// destroyApps must sync each app to an empty target with BOTH Prune and
-// AllowEmpty: without AllowEmpty the empty-render guard would refuse every
-// destroy. It also reports each app and visits them in the given order.
+// destroyApps must sync each app to an empty target with Prune, AllowEmpty, and
+// FailFast: without AllowEmpty the empty-render guard would refuse every destroy,
+// and without FailFast a wedged delete (an RBAC-forbidden or webhook-denied
+// prune) would be retried for --timeout instead of surfacing at once. It also
+// reports each app and visits them in the given order.
 func TestDestroyApps_PrunesEachWithAllowEmptyInOrder(t *testing.T) {
 	apps := []config.App{{Name: "api-b"}, {Name: "db"}} // caller-supplied deletion order
 	var order []string
@@ -33,8 +35,8 @@ func TestDestroyApps_PrunesEachWithAllowEmptyInOrder(t *testing.T) {
 		t.Fatalf("destroyApps: %v", err)
 	}
 	for i, o := range opts {
-		if !o.Prune || !o.AllowEmpty {
-			t.Errorf("app %s: SyncOptions = %+v, want Prune && AllowEmpty", order[i], o)
+		if !o.Prune || !o.AllowEmpty || !o.FailFast {
+			t.Errorf("app %s: SyncOptions = %+v, want Prune && AllowEmpty && FailFast", order[i], o)
 		}
 	}
 	if got := strings.Join(order, ","); got != "api-b,db" {

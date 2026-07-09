@@ -827,6 +827,10 @@ func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *boo
 		defer cancel()
 		deploy := prog.pipeline(app).Deploy()
 		deploy.Start()
+		// Reset the retry count before this sync: OnRetry only fires on failure, so
+		// a clean re-sync would otherwise inherit the "(N retries)" suffix from an
+		// earlier failed sync of the same app whose count was never cleared.
+		prog.recordRetries(app, 0)
 		results, err := eng.Sync(ctx, app, objs, engine.SyncOptions{Prune: *prune, Namespace: nsByApp[app], ServerSide: !*clientDiff, OnWait: deployWait(deploy), OnRetry: deployRetry(deploy, out, app, prog)})
 		deploy.Done(err)
 		stats := syncStats(results)
@@ -1340,12 +1344,14 @@ type destroySyncFunc func(ctx context.Context, app string, opts engine.SyncOptio
 // target with prune, in the given order (the caller reverses needs order so a
 // dependent is removed before what it depends on). AllowEmpty is required: the
 // empty target is intentional here and would otherwise trip the empty-render
-// guard. It stops at the first failure so a wedged delete is not masked.
+// guard. FailFast keeps it stopping at the first failure so a wedged delete (an
+// RBAC-forbidden or webhook-denied prune) is not masked by the convergence retry
+// that `sync`/`watch` use — surfacing a stuck delete at once is the point.
 func destroyApps(ctx context.Context, apps []config.App, timeout time.Duration, sync destroySyncFunc, report func(app string, results []common.ResourceSyncResult, took time.Duration)) error {
 	for _, app := range apps {
 		syncCtx, cancel := withTimeout(ctx, timeout)
 		start := time.Now()
-		results, err := sync(syncCtx, app.Name, engine.SyncOptions{Prune: true, AllowEmpty: true})
+		results, err := sync(syncCtx, app.Name, engine.SyncOptions{Prune: true, AllowEmpty: true, FailFast: true})
 		cancel()
 		if err != nil {
 			return fmt.Errorf("app %s: destroy: %w", app.Name, err)
