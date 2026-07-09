@@ -150,6 +150,27 @@ func TestScheduler_FailuresRetryWithExponentialBackoff(t *testing.T) {
 	}
 }
 
+func TestScheduler_FinishReportsRetryStateOnFailure(t *testing.T) {
+	s := New(Options{RetryBase: time.Second, RetryMax: 8 * time.Second}, []App{{Name: "api-b"}})
+	s.MarkDirty("api-b", at(0))
+	s.StartDue(at(0))
+
+	// First failure: attempt 1, retry after the base delay.
+	if attempts, retryIn := s.Finish("api-b", false, at(0)); attempts != 1 || retryIn != time.Second {
+		t.Errorf("Finish(fail) = (%d, %v), want (1, 1s)", attempts, retryIn)
+	}
+	// Re-run at the backoff, then a second failure: attempt 2, delay doubled.
+	s.StartDue(at(time.Second))
+	if attempts, retryIn := s.Finish("api-b", false, at(time.Second)); attempts != 2 || retryIn != 2*time.Second {
+		t.Errorf("Finish(fail again) = (%d, %v), want (2, 2s)", attempts, retryIn)
+	}
+	// A success reports no pending retry.
+	s.StartDue(at(3 * time.Second))
+	if attempts, retryIn := s.Finish("api-b", true, at(3*time.Second)); attempts != 0 || retryIn != 0 {
+		t.Errorf("Finish(ok) = (%d, %v), want (0, 0)", attempts, retryIn)
+	}
+}
+
 func TestScheduler_NewChangeResetsBackoff(t *testing.T) {
 	s := New(Options{Debounce: 100 * time.Millisecond, RetryBase: 10 * time.Second}, []App{{Name: "api-b"}})
 	s.MarkDirty("api-b", at(0))

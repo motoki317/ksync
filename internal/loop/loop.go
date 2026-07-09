@@ -681,7 +681,13 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			}
 			refreshWatch()
 		case r := <-deployResults:
-			deploySched.Finish(r.app, r.ok, time.Now())
+			attempts, retryIn := deploySched.Finish(r.app, r.ok, time.Now())
+			if !r.ok {
+				// The whole app failed and the scheduler queued a retry: announce it
+				// with the attempt number and backoff so a silent failure is visible,
+				// keeping the error text on the line for grep-ability.
+				log.Info(fmt.Sprintf("%s: sync failed (attempt %d); retrying in %s: %v", r.app, attempts, retryIn, r.err))
+			}
 			// The render may have changed what the app references.
 			for i, a := range apps {
 				if a.Name == r.app {
@@ -719,10 +725,13 @@ type buildResult struct {
 	failed []int          // entries whose build must run again
 }
 
-// deployResult reports one app's deploy phase (render + inject + sync).
+// deployResult reports one app's deploy phase (render + inject + sync). On
+// failure err carries the cause, which the loop surfaces once at the scheduler's
+// Finish as the retry line — runDeploy does not log it, so it is not doubled.
 type deployResult struct {
 	app string
 	ok  bool
+	err error
 }
 
 // unbuilt returns the todo entries that built does not record — what a build
@@ -753,33 +762,33 @@ type runner struct {
 // ahead of this, and the deploy scheduler's external gate holds the deploy until
 // the app's images have built — so an image absent from images here is a
 // build-less, non-overridden one, and the manifest's own pin is used.
+//
+// A failure returns its cause in deployResult.err rather than logging it: the
+// loop reports it once, at the scheduler's Finish, as the retry line (attempt
+// count + backoff), so a single line names both what broke and when it retries.
 func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render.Image) deployResult {
 	started := time.Now()
 	res, err := rn.renderer.Render(app.Path, app.ClientRender)
 	if err != nil {
-		rn.log.Error(err, "Render failed", "app", app.Name)
 		rn.onError(app.Name, err)
-		return deployResult{app: app.Name}
+		return deployResult{app: app.Name, err: err}
 	}
 	// Patches before image injection (deploy-environment fields the kustomization
 	// can't carry); SetImages must win on the built dev tag.
 	if err := res.ApplyPatches(app.Patches, rn.lookup); err != nil {
-		rn.log.Error(err, "Applying patches failed", "app", app.Name)
 		rn.onError(app.Name, err)
-		return deployResult{app: app.Name}
+		return deployResult{app: app.Name, err: err}
 	}
 	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {
-			rn.log.Error(err, "Injecting image refs failed", "app", app.Name)
 			rn.onError(app.Name, err)
-			return deployResult{app: app.Name}
+			return deployResult{app: app.Name, err: err}
 		}
 	}
 	stats, err := rn.syncFn(ctx, app.Name, res.Objects)
 	if err != nil {
-		rn.log.Error(err, "Sync failed", "app", app.Name)
 		rn.onError(app.Name, err)
-		return deployResult{app: app.Name}
+		return deployResult{app: app.Name, err: err}
 	}
 	rn.reportSync(app.Name, stats, time.Since(started))
 	return deployResult{app: app.Name, ok: true}

@@ -130,24 +130,28 @@ func (s *Scheduler) blocked(st *appState) bool {
 
 // Finish records the completion of a run started via StartDue. A failure
 // re-dirties the app with an exponential-backoff deadline — unless an edit
-// during the run already scheduled a sooner one.
-func (s *Scheduler) Finish(name string, ok bool, now time.Time) {
+// during the run already scheduled a sooner one — and returns the app's new
+// attempt count and that backoff delay so the caller can report the pending
+// retry. A success returns (0, 0).
+func (s *Scheduler) Finish(name string, ok bool, now time.Time) (attempts int, retryIn time.Duration) {
 	st, found := s.apps[name]
 	if !found || !st.running {
-		return
+		return 0, 0
 	}
 	st.running = false
 	s.running--
 	if ok {
 		st.attempts = 0
-		return
+		return 0, 0
 	}
 	st.attempts++
-	deadline := now.Add(s.retryDelay(st.attempts))
+	retryIn = s.retryDelay(st.attempts)
+	deadline := now.Add(retryIn)
 	if !st.dirty || deadline.Before(st.deadline) {
 		st.deadline = deadline
 	}
 	st.dirty = true
+	return st.attempts, retryIn
 }
 
 // hardBackoffCeiling bounds the doubling loop when RetryMax is unset, both as
