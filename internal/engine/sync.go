@@ -72,6 +72,12 @@ type SyncOptions struct {
 	// than silently deleting the whole app — ArgoCD's allowEmpty=false guard. Only
 	// `ksync destroy`, whose empty target is the intent, sets it.
 	AllowEmpty bool
+	// FailFast opts out of the convergence retry: the first operation failure is
+	// returned instead of retried until --timeout. `ksync destroy` sets it so a
+	// wedged delete (an RBAC-forbidden or webhook-denied prune) surfaces at once
+	// rather than being masked by minutes of silent retries — the fail-fast
+	// semantics destroy documents. A normal sync leaves it false (retry).
+	FailFast bool
 }
 
 // ResourceStatus is one resource's health as the sync gate sees it — its
@@ -188,12 +194,11 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		}
 	}
 
-	// Fill the default namespace before any key-based matching: the live-state
-	// lookup and the diff below key resources by the target's namespace, so a
-	// late fill (gitops-engine also stamps at task creation) would mismatch.
-	if opts.Namespace != "" {
-		fillDefaultNamespace(target, opts.Namespace, e.clusterCache.IsNamespaced)
-	}
+	// The default namespace is filled at the top of the converge loop below (once
+	// per cycle, before any key-based matching), so a CR whose CRD registers
+	// mid-convergence gets keyed correctly once the kind is served. ensureReferenced-
+	// Namespaces just below is unaffected: it skips both the app's own namespace and
+	// an empty one, which is every object a fill would touch.
 
 	// Create any namespace this app's resources target but does not own — a
 	// multi-namespace app (e.g. workflow RBAC fanned out across app namespaces)
@@ -267,24 +272,25 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 	// not yet serving, an SSA conflict, a failed hook) is retried rather than
 	// returned: the failed results are stripped so the next NewSyncContext
 	// re-attempts exactly those tasks, and a backoff paces the attempts. On a
-	// warm cluster nothing fails, so this runs byte-identically to before — the
-	// retry state is only touched in an already-failing branch.
+	// warm cluster nothing fails, so the clean path adds no reconciles, diffs,
+	// API calls, or output over the pre-retry behavior — the retry state is only
+	// touched in an already-failing branch. FailFast (destroy) opts out of the
+	// retry entirely and returns the first failure.
 	conv := newConvergence(retryBase, retryCap)
-	recovered := false // guards the single OnRetry recovery event
-	missingPolls, missingBudget := 0, missingReapplyPolls
+	recovered := false // guards the single OnRetry recovery event per failure streak
+	miss := newMissingReapply()
 converge:
 	for {
-		// Re-fill default namespaces each cycle. The pre-loop fill runs before any
-		// retry, so a namespaced CR whose CRD is still registering reads as
-		// cluster-scoped then (IsNamespaced can only answer for kinds the cluster
-		// already serves) and keeps an empty namespace. Once a later attempt
-		// registers the CRD, this fills it — without which the health gate keys the
-		// resource by the wrong (empty) namespace and reports it Missing forever
-		// while the live object exists under its real namespace, timing out a sync
-		// that in fact converged. Idempotent: it only fills an empty namespace, so
-		// on the clean path (CRD already served) it is a no-op after the first fill.
-		// IsNamespaced answers from the warm cache, which learns a new CRD from its
-		// CRD-Added watch event — so it can still read false on the same cycle the
+		// Fill default namespaces each cycle. A namespaced CR whose CRD is still
+		// registering reads as cluster-scoped on an early cycle (IsNamespaced can
+		// only answer for kinds the cluster already serves) and keeps an empty
+		// namespace; once a later attempt registers the CRD, this fills it — without
+		// which the health gate keys the resource by the wrong (empty) namespace and
+		// reports it Missing forever while the live object exists under its real
+		// namespace, timing out a sync that in fact converged. Idempotent (fills only
+		// an empty namespace), so on the clean path it is a no-op after the first
+		// fill. IsNamespaced answers from the warm cache, which learns a new CRD from
+		// its CRD-Added watch event — so it can still read false on the same cycle the
 		// apply first registers the kind; that cycle's target stays empty-namespaced
 		// and the health gate reads Missing, self-correcting on the next cycle once
 		// the cache has processed the event, so convergence lags by a poll or two,
@@ -367,12 +373,20 @@ converge:
 		}
 
 		if operationFailed(phase, results) {
+			reason := failureReason(message, results)
+			// destroy (FailFast) keeps ArgoCD-free fail-fast semantics: a wedged
+			// delete — an RBAC-forbidden or webhook-denied prune — must surface at
+			// once, not be masked by 5 minutes of silent retries. Returns the first
+			// failure verbatim.
+			if opts.FailFast {
+				return results, failFastError(reason)
+			}
 			// gitops-engine reports task-level apply failures via the result phase,
 			// not the operation error. Retry rather than give up: strip the failed
 			// results so the next attempt re-runs exactly those tasks (the fresh
 			// per-iteration REST mapper re-resolves a just-registered CRD's kind),
 			// back off, and try again until the app converges or --timeout expires.
-			reason := failureReason(message, results)
+			recovered = false // a new failure; a following success re-announces recovery
 			delay := conv.fail(failedResultKeys(results), reason)
 			if opts.OnRetry != nil {
 				opts.OnRetry(RetryEvent{Attempt: conv.retries, NextDelay: delay, Reason: reason, Retries: conv.retries})
@@ -414,24 +428,18 @@ converge:
 			// A target still Missing after the apply reported success may have
 			// silently never been created (a CR applied against a stale REST mapping
 			// before its CRD registered). Re-apply it — a fresh apply re-resolves the
-			// mapping — but only once it has stayed Missing across a few polls, so a
-			// resource merely not yet observed by the cache on the clean path is not
-			// re-applied; and back the poll budget off so a genuinely wedged resource
-			// does not re-apply on a hot loop. Its result reads Succeeded, so strip
-			// it by key to force the re-attempt.
+			// mapping — but only once it has stayed Missing across a few polls (miss
+			// paces this: a resource merely not yet observed by the cache on the clean
+			// path is not re-applied, and a wedged one backs off, never hot-loops). Its
+			// result reads Succeeded, so strip it by key to force the re-attempt.
 			if hasMissing(pending) {
-				missingPolls++
-				if missingPolls >= missingBudget {
-					missingPolls = 0
-					if missingBudget < missingReapplyMax {
-						missingBudget *= 2
-					}
+				if miss.due() {
 					results = stripResultKeys(results, missingKeys(pending))
 					phase, message = common.OperationRunning, ""
 					continue converge
 				}
 			} else {
-				missingPolls, missingBudget = 0, missingReapplyPolls
+				miss.reset()
 			}
 			if err := interruptibleWait(ctx, operationRefresh, func() error {
 				return notConverged(ctx, notHealthyError(app, pending, conv.retries, conv.lastReason))
@@ -440,6 +448,16 @@ converge:
 			}
 		}
 	}
+}
+
+// failFastError frames the first operation failure for a FailFast (destroy)
+// caller — the failure reason verbatim, so a wedged delete surfaces immediately
+// instead of being retried. The caller adds the app/command context.
+func failFastError(reason string) error {
+	if reason == "" {
+		reason = "operation did not succeed"
+	}
+	return errors.New(reason)
 }
 
 // timeoutError explains a sync that did not converge before the deadline by

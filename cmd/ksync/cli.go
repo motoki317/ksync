@@ -127,7 +127,7 @@ func newSyncCmd() *cobra.Command {
 	kctx = contextFlag(f)
 	prune = pruneFlag(f)
 	force = f.Bool("force", false, "re-run hooks even when manifests are unchanged (re-applies PostSync Jobs; a failed hook is retried regardless)")
-	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before failing (0 = no limit)")
+	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to converge (retrying failures) before giving up (0 = retry until converged or interrupted)")
 	maxParallel = maxParallelFlag(f)
 	f.Var(images, "image", "deploy a pre-built image instead of building it: IMAGE=REF (repeatable; also via "+overrideEnv+")")
 	offline = offlineRenderFlag(f)

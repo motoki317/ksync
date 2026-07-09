@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +45,101 @@ func TestStripFailedResults(t *testing.T) {
 	}
 	if kept["migrate-bad"] {
 		t.Error("stripFailedResults kept the failed hook (Status Synced, HookPhase Failed) — it will not be re-run")
+	}
+}
+
+// failedResult is the one "did this task fail" predicate shared by the strip,
+// the retry reason, and the backoff progress set. It must catch every failure
+// shape and no success: an apply failure (SyncFailed status / Error phase), a
+// failed hook (Synced status but Failed phase — the case Status alone misses), a
+// dry-run/permission failure (SyncFailed status, empty phase), while a succeeded
+// resource, a completed-successful hook, and a still-pending task are not failed.
+func TestFailedResult(t *testing.T) {
+	cases := []struct {
+		name string
+		r    common.ResourceSyncResult
+		want bool
+	}{
+		{"apply failure", result("route.gateway.example.com", "Route", "team-a", "main", common.ResultCodeSyncFailed, common.OperationError, "no matches for kind"), true},
+		{"failed hook", result("batch", "Job", "team-a", "migrate", common.ResultCodeSynced, common.OperationFailed, "backoff limit reached"), true},
+		{"dry-run failure (empty hook phase)", result("apps", "Deployment", "team-a", "api", common.ResultCodeSyncFailed, "", "admission webhook denied"), true},
+		{"succeeded resource", result("apps", "Deployment", "team-a", "api", common.ResultCodeSynced, common.OperationSucceeded, ""), false},
+		{"completed-successful hook", result("batch", "Job", "team-a", "migrate", common.ResultCodeSynced, common.OperationSucceeded, ""), false},
+		{"pending (running, empty phase)", result("apps", "Deployment", "team-a", "api", common.ResultCodeSynced, "", ""), false},
+	}
+	for _, tc := range cases {
+		if got := failedResult(tc.r); got != tc.want {
+			t.Errorf("failedResult(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A failed PostSync hook (Status Synced, HookPhase Failed) is a supported retry
+// case, so its detail must reach both the retry reason and the backoff's failing
+// set — keyed off HookPhase, not Status (which stays Synced). Keyed off Status
+// alone the reason went generic and the failing set was empty, resetting the
+// backoff every attempt.
+func TestFailureReasonAndKeys_IncludeFailedHook(t *testing.T) {
+	failedHook := result("batch", "Job", "team-a", "migrate", common.ResultCodeSynced, common.OperationFailed, "backoff limit reached")
+
+	reason := failureReason("one or more tasks failed", []common.ResourceSyncResult{failedHook})
+	for _, want := range []string{"migrate", "backoff limit reached"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("failureReason must name the failed hook, got %q (missing %q)", reason, want)
+		}
+	}
+	keys := failedResultKeys([]common.ResourceSyncResult{failedHook})
+	if len(keys) != 1 || !strings.Contains(keys[0], "migrate") {
+		t.Errorf("failedResultKeys must include the failed hook, got %v", keys)
+	}
+}
+
+// missingReapply paces the re-apply of a persistently-Missing target: it fires
+// on the Nth Missing poll, then backs the interval off by doubling — clamped at
+// missingReapplyMax, the case that overshot to 48 before the clamp. reset returns
+// it to the initial budget.
+func TestMissingReapply(t *testing.T) {
+	m := newMissingReapply()
+	var intervals []int
+	polls := 0
+	for len(intervals) < 6 {
+		polls++
+		if m.due() {
+			intervals = append(intervals, polls)
+			polls = 0
+		}
+	}
+	want := []int{3, 6, 12, 24, 30, 30} // missingReapplyPolls, doubling, clamped at missingReapplyMax
+	for i := range want {
+		if intervals[i] != want[i] {
+			t.Errorf("re-apply interval #%d = %d polls, want %d (doubles, clamped at %d)", i, intervals[i], want[i], missingReapplyMax)
+		}
+	}
+
+	m.reset()
+	polls = 0
+	for {
+		polls++
+		if m.due() {
+			break
+		}
+	}
+	if polls != missingReapplyPolls {
+		t.Errorf("after reset, first re-apply at %d polls, want %d (back to the initial budget)", polls, missingReapplyPolls)
+	}
+}
+
+// interruptibleWait returns nil when the delay elapses and the caller's mapped
+// error when ctx ends — so a backoff never swallows a Ctrl-C or a sibling-abort.
+func TestInterruptibleWait(t *testing.T) {
+	if err := interruptibleWait(context.Background(), time.Millisecond, func() error { return errors.New("must not fire on elapse") }); err != nil {
+		t.Errorf("elapsed wait = %v, want nil", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	mapped := errors.New("mapped")
+	if err := interruptibleWait(ctx, time.Hour, func() error { return mapped }); !errors.Is(err, mapped) {
+		t.Errorf("cancelled wait = %v, want the onDone-mapped error", err)
 	}
 }
 
@@ -132,6 +229,42 @@ func TestOperationFailed(t *testing.T) {
 	}
 	if !operationFailed(common.OperationSucceeded, []common.ResourceSyncResult{synced, failed}) {
 		t.Error("a SyncFailed result must read as failed even when the phase is Succeeded")
+	}
+	failedHook := result("batch", "Job", "team-a", "migrate", common.ResultCodeSynced, common.OperationFailed, "backoff limit reached")
+	if !operationFailed(common.OperationSucceeded, []common.ResourceSyncResult{failedHook}) {
+		t.Error("a failed hook (Status Synced, HookPhase Failed) must read as failed")
+	}
+}
+
+// notConverged distinguishes the app's own deadline (a real timeout → the typed
+// error the command layer turns into a diagnostic dump) from any other
+// cancellation (Ctrl-C or a sibling app's failure aborting the run → a clean
+// interrupt). Mis-mapping either way is a misleading exit.
+func TestNotConverged(t *testing.T) {
+	timeoutErr := &TimeoutError{App: "shop"}
+
+	deadline, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancel()
+	<-deadline.Done()
+	if got := notConverged(deadline, timeoutErr); got != error(timeoutErr) {
+		t.Errorf("on DeadlineExceeded, notConverged = %v, want the timeout error", got)
+	}
+
+	cancelled, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if got := notConverged(cancelled, timeoutErr); !errors.Is(got, context.Canceled) {
+		t.Errorf("on Canceled, notConverged = %v, want the cancellation (not a timeout)", got)
+	}
+}
+
+// FailFast (destroy) surfaces the failure reason verbatim, and never an empty
+// message even when the engine supplied none.
+func TestFailFastError(t *testing.T) {
+	if got := failFastError("webhook denied the delete").Error(); got != "webhook denied the delete" {
+		t.Errorf("failFastError = %q, want the reason verbatim", got)
+	}
+	if got := failFastError("").Error(); got == "" {
+		t.Error("failFastError must never produce an empty message")
 	}
 }
 
