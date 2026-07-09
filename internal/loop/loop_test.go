@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/motoki317/ksync/internal/config"
@@ -91,6 +92,54 @@ func TestRun_RetriesFailedSyncs(t *testing.T) {
 
 	// First attempt fails; the loop must retry on its own.
 	waitFor(t, func() bool { return rec.count("app1") >= 2 })
+
+	cancel()
+	<-done
+}
+
+// logCapture records every log message the loop emits, so a test can assert on
+// the user-facing lines (the retry announcement) rather than only on behavior.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (c *logCapture) write(_, args string) {
+	c.mu.Lock()
+	c.lines = append(c.lines, args)
+	c.mu.Unlock()
+}
+
+func (c *logCapture) has(sub string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.ContainsFunc(c.lines, func(l string) bool { return strings.Contains(l, sub) })
+}
+
+// A failed sync must not be silent: the loop announces the retry with the
+// attempt number, the backoff delay, and the error text (kept for grep-ability).
+func TestRun_AnnouncesSyncRetryWithAttemptAndDelay(t *testing.T) {
+	tmp := t.TempDir()
+	writeApp(t, tmp, "shop")
+	apps := []config.App{{Name: "shop", Path: filepath.Join(tmp, "shop")}}
+	rec := &recorder{calls: map[string]int{}, failFirst: 2}
+	cap := &logCapture{}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, apps, rec.sync, Options{
+			RetryBase: 30 * time.Millisecond,
+			Log:       funcr.New(cap.write, funcr.Options{}),
+		})
+	}()
+
+	// Two failures precede success; each queues a retry the loop must announce,
+	// with the attempt counter and the doubling backoff (30ms → 60ms).
+	waitFor(t, func() bool {
+		return cap.has("shop: sync failed (attempt 1); retrying in 30ms: induced failure") &&
+			cap.has("shop: sync failed (attempt 2); retrying in 60ms: induced failure")
+	})
+	waitFor(t, func() bool { return rec.count("shop") >= 3 })
 
 	cancel()
 	<-done
