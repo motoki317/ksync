@@ -274,6 +274,24 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 	missingPolls, missingBudget := 0, missingReapplyPolls
 converge:
 	for {
+		// Re-fill default namespaces each cycle. The pre-loop fill runs before any
+		// retry, so a namespaced CR whose CRD is still registering reads as
+		// cluster-scoped then (IsNamespaced can only answer for kinds the cluster
+		// already serves) and keeps an empty namespace. Once a later attempt
+		// registers the CRD, this fills it — without which the health gate keys the
+		// resource by the wrong (empty) namespace and reports it Missing forever
+		// while the live object exists under its real namespace, timing out a sync
+		// that in fact converged. Idempotent: it only fills an empty namespace, so
+		// on the clean path (CRD already served) it is a no-op after the first fill.
+		// IsNamespaced answers from the warm cache, which learns a new CRD from its
+		// CRD-Added watch event — so it can still read false on the same cycle the
+		// apply first registers the kind; that cycle's target stays empty-namespaced
+		// and the health gate reads Missing, self-correcting on the next cycle once
+		// the cache has processed the event, so convergence lags by a poll or two,
+		// never stalls.
+		if opts.Namespace != "" {
+			fillDefaultNamespace(target, opts.Namespace, e.clusterCache.IsNamespaced)
+		}
 		live, err := e.clusterCache.GetManagedLiveObjs(target, isManaged)
 		if err != nil {
 			return results, fmt.Errorf("reading live state of %q: %w", app, err)

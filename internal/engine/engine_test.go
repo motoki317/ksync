@@ -105,6 +105,54 @@ func TestFillDefaultNamespace(t *testing.T) {
 	}
 }
 
+// A CR whose CRD registers mid-convergence (a Route racing its own CRD) reads
+// as cluster-scoped at Sync start, so the pre-loop namespace fill skips it and
+// its target key keeps an empty namespace — while the live object lands under
+// the app's real namespace. The converge loop re-fills each cycle, so once the
+// CRD is served the target key matches the live object and the health gate stops
+// reporting a converged resource as Missing. This is the regression the
+// convergence retry exposed: without the re-fill the sync times out though the
+// resource exists and is healthy.
+func TestFillDefaultNamespace_RefillMatchesLiveOnceCRDRegisters(t *testing.T) {
+	route := func() *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "gateway.example.com/v1",
+			"kind":       "Route",
+			"metadata":   map[string]any{"name": "main"}, // no namespace: relies on the app default
+		}}
+	}
+	target := []*unstructured.Unstructured{route()}
+
+	// The live object as the cluster (and the warm cache) holds it: created under
+	// the app namespace by the apply that finally succeeded.
+	liveRoute := route()
+	liveRoute.SetNamespace("team-a")
+	lives := map[kube.ResourceKey]*unstructured.Unstructured{kube.GetResourceKey(liveRoute): liveRoute}
+
+	// Before the CRD is served IsNamespaced cannot classify the kind, so the fill
+	// is a no-op and the target key keys by an empty namespace — the health gate
+	// reports the (actually present) resource as Missing.
+	crdAbsent := func(schema.GroupKind) (bool, error) { return false, errors.New("no matches for kind") }
+	fillDefaultNamespace(target, "team-a", crdAbsent)
+	if got := target[0].GetNamespace(); got != "" {
+		t.Fatalf("namespace before CRD registers = %q, want empty (kind not yet classifiable)", got)
+	}
+	if p := pending(target, lives); len(p) != 1 || p[0].Status != "Missing" {
+		t.Fatalf("pending before re-fill = %+v, want the live object reported Missing (the bug)", p)
+	}
+
+	// The CRD registers; the next converge cycle re-fills, the target key now
+	// carries the real namespace, and the health gate matches the live object.
+	crdServed := func(schema.GroupKind) (bool, error) { return true, nil }
+	fillDefaultNamespace(target, "team-a", crdServed)
+	if got := target[0].GetNamespace(); got != "team-a" {
+		t.Fatalf("namespace after CRD registers = %q, want team-a (re-fill must apply)", got)
+	}
+	if p := pending(target, lives); len(p) != 0 {
+		t.Fatalf("pending after re-fill = %+v, want empty (a bare CR with no health check is healthy once matched)", p)
+	}
+}
+
 func TestAlignedLiveObjs(t *testing.T) {
 	cm := func(ns, name string) *unstructured.Unstructured {
 		return &unstructured.Unstructured{Object: map[string]any{
