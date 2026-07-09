@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
-	"github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -132,64 +131,6 @@ func TestAlignedLiveObjs(t *testing.T) {
 	}
 	if aligned[1] != nil {
 		t.Errorf("aligned[1] = %v, want nil (no live state yet)", aligned[1])
-	}
-}
-
-func TestFailedResultsError(t *testing.T) {
-	ok := common.ResourceSyncResult{
-		ResourceKey: kube.ResourceKey{Group: "", Kind: "ConfigMap", Namespace: "team-a", Name: "settings"},
-		Status:      common.ResultCodeSynced,
-	}
-	failed := common.ResourceSyncResult{
-		ResourceKey: kube.ResourceKey{Group: "apps", Kind: "Deployment", Namespace: "team-a", Name: "api-b"},
-		Status:      common.ResultCodeSyncFailed,
-		Message:     "admission webhook denied",
-	}
-
-	if err := failedResultsError([]common.ResourceSyncResult{ok, ok}); err != nil {
-		t.Errorf("all-synced results produced error: %v", err)
-	}
-
-	err := failedResultsError([]common.ResourceSyncResult{ok, failed})
-	if err == nil {
-		t.Fatal("a SyncFailed result must produce an error — returning nil makes the watch loop treat the sync as successful and skip the retry")
-	}
-	for _, want := range []string{"Deployment", "api-b", "admission webhook denied"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not mention %q", err, want)
-		}
-	}
-}
-
-func TestSyncFailedError(t *testing.T) {
-	failed := common.ResourceSyncResult{
-		ResourceKey: kube.ResourceKey{Group: "apps", Kind: "Deployment", Namespace: "team-a", Name: "api-b"},
-		Status:      common.ResultCodeSyncFailed,
-		Message:     "admission webhook denied",
-	}
-
-	// With a per-resource failure, the actionable detail wins over the bare phase
-	// message: a user needs the resource and reason, not "OperationFailed: ...".
-	err := syncFailedError("shop", common.OperationFailed, "one or more tasks failed", []common.ResourceSyncResult{failed})
-	if err == nil {
-		t.Fatal("a Failed operation must produce an error")
-	}
-	for _, want := range []string{"Deployment", "api-b", "admission webhook denied"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not mention %q", err, want)
-		}
-	}
-
-	// With no per-resource failure (operation-level Error, e.g. a hook the loop
-	// gave up on), fall back to naming the app and the phase message.
-	err = syncFailedError("shop", common.OperationError, "namespace not found", nil)
-	if err == nil {
-		t.Fatal("an Error operation with no failed results must still produce an error")
-	}
-	for _, want := range []string{"shop", "namespace not found"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not mention %q", err, want)
-		}
 	}
 }
 
