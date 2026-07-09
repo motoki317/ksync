@@ -194,11 +194,18 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 		}
 	}
 
-	// The default namespace is filled at the top of the converge loop below (once
-	// per cycle, before any key-based matching), so a CR whose CRD registers
-	// mid-convergence gets keyed correctly once the kind is served. ensureReferenced-
-	// Namespaces just below is unaffected: it skips both the app's own namespace and
-	// an empty one, which is every object a fill would touch.
+	// Fill the default namespace before the converge loop, so revision() below —
+	// and every other consumer computed once before the loop — hashes the same
+	// target the apply will use; an app whose manifests omit the namespace would
+	// otherwise hash an empty one, changing a generateName hook's derived name for
+	// no reason. The loop re-fills each cycle (below) to additionally catch a CR
+	// whose CRD only registers mid-convergence, which IsNamespaced cannot classify
+	// yet at this point; this pre-fill covers the common case it already can.
+	// ensureReferencedNamespaces just below is unaffected: it skips both the app's
+	// own namespace and an empty one, which is every object a fill would touch.
+	if opts.Namespace != "" {
+		fillDefaultNamespace(target, opts.Namespace, e.clusterCache.IsNamespaced)
+	}
 
 	// Create any namespace this app's resources target but does not own — a
 	// multi-namespace app (e.g. workflow RBAC fanned out across app namespaces)
@@ -281,10 +288,11 @@ func (e *Engine) Sync(ctx context.Context, app string, resources []*unstructured
 	miss := newMissingReapply()
 converge:
 	for {
-		// Fill default namespaces each cycle. A namespaced CR whose CRD is still
-		// registering reads as cluster-scoped on an early cycle (IsNamespaced can
-		// only answer for kinds the cluster already serves) and keeps an empty
-		// namespace; once a later attempt registers the CRD, this fills it — without
+		// Re-fill default namespaces each cycle (the pre-loop fill above already
+		// covered the kinds IsNamespaced could classify at Sync start). A namespaced
+		// CR whose CRD is still registering reads as cluster-scoped on an early cycle
+		// (IsNamespaced can only answer for kinds the cluster already serves) and keeps
+		// an empty namespace; once a later attempt registers the CRD, this fills it — without
 		// which the health gate keys the resource by the wrong (empty) namespace and
 		// reports it Missing forever while the live object exists under its real
 		// namespace, timing out a sync that in fact converged. Idempotent (fills only
