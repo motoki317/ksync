@@ -98,25 +98,45 @@ terminal and off it.
 - A fresh-cluster sync that races its own CRD registration (or waits on a webhook that is not yet
   serving) self-heals within seconds instead of failing the run; a `needs` chain no longer aborts
   because one dependency raced.
-- A genuinely broken manifest now fails at `--timeout` (default 5m) rather than in ~2s. This is
-  the deliberate cost of always-retry, mitigated by the failure being visible from attempt 1 (the
-  first `⚠`/stream line names the exact error) and by Ctrl-C producing the usual diagnostics dump.
-- The warm-cluster clean path is byte-for-byte unchanged: no extra reconciles, diffs, or API
-  calls when nothing fails, and no new output.
-- `OnRetry` fires per *attempt*, so a `SyncFail`-phase hook (`argocd.argoproj.io/hook: SyncFail`)
-  runs once per failed attempt — rare in kustomize apps, accepted.
+- A genuinely broken manifest under `ksync sync` now fails at `--timeout` (default 5m) rather than
+  in ~2s. This is the deliberate cost of always-retry, mitigated by the failure being visible from
+  attempt 1 (the first `⚠`/stream line names the exact error) and by Ctrl-C producing the usual
+  diagnostics dump. `--timeout 0` ("no limit") consequently also removes the failure bound: a
+  broken app retries until it converges or is interrupted. A wrapper that calls ksync as its deploy
+  engine and imposes its own outer timeout shorter than `--timeout` will now cut ksync off
+  mid-convergence where it previously got a fast typed error — set the two timeouts consistently.
+- The warm-cluster clean path adds no reconciles, diffs, API calls, or output when nothing fails —
+  the retry state is only touched in an already-failing branch. (Not literally byte-identical: the
+  per-cycle namespace re-fill and a per-poll `hasMissing` check run, both in-memory and immaterial
+  to the p50/p95 targets.)
+- A `SyncFail`-phase hook (`argocd.argoproj.io/hook: SyncFail`) that *succeeds* runs about once for
+  the whole convergence, not once per attempt: its Succeeded result is kept across retries, so
+  gitops-engine treats it as done and does not re-run it. Only a SyncFail hook that itself *fails*
+  is dropped by the strip and re-runs each attempt. Rare in kustomize apps; called out because the
+  re-drive makes the exact semantics non-obvious.
 - Render failures stay fail-fast (a render error is almost always the user's own manifest, where
-  instant failure is the right dev-loop UX); `destroy` and `diff` are unchanged.
+  instant failure is the right dev-loop UX). `diff` is unchanged. `destroy` is unchanged too, but
+  deliberately: it sets `SyncOptions.FailFast`, opting out of the retry so a wedged delete (an
+  RBAC-forbidden or webhook-denied prune) surfaces at once instead of retrying for `--timeout` —
+  the fail-fast semantics `destroy` documents. Without that opt-out `destroy` would silently inherit
+  the retry.
 
 # Impact
 
 - `internal/engine/converge.go` (new): the retry helpers, all pure and unit-tested — result
-  stripping, the backoff/progress state machine, the failure/Missing predicates, `RetryEvent`,
-  and the ctx-interruptible wait.
+  stripping, the backoff/progress state machine, the `missingReapply` poll-budget pacing, the
+  `failedResult` predicate (the shared "is it failing" test — a SyncFailed status *or* a
+  completed-unsuccessful HookPhase, so a failed PostSync hook, whose Status stays Synced, is
+  reported and counted, not just an apply failure), `RetryEvent`, and the ctx-interruptible wait.
+- `internal/engine/contract_test.go` (new): pins the three undocumented gitops-engine invariants
+  the strip lever rests on (completed-unsuccessful → short-circuit; stripped → re-run;
+  succeeded-kept → not re-run) through the exported `sync.NewSyncContext`/`Sync()` with a mock
+  kubectl, so a future engine pin bump that changes the semantics fails CI instead of at runtime.
 - `internal/engine/sync.go`: the two loops become one labeled convergence loop; the loop re-fills
-  default namespaces each cycle (D7); `SyncOptions` gains `OnRetry`; `TimeoutError` gains
-  `Retries`/`LastFailure`; `syncFailedError`/`failedResultsError` (which existed to surface a
-  failure as a terminal error) are removed, since a failure is now retried, not returned.
+  default namespaces each cycle (D7); `SyncOptions` gains `OnRetry` and `FailFast` (destroy's
+  opt-out of the retry); `TimeoutError` gains `Retries`/`LastFailure`; `syncFailedError`/
+  `failedResultsError` (which existed to surface a failure as a terminal error) are removed — a
+  failure is now retried, not returned — while a small `failFastError` frames the FailFast return.
 - `internal/ui/pipeline.go`: `Stage.Event` (a committed notice — `<symbol> <app>  <text>` on a
   terminal, stream-prefixed off it) and `Stage.SetTailQuiet` (a transient row update that never
   streams off a terminal, so the per-attempt countdown does not flood a CI log).
@@ -148,7 +168,10 @@ The load-bearing claim — that stripping a failed result re-runs exactly that t
 in the gitops-engine source (`pkg/sync/sync_context.go`): a task looks up its carried result by
 `resultKey()`; with the result absent the task stays pending and is applied again, while the
 `Fresh()`→`Reset()`→`Invalidate()` self-heal in client-go's `restmapper/discovery.go` is what
-makes the re-applied CR resolve its now-registered kind.
+makes the re-applied CR resolve its now-registered kind. Because this rests on *undocumented*
+engine internals — a version bump could break it silently, with the worst case a false-success on
+a broken deploy — `contract_test.go` now pins the three invariants (short-circuit, strip→re-run,
+succeeded-kept→not-re-run) through the exported API with a mock kubectl, so such a bump fails CI.
 
 Validated live against a real cluster (output redirected to a file, so the non-terminal stream
 path), an app rendering a namespaced `Route` CR whose CRD was absent:
