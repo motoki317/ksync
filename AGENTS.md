@@ -177,11 +177,29 @@ re-litigate only with new evidence):
   the engine's version): warm cluster cache, SSA, tracking-label-scoped prune, namespace
   auto-creation (create-if-missing — the app's own *and* every other namespace its resources
   reference, the latter bare/untracked so prune never touches it; ADR
-  20260614-ensure-referenced-namespaces). After apply, a **health gate** blocks until every
-  non-hook resource is Healthy (or `--timeout`), so a completed `Sync` means deployed-and-healthy
-  and a `needs` edge waits for the dependency to actually serve (ADR 20260614-sync-health-gate);
-  while waiting, `OnWait` reports the not-yet-ready resources (`[]ResourceStatus`, UI-neutral) so the
-  live deploy line can name them. The health-gate/apply loops split `ctx.Err()`: only the app's own
+  20260614-ensure-referenced-namespaces). `Sync` is a **convergence loop**: it retries every
+  apply/hook failure — unclassified — until the app is applied-and-healthy or `--timeout` expires,
+  rather than failing the run on the first error, so a fresh-cluster CRD+CR registration race (the
+  next loop iteration's fresh kubectl factory re-resolves the just-registered kind, client-go
+  `restmapper` `Fresh()`→`Reset()` self-heal) or a webhook not yet serving self-heals. The lever:
+  a carried `SyncFailed`/failed-hook result short-circuits gitops-engine's next operation straight
+  back to Failed, so `Sync` **strips the completed-unsuccessful results** (`stripFailedResults`,
+  keeping succeeded resources and completed hooks) before re-seeding `WithInitialState` — the
+  stripped tasks re-run, the rest do not. The loop also **re-fills default namespaces each cycle**:
+  a namespaced CR whose CRD is still registering reads as cluster-scoped at Sync start (`IsNamespaced`
+  can only classify served kinds), so its target keeps an empty namespace and the health gate — which
+  keys by namespace — reads the (converged) resource `Missing` forever; the per-cycle re-fill matches
+  the target key to the live object once the CRD is served (idempotent, so a no-op on the clean path).
+  Backoff 1s→30s, reset when the failing set shrinks;
+  `--timeout` is the only bound (no retry-limit knob). Each failure/retry/recovery is reported via
+  `OnRetry` (UI-neutral, like `OnWait`) as a distinct committed line in both TTY and non-TTY output
+  (`internal/ui` `Stage.Event`/`SetTailQuiet`, deduped by message), and `TimeoutError` names the
+  retry count + last failure (ADR 20260709-sync-convergence-retry). After apply, a **health gate**
+  blocks until every non-hook resource is Healthy (or `--timeout`), so a completed `Sync` means
+  deployed-and-healthy and a `needs` edge waits for the dependency to actually serve (ADR
+  20260614-sync-health-gate); a target still Missing after a successful apply re-enters the apply
+  path (D6). While waiting, `OnWait` reports the not-yet-ready resources (`[]ResourceStatus`,
+  UI-neutral) so the live deploy line can name them. The health-gate/apply loops split `ctx.Err()`: only the app's own
   `--timeout` (`DeadlineExceeded`) is a typed `TimeoutError`; a Ctrl-C or a sibling app's failure
   aborting the run (`Canceled`) returns the cancellation, which the command maps to `ksync:
   interrupted` + exit 130 (not the raw error). `Diagnose` (`diagnose.go`) gathers a **bounded,
