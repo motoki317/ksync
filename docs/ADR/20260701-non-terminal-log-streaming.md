@@ -6,7 +6,7 @@ status: "accepted"
 
 # Context
 
-The previous non-terminal design (ADR 20260630-non-tty-progress-output) gave a piped/CI run three
+The previous non-terminal design (ADR _20260630-non-tty-progress-output) gave a piped/CI run three
 things: app-qualified completion lines, a 30s heartbeat, and a slowest-first timing recap. Run on a
 real 22-app sync it read as a letdown. The heartbeat was the problem: between a multi-minute build's
 start and finish it reprinted a near-identical in-flight snapshot every 30s, each line differing only
