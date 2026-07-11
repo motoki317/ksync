@@ -6,11 +6,15 @@ truth. Keep durable project rules in `AGENTS.md`, not here.
 
 @AGENTS.md
 
-## Local-only handoff
+## Research context (before design work)
 
-`HANDOFF.md` (gitignored; absent on a fresh clone) holds the full research context behind this
-project: the tool-landscape survey that justified building ksync, the source-verified ArgoCD
-semantic contract, the architecture sketch, and the milestone plan with acceptance criteria.
-When it exists, **read it before design work** and do not re-litigate tool selection without it.
-It is untracked because it references private environment details — never commit it or copy its
-private references into tracked files (see the leakage rule in AGENTS.md).
+The research behind ksync is tracked, not machine-local:
+
+- **Why ksync exists / build-vs-buy** — [docs/ADR/20260612-build-vs-buy-tool-landscape.md](docs/ADR/20260612-build-vs-buy-tool-landscape.md).
+  Read it before re-litigating tool selection; do so only with new evidence.
+- **The verified ArgoCD semantic contract** — [docs/argocd-parity.md](docs/argocd-parity.md).
+
+A gitignored `HANDOFF.md` may still exist on a given machine, holding only private
+reference-environment details (specific cluster/repo names). It is optional local scratch — no
+tracked work depends on it. Never commit it or copy its private references into tracked files
+(see the leakage rule in AGENTS.md).
