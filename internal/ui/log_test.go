@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,19 @@ import (
 // so NewColors disables color automatically — these tests assert on plain text.
 func fixedClock() time.Time {
 	return time.Date(2026, 6, 13, 15, 4, 5, 0, time.UTC)
+}
+
+// New must honor its documented os.Stderr default when Writer is unset —
+// otherwise a pure-log run (no pipeline binds a writer) panics on the first
+// record written to a nil io.Writer.
+func TestNew_DefaultsWriterToStderr(t *testing.T) {
+	s, ok := New(Options{}).GetSink().(*sink)
+	if !ok {
+		t.Fatalf("New did not return a *sink")
+	}
+	if s.w != os.Stderr {
+		t.Errorf("New(Options{}).w = %v, want os.Stderr", s.w)
+	}
 }
 
 func TestSink_InfoFormat(t *testing.T) {

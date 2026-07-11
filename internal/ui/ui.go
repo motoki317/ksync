@@ -1,7 +1,7 @@
 // Package ui is ksync's human-facing output layer. Logs are the only interface
 // ksync has with the developer running it, so this package owns two concerns:
 // turning the engine's structured log stream into clean, colored, scannable
-// lines (see Sink), and the small color helpers that the command layer reuses
+// lines (see sink), and the small color helpers that the command layer reuses
 // for its own summaries. Color is opt-out (NO_COLOR) and auto-disabled when the
 // target is not a terminal, so piping or redirecting yields plain text.
 package ui

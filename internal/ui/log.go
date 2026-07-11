@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"github.com/go-logr/logr"
 )
 
-// Options configure a Sink.
+// Options configure a sink.
 type Options struct {
 	// Writer receives the formatted lines; defaults to os.Stderr via New.
 	Writer io.Writer
@@ -31,11 +32,14 @@ type Options struct {
 // so it drops into the existing plumbing without rewiring.
 func New(opts Options) logr.Logger {
 	w := opts.Writer
+	if w == nil {
+		w = os.Stderr
+	}
 	clock := opts.Clock
 	if clock == nil {
 		clock = time.Now
 	}
-	return logr.New(&Sink{
+	return logr.New(&sink{
 		w:         w,
 		colors:    NewColors(w),
 		verbosity: opts.Verbosity,
@@ -44,14 +48,14 @@ func New(opts Options) logr.Logger {
 	})
 }
 
-// Sink is the logr.LogSink behind New. It formats records as
+// sink is the logr.LogSink behind New. It formats records as
 //
 //	HH:MM:SS <symbol> <message>   key=value key=value
 //
 // with the timestamp and key/value tail dimmed so the eye lands on the
 // message. WithName/WithValues are honored so engine sub-loggers keep their
 // context.
-type Sink struct {
+type sink struct {
 	w         io.Writer
 	colors    Colors
 	verbosity int
@@ -61,23 +65,23 @@ type Sink struct {
 	values    []any
 }
 
-func (s *Sink) Init(logr.RuntimeInfo) {}
+func (s *sink) Init(logr.RuntimeInfo) {}
 
 // Enabled gates Info/V output. Returning false in quiet mode means the engine
 // never even formats its chatter (and klog skips its own V-checks), while
 // Error bypasses Enabled entirely in logr — so failures still surface.
-func (s *Sink) Enabled(level int) bool {
+func (s *sink) Enabled(level int) bool {
 	if s.quiet {
 		return false
 	}
 	return level <= s.verbosity
 }
 
-func (s *Sink) Info(_ int, msg string, kv ...any) {
+func (s *sink) Info(_ int, msg string, kv ...any) {
 	s.write(s.colors.Cyan("•"), msg, kv, false)
 }
 
-func (s *Sink) Error(err error, msg string, kv ...any) {
+func (s *sink) Error(err error, msg string, kv ...any) {
 	// In quiet mode (the engine/klog stream) drop known-benign notices that
 	// gitops-engine logs at Error level but recovers from. The motivating case:
 	// on a cold cluster an aggregated APIService (metrics-server) is registered
@@ -110,7 +114,7 @@ func isBenignEngineNotice(msg string) bool {
 	return false
 }
 
-func (s *Sink) write(symbol, msg string, kv []any, isError bool) {
+func (s *sink) write(symbol, msg string, kv []any, isError bool) {
 	var b strings.Builder
 	b.WriteString(s.colors.Dim(s.clock().Format("15:04:05")))
 	b.WriteByte(' ')
@@ -137,7 +141,7 @@ func (s *Sink) write(symbol, msg string, kv []any, isError bool) {
 // own key/value pairs as a stable, space-separated "key=value" tail. Keys are
 // sorted so the same record always reads the same way; values with spaces are
 // quoted so the boundaries stay obvious.
-func (s *Sink) formatPairs(kv []any) string {
+func (s *sink) formatPairs(kv []any) string {
 	pairs := map[string]string{}
 	var order []string
 	add := func(list []any) {
@@ -174,13 +178,13 @@ func quoteValue(v any) string {
 	return s
 }
 
-func (s *Sink) WithValues(kv ...any) logr.LogSink {
+func (s *sink) WithValues(kv ...any) logr.LogSink {
 	c := *s
 	c.values = append(append([]any{}, s.values...), kv...)
 	return &c
 }
 
-func (s *Sink) WithName(name string) logr.LogSink {
+func (s *sink) WithName(name string) logr.LogSink {
 	c := *s
 	if c.name != "" {
 		c.name += "." + name
