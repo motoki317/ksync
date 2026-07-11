@@ -154,35 +154,6 @@ func TestFillDefaultNamespace_RefillMatchesLiveOnceCRDRegisters(t *testing.T) {
 	}
 }
 
-func TestAlignedLiveObjs(t *testing.T) {
-	cm := func(ns, name string) *unstructured.Unstructured {
-		return &unstructured.Unstructured{Object: map[string]any{
-			"apiVersion": "v1",
-			"kind":       "ConfigMap",
-			"metadata":   map[string]any{"name": name, "namespace": ns},
-		}}
-	}
-	target := []*unstructured.Unstructured{cm("team-a", "one"), cm("team-a", "two")}
-	liveOne := cm("team-a", "one")
-	lives := map[kube.ResourceKey]*unstructured.Unstructured{
-		kube.GetResourceKey(liveOne): liveOne,
-		// an extra managed live object not in target (prune candidate) must
-		// not disturb alignment
-		kube.GetResourceKey(cm("team-a", "gone")): cm("team-a", "gone"),
-	}
-
-	aligned := alignedLiveObjs(target, lives)
-	if len(aligned) != 2 {
-		t.Fatalf("len = %d, want 2 (one slot per target)", len(aligned))
-	}
-	if aligned[0] != liveOne {
-		t.Errorf("aligned[0] = %v, want the matching live object", aligned[0])
-	}
-	if aligned[1] != nil {
-		t.Errorf("aligned[1] = %v, want nil (no live state yet)", aligned[1])
-	}
-}
-
 func TestUnhealthyLines(t *testing.T) {
 	key := func(group, kind, ns, name string) kube.ResourceKey {
 		return kube.ResourceKey{Group: group, Kind: kind, Namespace: ns, Name: name}

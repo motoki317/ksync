@@ -666,7 +666,7 @@ func (e *Engine) AppDegraded(app, namespace string, objects []*unstructured.Unst
 }
 
 // degradedLines describes the live objects whose health is Degraded, one sorted
-// line each. Unlike unhealthyLines it deliberately ignores Progressing and
+// line each. Unlike unhealthyStatuses it deliberately ignores Progressing and
 // Missing: those are the normal post-apply states of a healthy rollout, and
 // flagging them would make every fresh edit look broken. The tradeoff is that a
 // wedged StatefulSet stays Progressing (StatefulSets carry no progress
@@ -674,20 +674,14 @@ func (e *Engine) AppDegraded(app, namespace string, objects []*unstructured.Unst
 // Degraded via ProgressDeadlineExceeded and is — accepting a blind spot for
 // StatefulSets in exchange for never crying wolf on a healthy rollout.
 func degradedLines(lives map[kube.ResourceKey]*unstructured.Unstructured) []string {
-	var lines []string
+	var degraded []ResourceStatus
 	for key, obj := range lives {
-		h, err := health.GetResourceHealth(obj, resourceHealth)
-		if err != nil || h == nil || h.Status != health.HealthStatusDegraded {
-			continue
+		if rs, ok := unhealthyStatus(key, obj); ok && rs.Status == string(health.HealthStatusDegraded) {
+			degraded = append(degraded, rs)
 		}
-		line := fmt.Sprintf("%s: Degraded", key.String())
-		if h.Message != "" {
-			line += " — " + strings.TrimSpace(h.Message)
-		}
-		lines = append(lines, line)
 	}
-	sort.Strings(lines)
-	return lines
+	sortStatuses(degraded)
+	return statusLines(degraded)
 }
 
 // fillDefaultNamespace sets namespace on namespaced objects that carry none —
@@ -703,18 +697,6 @@ func fillDefaultNamespace(objs []*unstructured.Unstructured, namespace string, i
 			obj.SetNamespace(namespace)
 		}
 	}
-}
-
-// alignedLiveObjs returns the live counterpart of every target object (nil
-// where none exists), in target order — the pairing diff.DiffArray expects.
-// Extra entries in lives (live-only resources, i.e. prune candidates) have no
-// target to diff against and are dropped; prune handles them.
-func alignedLiveObjs(target []*unstructured.Unstructured, lives map[kube.ResourceKey]*unstructured.Unstructured) []*unstructured.Unstructured {
-	aligned := make([]*unstructured.Unstructured, len(target))
-	for i, t := range target {
-		aligned[i] = lives[kube.GetResourceKey(t)]
-	}
-	return aligned
 }
 
 // createNamespaceIfMissing is ksync's namespace auto-creation contract — the

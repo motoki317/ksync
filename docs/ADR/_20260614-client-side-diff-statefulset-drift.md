@@ -1,8 +1,13 @@
 ---
 date: "2026-06-14"
 author: "motoki317"
-status: "accepted"
+status: "superseded"
 ---
+
+> **Superseded by [20260625-server-side-diff-default](20260625-server-side-diff-default.md).**
+> `diff` and `sync`/`watch` apply-skip now default to a server-side dry-run diff, which does not
+> surface the spurious StatefulSet-VCT drift this ADR accepted as a limitation; `--client-diff`
+> opts back into the client-side path analyzed below. The analysis here is why the default moved.
 
 # Context
 

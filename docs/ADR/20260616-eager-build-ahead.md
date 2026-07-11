@@ -69,7 +69,7 @@ excludes running apps.
   eager builds would have made more frequent.
 - Every prior invariant holds: per-app deploy serialization, `needs` ordering on deploys, retry
   backoff per phase, and "never deploy an unbuilt image." The `imageLoad` Loader still serializes
-  its calls internally (k3d image import is not concurrency-safe; 20260615-imageload-concurrency),
+  its calls internally (k3d image import is not concurrency-safe; _20260615-imageload-concurrency),
   so more concurrent builds remain safe.
 
 # Impact

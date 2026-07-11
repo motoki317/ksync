@@ -2,7 +2,6 @@ package render
 
 import (
 	"regexp"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -76,11 +75,10 @@ func liveDevTags(objs []*unstructured.Unstructured, repos []string) map[string]s
 	conflict := map[string]bool{} // repo -> saw a disagreeing or non-ksync ref
 	for _, o := range objs {
 		for _, ref := range collectImageRefs(o.Object) {
-			repo := imageRepo(ref)
+			repo, tag := splitImageRef(ref)
 			if !want[repo] || conflict[repo] {
 				continue
 			}
-			tag := imageTag(ref)
 			if !devTagPattern.MatchString(tag) {
 				conflict[repo] = true // a non-ksync ref disqualifies the repo
 				continue
@@ -134,17 +132,4 @@ func collectImageRefs(v any) []string {
 	}
 	walk(v)
 	return out
-}
-
-// imageTag returns the tag portion of an image reference, or "" when it carries
-// none (or only a digest). It mirrors imageRepo's port-vs-tag rule: a ':' starts
-// the tag only when no '/' follows it.
-func imageTag(ref string) string {
-	if at := strings.IndexByte(ref, '@'); at >= 0 {
-		ref = ref[:at]
-	}
-	if c := strings.LastIndexByte(ref, ':'); c >= 0 && !strings.ContainsRune(ref[c:], '/') {
-		return ref[c+1:]
-	}
-	return ""
 }

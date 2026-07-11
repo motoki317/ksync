@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -435,6 +436,11 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 				b.Context = filepath.Join(baseDir, b.Context)
 			}
 			b.Context = filepath.Clean(b.Context)
+			// Watch globs resolve against the now-absolute build context — the
+			// same base whether or not the entry belongs to a group.
+			for k, w := range b.Watch {
+				b.Watch[k] = resolveAgainst(b.Context, w)
+			}
 			if b.Group != "" {
 				// A grouped entry is built by the group's bulk command, not by a
 				// per-image docker build or command of its own.
@@ -450,9 +456,6 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 					}
 					groupContext[b.Group] = b.Context
 				}
-				for k, w := range b.Watch {
-					b.Watch[k] = resolveAgainst(b.Context, w)
-				}
 				continue
 			}
 			if b.Command != "" && b.Dockerfile != "" {
@@ -463,9 +466,6 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 			}
 			if b.Dockerfile != "" {
 				b.Dockerfile = resolveAgainst(b.Context, b.Dockerfile)
-			}
-			for k, w := range b.Watch {
-				b.Watch[k] = resolveAgainst(b.Context, w)
 			}
 		}
 	}
@@ -498,8 +498,6 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Select returns the apps with the given names in request order, or all apps
-// in declaration order when names is empty.
 // SelectContext resolves which kubectl context a run targets and enforces the
 // allowlist. override is the explicit --context flag ("" if unset).
 //
@@ -544,10 +542,8 @@ func isGlob(s string) bool {
 // --context resolved by pattern — the per-worktree microVM case (k3s-*) — names
 // the cluster it actually acted on, rather than silently matching.
 func (c *Config) MatchedViaGlob(name string) bool {
-	for _, pat := range c.AllowedContexts {
-		if pat == name {
-			return false
-		}
+	if slices.Contains(c.AllowedContexts, name) {
+		return false
 	}
 	for _, pat := range c.AllowedContexts {
 		if !isGlob(pat) {
@@ -560,6 +556,8 @@ func (c *Config) MatchedViaGlob(name string) bool {
 	return false
 }
 
+// Select returns the apps with the given names in request order, or all apps
+// in declaration order when names is empty.
 func (c *Config) Select(names []string) ([]App, error) {
 	if len(names) == 0 {
 		return c.Apps, nil
@@ -719,7 +717,7 @@ func (p Patch) Validate() error {
 			return fmt.Errorf("target.namespace %q is not a valid namespace name: %s", p.Target.Namespace, strings.Join(msgs, "; "))
 		}
 	}
-	ops, err := decodePatchOps(p.Patch)
+	ops, err := DecodePatchOps(p.Patch)
 	if err != nil {
 		return err
 	}
@@ -734,11 +732,11 @@ func (p Patch) Validate() error {
 	return nil
 }
 
-// decodePatchOps parses an inline RFC 6902 patch (YAML or JSON) into its op
+// DecodePatchOps parses an inline RFC 6902 patch (YAML or JSON) into its op
 // list. Each op stays a raw-message map so a present value — including an
 // explicit null, which is valid for add/replace/test — is distinguishable from
 // a missing one.
-func decodePatchOps(patch string) ([]map[string]json.RawMessage, error) {
+func DecodePatchOps(patch string) ([]map[string]json.RawMessage, error) {
 	j, err := yaml.YAMLToJSON([]byte(patch))
 	if err != nil {
 		return nil, fmt.Errorf("patch is not valid YAML/JSON: %w", err)

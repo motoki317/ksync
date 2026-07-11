@@ -79,10 +79,10 @@ type DiffOptions struct {
 // live managed state, and reconcile — then reports one entry per resource a sync
 // would create, update, or prune. Read-only: no apply, no hook execution.
 //
-// The diff engine is the same client-side three-way / structured-merge path
-// sync's own apply-skip checker uses (diff.Diff), so "diff reports X" matches
-// "sync would apply X"; it is not a full server-side-apply diff (see ADR
-// 20260625-diff-command).
+// It routes through the same differ sync's own apply-skip check uses —
+// server-side by default, --client-diff opts out (see ADR
+// 20260625-server-side-diff-default) — so "diff reports X" matches "sync would
+// apply X".
 func (e *Engine) Diff(app string, resources []*unstructured.Unstructured, opts DiffOptions) ([]ResourceDiff, error) {
 	target := StampTracking(app, resources)
 	if opts.Namespace != "" {

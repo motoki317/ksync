@@ -4,6 +4,13 @@ author: "motoki317"
 status: "accepted"
 ---
 
+> **Superseded in part (2026-06-15 / 2026-06-19).** The single required `context` field decided
+> here is now the `allowedContexts` allowlist — see
+> [20260615-allowed-contexts](20260615-allowed-contexts.md) and
+> [20260619-context-auto-select](20260619-context-auto-select.md). The rest of this ADR (app =
+> kustomization directory, explicit app list, name = tracking-label value, `needs` DAG, strict
+> parsing) still holds.
+
 # Context
 
 ksync needs to know which local directories are apps, what to call each app, which cluster it

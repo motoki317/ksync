@@ -60,13 +60,14 @@ re-litigate only with new evidence):
   `build:` repos (local dev tags, never pulled). `--live` also reads running-pod images so
   operator-derived ones absent from the manifests (an ECK Elasticsearch's data image from
   `spec.version`) are covered — the set a cache/pre-pull scopes to (ADR 20260617-images-command).
-  `override.go` resolves **image overrides** (`--image IMAGE=REF`
-  on **sync only**, or `KSYNC_IMAGE_OVERRIDES`): a supplied ref deploys a pre-built image instead of
+  `override.go` resolves **image overrides** (`--image IMAGE=REF` on `sync`, `diff`, and `watch`,
+  or `KSYNC_IMAGE_OVERRIDES`): a supplied ref deploys a pre-built image instead of
   building that `build:` entry — the build (and its `imageLoad`) is skipped and the ref is injected
   at deploy; an override for an image no app builds is dropped with a note. This is what lets a
   wrapper own image resolution and call ksync as the deploy engine (ADR 20260616-image-override).
-  `watch` rejects overrides (it rebuilds from source): no `--image` flag, and a set
-  `KSYNC_IMAGE_OVERRIDES` fails it fast (ADR 20260623-watch-rejects-image-overrides).
+  On `watch` an override has **takeover** semantics: the entry is seeded from the supplied ref on
+  first convergence (like `sync`) but its source stays watched, and the first source edit drops the
+  override and rebuilds (ADR 20260702-watch-image-override-takeover).
 - `internal/config` — ksync.yaml model: app list, `allowedContexts` allowlist (the safety model —
   ksync never reads the host current-context (a shared, host-global setting); `SelectContext`
   auto-targets the **sole** concrete entry, else (≥2 entries, or a single glob) requires `--context`
@@ -99,7 +100,7 @@ re-litigate only with new evidence):
   per-app builds by default** — a bulk command need not be concurrency-safe (a cold `cargo zigbuild`
   races to create its shared wrapper cache → `File exists (os error 17)`, the same class of hazard the
   Loader serializes for), opt out per group with `parallel: true` (ADR 20260630-serialize-build-groups).
-  See ADRs 20260612-build-integration, 20260613-image-load-hook, 20260615-imageload-concurrency,
+  See ADRs 20260612-build-integration, 20260613-image-load-hook, _20260615-imageload-concurrency,
   20260617-imageload-batching, and 20260630-serialize-build-groups.
 - `internal/render` — in-process kustomize (krusty) replicating
   `kustomize build --enable-helm --load-restrictor LoadRestrictionsNone`; byte-parity with the
@@ -237,9 +238,11 @@ re-litigate only with new evidence):
   the dependency chain's deploys, while the deploy stays `needs`-gated and waits on the external gate
   until its own build finishes — so an unbuilt tag is never deployed, and `--max-parallel` now bounds
   builds and deploys with independent budgets (ADR 20260616-eager-build-ahead). An entry in
-  `Options.Overrides` (a supplied image ref) is never built and its sources are not watched — the ref
-  is injected at deploy (ADR 20260616-image-override); the loop still supports this, but the `watch`
-  command no longer populates it — overrides are sync-only (ADR 20260623-watch-rejects-image-overrides).
+  `Options.Overrides` (a supplied image ref) is deployed as-is instead of built (ADR
+  20260616-image-override). Under `sync` the override holds for the whole run — the entry is never
+  built and its sources are not watched; under `watch` it has **takeover** semantics — seeded on
+  first convergence but its source stays watched, and the first source edit drops it and rebuilds
+  (ADR 20260702-watch-image-override-takeover).
   Manifest-only edits
   never invoke docker. By default (interactive TTY, no `-auto`) incremental changes pass through a
   **manual gate** (`Options.Gate`): instead of scheduling, they accumulate into a pending set and,
@@ -254,12 +257,15 @@ re-litigate only with new evidence):
   layer (`watchReporter`) turns it into a committed per-batch **Summary** and a `finished, watching
   for changes` log line (a change merely held/skipped by the gate runs no work, so it never fires).
 - `internal/leakcheck` — the no-leak guard (see Conventions).
-- `docs/ADR/` — dated decision records (`YYYYMMDD-title.md`, template at `_template.md`).
+- `docs/ADR/` — dated decision records (`YYYYMMDD-title.md`, template at `_template.md`). The
+  research context behind the whole project is tracked here too:
+  [why ksync exists / build-vs-buy](docs/ADR/20260612-build-vs-buy-tool-landscape.md) and the
+  [verified ArgoCD semantic contract](docs/argocd-parity.md). Read those before design work; do
+  not re-litigate tool selection without new evidence.
 - `docs/plans/` — gitignored single-session scratch.
-- `HANDOFF.md` — **gitignored, local-only**: the full research context (tool landscape survey
-  with citations, verified semantic contract, architecture sketch, milestone plan). It references
-  private environment details, which is why it is never tracked. If present on this machine,
-  read it before design work; never copy its private references into tracked files.
+- `HANDOFF.md` — **gitignored, local-only**, and no longer load-bearing: if present, it holds only
+  private reference-environment details (specific cluster/repo names). Never copy its private
+  references into tracked files.
 
 ## Build / test
 
@@ -321,7 +327,11 @@ the `release` skill (`.claude/skills/release/SKILL.md`) — this is the summary.
     kubeconfig can't surface (internal product/service names) go in the gitignored `.leakcheck`
     denylist — copy `.leakcheck.example`; one-offs via `KSYNC_LEAKCHECK_EXTRA`. Run
     `just leakcheck` before committing notes or fixtures.
-- ADRs are dated `YYYYMMDD-title.md`; design rationale lives there, not in comments.
+- ADRs are dated `YYYYMMDD-title.md`; design rationale lives there, not in comments. A **fully
+  superseded** ADR is renamed with a leading `_` (`_YYYYMMDD-title.md`), set to `status:
+  superseded`, and opens with a "Superseded by X" note; a **partially** superseded one keeps its
+  name and gets an in-file note. Cite a renamed ADR by its `_` form so the reference resolves. (The
+  undated `_template.md` is the ADR template, not a superseded record.)
 - Code comments explain WHY (non-obvious decisions, hidden constraints) — never WHAT.
 - TDD for pure logic (render orchestration, dirty-set mapping, scheduling); fixture-driven where
   possible.
@@ -331,7 +341,10 @@ the `release` skill (`.claude/skills/release/SKILL.md`) — this is the summary.
 Long-lived, shareable context must be **git-tracked** — but anything referencing the private
 reference environment stays in gitignored local files:
 
-- **`docs/ADR/`** (tracked) — dated decision records.
+- **`docs/ADR/`** (tracked) — dated decision records, including the project's research context
+  ([build-vs-buy](docs/ADR/20260612-build-vs-buy-tool-landscape.md)) and
+  [`docs/argocd-parity.md`](docs/argocd-parity.md) (the verified semantic contract).
 - **git log** (tracked) — the authoritative per-change "what + why".
-- **`HANDOFF.md`** (gitignored) — research context with private references; local-only.
+- **`HANDOFF.md`** (gitignored) — only private reference-environment details; local-only,
+  not load-bearing.
 - **`docs/plans/`** (gitignored) — volatile single-session scratch.

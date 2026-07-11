@@ -7,7 +7,7 @@ status: "accepted"
 # Context
 
 Image overrides (20260616-image-override) let a caller supply a pre-built ref for a `build:`
-entry so ksync deploys it instead of building from source. 20260623-watch-rejects-image-overrides
+entry so ksync deploys it instead of building from source. _20260623-watch-rejects-image-overrides
 then made `watch` refuse them: the `--image` flag was undefined and a set `KSYNC_IMAGE_OVERRIDES`
 failed the command fast.
 
@@ -112,7 +112,7 @@ already taken over is rebuilt on resync, one still overridden is not.)
 
 # Notes
 
-Supersedes 20260623-watch-rejects-image-overrides. The override *parsing and injection* mechanism is
+Supersedes _20260623-watch-rejects-image-overrides. The override *parsing and injection* mechanism is
 unchanged from 20260616-image-override; this ADR changes only what `watch` does with an overridden
 entry after the first deploy (watch its source; take over on edit) and which apps the build scheduler
 must know about (all build-declaring apps, so a takeover can schedule).
