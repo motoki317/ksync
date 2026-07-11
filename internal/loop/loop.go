@@ -32,6 +32,16 @@ import (
 // (genuinely broken, not a rollout in flight); a healthy edit reports 0.
 type SyncStats struct{ Applied, Pruned, Failed, Degraded int }
 
+// Add folds one app's stats into a running total. Callers accumulating across
+// apps use this so a new field is summed in one place, not silently dropped at
+// one of several open-coded sites.
+func (s *SyncStats) Add(o SyncStats) {
+	s.Applied += o.Applied
+	s.Pruned += o.Pruned
+	s.Failed += o.Failed
+	s.Degraded += o.Degraded
+}
+
 // SyncFunc applies one app's rendered objects to the cluster and reports how
 // many changed, were pruned, or failed.
 type SyncFunc func(ctx context.Context, app string, objects []*unstructured.Unstructured) (SyncStats, error)
@@ -674,10 +684,8 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			}
 			buildSched.Finish(r.app, r.ok, time.Now())
 			// A build's .dockerignore may have changed what affects the image.
-			for _, a := range apps {
-				if a.Name == r.app {
-					deriveScopes(a)
-				}
+			if a, ok := byName[r.app]; ok {
+				deriveScopes(a)
 			}
 			refreshWatch()
 		case r := <-deployResults:

@@ -8,7 +8,6 @@ import (
 
 	"sigs.k8s.io/kustomize/api/filters/patchjson6902"
 	"sigs.k8s.io/kustomize/api/resource"
-	"sigs.k8s.io/yaml"
 
 	"github.com/motoki317/ksync/internal/config"
 )
@@ -109,13 +108,9 @@ func targetString(t config.PatchTarget) string {
 // the patch structure or a JSON pointer, and recursing into nested values
 // covers a value that is an object or array.
 func expandPatchValues(patch string, lookup func(string) (string, bool)) (string, error) {
-	j, err := yaml.YAMLToJSON([]byte(patch))
+	ops, err := config.DecodePatchOps(patch)
 	if err != nil {
-		return "", fmt.Errorf("patch is not valid YAML/JSON: %w", err)
-	}
-	var ops []map[string]json.RawMessage
-	if err := json.Unmarshal(j, &ops); err != nil {
-		return "", fmt.Errorf("patch must be a list of RFC 6902 operations: %w", err)
+		return "", err
 	}
 	for _, op := range ops {
 		raw, ok := op["value"]

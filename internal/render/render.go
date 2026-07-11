@@ -136,18 +136,10 @@ func forceLocalImagePullPolicy(objs []*unstructured.Unstructured, images []Image
 		}
 		built[name] = true
 	}
-	// The pod-spec locations of the standard workload kinds (and bare Pods);
-	// jobTemplate covers CronJob.
-	bases := [][]string{
-		{"spec"},
-		{"spec", "template", "spec"},
-		{"spec", "jobTemplate", "spec", "template", "spec"},
-	}
 	for _, obj := range objs {
-		for _, base := range bases {
+		for _, base := range podSpecBases {
 			for _, field := range []string{"containers", "initContainers"} {
-				path := append(append([]string{}, base...), field)
-				pinContainers(obj, path, built)
+				pinContainers(obj, path(base, field), built)
 			}
 		}
 	}
@@ -178,18 +170,27 @@ func pinContainers(obj *unstructured.Unstructured, path []string, built map[stri
 	}
 }
 
-// imageRepo strips the tag and digest from an image reference, leaving the
-// repository (registry/name) that kustomize's image override matches on.
-func imageRepo(ref string) string {
+// splitImageRef splits an image reference into its repository (registry/name)
+// and tag. A trailing @digest is dropped; a ':' starts the tag only when no '/'
+// follows it (otherwise it is a registry port, e.g. localhost:5000/img); tag is
+// "" when the ref carries only a repo or a digest. This is the plain-string
+// split kustomize's image override matches on — deliberately not
+// distribution/reference, which would canonicalize and diverge from that match.
+func splitImageRef(ref string) (repo, tag string) {
 	if at := strings.IndexByte(ref, '@'); at >= 0 {
 		ref = ref[:at]
 	}
-	// A ':' starts the tag only when no '/' follows it (otherwise it is a
-	// registry port, e.g. localhost:5000/img).
 	if c := strings.LastIndexByte(ref, ':'); c >= 0 && !strings.ContainsRune(ref[c:], '/') {
-		ref = ref[:c]
+		return ref[:c], ref[c+1:]
 	}
-	return ref
+	return ref, ""
+}
+
+// imageRepo returns just the repository (registry/name) of an image reference —
+// what kustomize's image override matches on.
+func imageRepo(ref string) string {
+	repo, _ := splitImageRef(ref)
+	return repo
 }
 
 // Renderer renders kustomization directories. It is safe for concurrent use;

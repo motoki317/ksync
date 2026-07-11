@@ -27,14 +27,14 @@ func (g *GroupGate) Run(group string, parallel bool, fn func() error) error {
 	if group == "" || parallel {
 		return fn()
 	}
-	g.lockFor(group).Lock()
-	defer g.lockFor(group).Unlock()
+	m := g.lockFor(group)
+	m.Lock()
+	defer m.Unlock()
 	return fn()
 }
 
-// lockFor returns the mutex guarding group, creating it on first use. The same
-// pointer is returned for a given group for the gate's lifetime, so the Lock in
-// Run and the Unlock in its deferred call operate on one mutex.
+// lockFor returns the mutex guarding group, creating it on first use and
+// memoizing it for the gate's lifetime (so all callers serialize on one mutex).
 func (g *GroupGate) lockFor(group string) *sync.Mutex {
 	g.mu.Lock()
 	defer g.mu.Unlock()

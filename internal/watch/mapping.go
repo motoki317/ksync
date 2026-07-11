@@ -58,22 +58,6 @@ func (m *Mapping) AffectedBy(path string) []string {
 	return affected
 }
 
-// AllRoots returns every distinct root in declaration order — the set of
-// paths a watcher must observe.
-func (m *Mapping) AllRoots() []string {
-	seen := map[string]bool{}
-	var roots []string
-	for _, a := range m.apps {
-		for _, root := range a.Roots {
-			if !seen[root] {
-				seen[root] = true
-				roots = append(roots, root)
-			}
-		}
-	}
-	return roots
-}
-
 // isBelow reports whether path is strictly inside root. Matching must respect
 // path boundaries: /a/b is not a parent of /a/bc.
 func isBelow(root, path string) bool {

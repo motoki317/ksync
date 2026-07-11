@@ -88,14 +88,3 @@ func TestMapping_IgnorePredicateFiltersPaths(t *testing.T) {
 		t.Errorf("AffectedBy = %v, want [api-b-build]", got)
 	}
 }
-
-func TestMapping_AllRoots(t *testing.T) {
-	m := NewMapping([]AppRoots{
-		{App: "shop", Roots: []string{"/repo/apps/shop", "/repo/charts"}},
-		{App: "api-b", Roots: []string{"/repo/apps/api-b", "/repo/charts"}},
-	})
-	got := m.AllRoots()
-	if want := []string{"/repo/apps/shop", "/repo/charts", "/repo/apps/api-b"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("AllRoots = %v, want %v (deduplicated, encounter order)", got, want)
-	}
-}
