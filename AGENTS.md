@@ -15,6 +15,12 @@ a local cluster — with ArgoCD-parity sync semantics and a fast change→applie
 `build` entries extend the loop to source changes: docker build → content-addressed dev tag →
 in-process `images:` injection → sync (M2, ADR 20260612-build-integration).
 
+The tiebreaker when design or docs choices conflict: **easy for human users, straightforward,
+no bloated docs**. Bloat means redundancy (saying one thing many times), not depth a user needs —
+fix the redundancy rather than delete reference content, keep `ksync <cmd> -h` self-sufficient
+and let docs defer flag detail to it, and surface a lean-vs-comprehensive doc fork to the user
+instead of deciding it silently.
+
 Non-negotiable design constraints (each was verified at source level before scaffolding —
 re-litigate only with new evidence):
 
@@ -272,9 +278,17 @@ re-litigate only with new evidence):
 ```bash
 just build       # CGO_ENABLED=0 go build → ./ksync  (the authority)
 just test        # go test ./... (includes internal/leakcheck)
+just test-race   # go test -race ./... — run yourself before pushing concurrency changes
 just check       # gofmt gate + go vet + (advisory) golangci-lint — run before committing Go
 just leakcheck   # the no-leak guard alone
 ```
+
+The race detector is deliberately **CI-only** (`ci.yaml` runs `just test-race`; the local gates —
+`just pre-commit`, `just test` — run plain `go test` to keep commits fast). The blind spot: a
+`-race`-only failure is invisible locally — build, tests, and the commit hook all stay green, and
+only the push fails CI. Before pushing anything touching goroutines, channels, `sync.*`, or
+scheduling, run `just test-race`; for a non-deterministic race, loop the suspect test
+(`go test -race -run TestX -count=500 ./...`) — a single pass proves little.
 
 The flake devShell (`nix develop` / direnv) installs commit-time git hooks: every commit runs
 `just pre-commit` (build, gofmt, vet, go test — each commit must compile and pass), and a second
@@ -330,9 +344,10 @@ the `release` skill (`.claude/skills/release/SKILL.md`) — this is the summary.
 - ADRs are dated `YYYYMMDD-title.md`; design rationale lives there, not in comments. A **fully
   superseded** ADR is renamed with a leading `_` (`_YYYYMMDD-title.md`), set to `status:
   superseded`, and opens with a "Superseded by X" note; a **partially** superseded one keeps its
-  name and gets an in-file note. Cite a renamed ADR by its `_` form so the reference resolves. (The
   undated `_template.md` is the ADR template, not a superseded record.)
-- Code comments explain WHY (non-obvious decisions, hidden constraints) — never WHAT.
+- Code comments explain WHY (non-obvious decisions, hidden constraints) — never WHAT. When
+  cutting comments, the bar is **deletion, not shortening**: delete anything a competent reader
+  can infer from the code, names, keys, or values; only non-inferrable WHY survives.
 - TDD for pure logic (render orchestration, dirty-set mapping, scheduling); fixture-driven where
   possible.
 

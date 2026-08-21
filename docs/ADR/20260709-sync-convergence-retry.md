@@ -117,7 +117,14 @@ terminal and off it.
   is dropped by the strip and re-runs each attempt. Rare in kustomize apps; called out because the
   re-drive makes the exact semantics non-obvious.
 - Render failures stay fail-fast (a render error is almost always the user's own manifest, where
-  instant failure is the right dev-loop UX). `diff` is unchanged. `destroy` is unchanged too, but
+  instant failure is the right dev-loop UX). Field counter-evidence since adoption: in CI, a
+  kustomization that pulls remote content can fail render on pure network transients — a chart
+  repository index lookup hitting transient DNS failure, a chart's `values.schema.json` fetch
+  answered with HTTP 429 — and render precedes the convergence loop, so these still fail the run
+  in one shot. So "almost always the user's own manifest" does not hold for remote-chart renders;
+  if this warrants fixing, the levers are render-side (vendor charts into `chartHome`, vendor or
+  skip schema validation, or a bounded render retry), not widening the convergence loop.
+  `diff` is unchanged. `destroy` is unchanged too, but
   deliberately: it sets `SyncOptions.FailFast`, opting out of the retry so a wedged delete (an
   RBAC-forbidden or webhook-denied prune) surfaces at once instead of retrying for `--timeout` —
   the fail-fast semantics `destroy` documents. Without that opt-out `destroy` would silently inherit
