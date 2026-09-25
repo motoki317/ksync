@@ -15,12 +15,12 @@ import (
 	"github.com/motoki317/ksync/internal/ui"
 )
 
-func runDestroy(path, kctx *string, yes *bool, timeout *time.Duration, names []string) error {
+func runDestroy(path, kctx *string, yes *bool, timeout *time.Duration, names, profiles []string) error {
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
-	apps, err := cfg.Select(names)
+	apps, err := cfg.Select(names, profiles)
 	if err != nil {
 		return err
 	}
@@ -31,8 +31,7 @@ func runDestroy(path, kctx *string, yes *bool, timeout *time.Duration, names []s
 	if !*yes {
 		return fmt.Errorf("destroy deletes every tracked resource of: %s on context %s — re-run with --yes to confirm", strings.Join(appNames(apps), ", "), kubeContext)
 	}
-	// Always echo the scope: a bare `destroy --yes` (no app names) deletes every
-	// app, so the user must see what is about to go and on which cluster.
+	// Echo the scope so the user can see which apps and cluster the delete affects.
 	fmt.Fprintf(os.Stderr, "destroying %d app(s) on context %s: %s\n", len(apps), kubeContext, strings.Join(appNames(apps), ", "))
 	// Dependents go down before their dependencies.
 	apps = config.SortByNeeds(apps)

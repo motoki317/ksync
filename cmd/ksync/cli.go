@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"time"
 
@@ -22,8 +23,7 @@ const (
 	groupTopics   = "topics"
 )
 
-// Shared-flag registrars. Each adds one flag to f and returns its bound pointer,
-// so every command that offers a flag gets identical help and defaults (the help
+// Shared-flag registrars keep identical help and defaults across commands (the help
 // drifted when these were hand-written per command). SortFlags is left off on
 // each command's flag set, so registration order is display order.
 
@@ -37,6 +37,16 @@ func contextFlag(f *pflag.FlagSet) *string {
 	p := new(string)
 	f.StringVar(p, "context", "", "kubectl context to target; must be listed in allowedContexts (default: the sole allowedContexts entry, when exactly one)")
 	return p
+}
+
+func profileFlag(f *pflag.FlagSet) func() []string {
+	profiles := f.StringSliceP("profile", "p", nil, "activate optional apps (repeatable, comma-separated; '*' = every profile; defaults to "+profileEnv+")")
+	return func() []string {
+		if f.Changed("profile") {
+			return normalizeProfiles(*profiles)
+		}
+		return parseProfiles(os.Getenv(profileEnv))
+	}
 }
 
 func maxParallelFlag(f *pflag.FlagSet) *int {
@@ -70,6 +80,7 @@ func pruneFlag(f *pflag.FlagSet) *bool {
 }
 
 func newWatchCmd() *cobra.Command {
+	var profiles func() []string
 	var (
 		path, kctx                             *string
 		prune, auto, verbose, offline, clientD *bool
@@ -84,13 +95,14 @@ func newWatchCmd() *cobra.Command {
 		Example: watchExample,
 		GroupID: groupCommands,
 		RunE: func(_ *cobra.Command, names []string) error {
-			return runWatch(path, kctx, prune, auto, verbose, offline, clientD, debounce, timeout, maxParallel, *images, names)
+			return runWatch(path, kctx, prune, auto, verbose, offline, clientD, debounce, timeout, maxParallel, *images, names, profiles())
 		},
 	}
 	f := cmd.Flags()
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
+	profiles = profileFlag(f)
 	prune = pruneFlag(f)
 	debounce = f.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
 	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
@@ -104,6 +116,7 @@ func newWatchCmd() *cobra.Command {
 }
 
 func newSyncCmd() *cobra.Command {
+	var profiles func() []string
 	var (
 		path, kctx                              *string
 		prune, force, verbose, offline, clientD *bool
@@ -118,13 +131,14 @@ func newSyncCmd() *cobra.Command {
 		Example: syncExample,
 		GroupID: groupCommands,
 		RunE: func(_ *cobra.Command, names []string) error {
-			return runSync(path, kctx, prune, force, verbose, offline, clientD, timeout, maxParallel, *images, names)
+			return runSync(path, kctx, prune, force, verbose, offline, clientD, timeout, maxParallel, *images, names, profiles())
 		},
 	}
 	f := cmd.Flags()
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
+	profiles = profileFlag(f)
 	prune = pruneFlag(f)
 	force = f.Bool("force", false, "re-run hooks even when manifests are unchanged (re-applies PostSync Jobs; a failed hook is retried regardless)")
 	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to converge (retrying failures) before giving up (0 = retry until converged or interrupted)")
@@ -137,6 +151,7 @@ func newSyncCmd() *cobra.Command {
 }
 
 func newDiffCmd() *cobra.Command {
+	var profiles func() []string
 	var (
 		path, kctx           *string
 		prune, offline, cliD *bool
@@ -150,13 +165,14 @@ func newDiffCmd() *cobra.Command {
 		Example: diffExample,
 		GroupID: groupCommands,
 		RunE: func(_ *cobra.Command, names []string) error {
-			return runDiff(path, kctx, prune, offline, cliD, maxParallel, *images, names)
+			return runDiff(path, kctx, prune, offline, cliD, maxParallel, *images, names, profiles())
 		},
 	}
 	f := cmd.Flags()
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
+	profiles = profileFlag(f)
 	prune = f.Bool("prune", true, "show tracked resources a sync would prune (delete)")
 	maxParallel = maxParallelFlag(f)
 	f.Var(images, "image", "diff as if this pre-built image were deployed: IMAGE=REF (repeatable; also via "+overrideEnv+")")
@@ -166,6 +182,7 @@ func newDiffCmd() *cobra.Command {
 }
 
 func newRenderCmd() *cobra.Command {
+	var profiles func() []string
 	var (
 		path, kctx  *string
 		offline     *bool
@@ -178,19 +195,21 @@ func newRenderCmd() *cobra.Command {
 		Example: renderExample,
 		GroupID: groupCommands,
 		RunE: func(_ *cobra.Command, names []string) error {
-			return runRender(path, kctx, offline, maxParallel, names)
+			return runRender(path, kctx, offline, maxParallel, names, profiles())
 		},
 	}
 	f := cmd.Flags()
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
+	profiles = profileFlag(f)
 	maxParallel = maxParallelFlag(f)
 	offline = offlineRenderFlag(f)
 	return cmd
 }
 
 func newImagesCmd() *cobra.Command {
+	var profiles func() []string
 	var (
 		path, kctx    *string
 		live, offline *bool
@@ -203,13 +222,14 @@ func newImagesCmd() *cobra.Command {
 		Example: imagesExample,
 		GroupID: groupCommands,
 		RunE: func(_ *cobra.Command, names []string) error {
-			return runImages(path, kctx, live, offline, maxParallel, names)
+			return runImages(path, kctx, live, offline, maxParallel, names, profiles())
 		},
 	}
 	f := cmd.Flags()
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
+	profiles = profileFlag(f)
 	live = f.Bool("live", false, "also include images of pods in the apps' namespaces (captures operator-derived images, e.g. ECK Elasticsearch, that rendered manifests never name)")
 	maxParallel = maxParallelFlag(f)
 	offline = offlineRenderFlag(f)
@@ -217,6 +237,7 @@ func newImagesCmd() *cobra.Command {
 }
 
 func newDestroyCmd() *cobra.Command {
+	var profiles func() []string
 	var (
 		path, kctx *string
 		yes        *bool
@@ -229,13 +250,14 @@ func newDestroyCmd() *cobra.Command {
 		Example: destroyExample,
 		GroupID: groupCommands,
 		RunE: func(_ *cobra.Command, names []string) error {
-			return runDestroy(path, kctx, yes, timeout, names)
+			return runDestroy(path, kctx, yes, timeout, names, profiles())
 		},
 	}
 	f := cmd.Flags()
 	f.SortFlags = false
 	path = fileFlag(f)
 	kctx = contextFlag(f)
+	profiles = profileFlag(f)
 	yes = f.Bool("yes", false, "confirm deleting every tracked resource of the selected apps")
 	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app's resources to delete (0 = no limit)")
 	return cmd

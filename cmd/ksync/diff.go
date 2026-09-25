@@ -27,12 +27,12 @@ type appDiff struct {
 // runDiff renders each selected app exactly as `sync` would (post-render patches,
 // image overrides, and live build-tag carry-forward) and prints a per-resource
 // unified YAML diff against live cluster state. Read-only: no apply, no build.
-func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *int, images stringSlice, names []string) error {
+func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *int, images stringSlice, names, profiles []string) error {
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
-	apps, err := cfg.Select(names)
+	apps, err := cfg.Select(names, profiles)
 	if err != nil {
 		return err
 	}
