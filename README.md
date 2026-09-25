@@ -1,92 +1,82 @@
-# ksync — local-development sync loop for Kubernetes
+# ksync
 
-ksync is a long-running CLI for developing Kubernetes manifests against a local cluster. It watches
-your `kustomization.yaml` directories and, on every save, renders, diffs, and applies the changed
-app with ArgoCD's sync semantics (helm hooks, sync waves, prune, server-side apply, health gating) —
-optionally rebuilding the image from source first.
+ksync is a sync loop for developing Kubernetes manifests against a local cluster. It watches your
+kustomize directories. When files change, it renders, diffs, and applies the affected app with
+ArgoCD's sync rules: hooks, sync waves, prune, and a wait until resources are Healthy. ksync uses
+server-side apply by default. If an app builds from source, ksync rebuilds its image first.
 
-Think of it as ArgoCD pointed at local files instead of git, or `helmfile apply` as a continuous
-watch loop. It is a development tool only: no server or UI, no production deploys (use a GitOps
-controller), and no file-sync into running containers (use mirrord or Telepresence).
+Think of it as ArgoCD pointed at local files instead of git, or `helmfile apply` in a loop. It is
+for development only: it has no server or UI, and it does not deploy to production. It also does
+not hot-reload code in running pods. mirrord and Telepresence cover that loop by running your
+local process against the cluster.
 
-> **Status: core loop and native builds working.** `watch`, `sync`, `diff`, `render`, `images`,
-> and `destroy` are implemented. Not yet done: exec-plugin (e.g. ksops) rendering and
-> hook-semantics conformance fixtures.
+> **Limitation:** kustomize exec plugins (such as ksops) are not supported yet, so a kustomization
+> that uses one fails to render.
 
 ## Install
 
-- **Nix** (flakes enabled): run it directly with `nix run github:motoki317/ksync -- <command>`, or
-  add it to a project's devShell:
+- **Nix** (flakes): run `nix run github:motoki317/ksync -- <command>`, or add ksync to a
+  project's devShell:
 
   ```nix
   # flake.nix
   inputs.ksync.url = "github:motoki317/ksync";
-  # then, in your devShell's packages:
+  # then add to your devShell's packages:
   #   inputs.ksync.packages.${system}.default
   ```
 
-  Don't set `inputs.ksync.inputs.nixpkgs.follows` — pinning ksync to your nixpkgs rebuilds it from
-  source instead of substituting the prebuilt binary from its cache.
+  Prebuilt binaries are in the `motoki317-ksync` Cachix cache. `nix run` asks you to accept it,
+  and Nix uses it only if you are a trusted user. Nix never applies the cache setting of an
+  input flake, so for a devShell add the cache to your own Nix config (for example,
+  `/etc/nix/nix.conf`):
 
-- **Binary**: download the archive for your platform from the
-  [latest release](https://github.com/motoki317/ksync/releases) and put `ksync` on your `PATH`.
+  ```ini
+  extra-substituters = https://motoki317-ksync.cachix.org
+  extra-trusted-public-keys = motoki317-ksync.cachix.org-1:uDM0RWapTkolNEgkcqQIGpmJc3bumFf+y3RYj50jQA0=
+  ```
 
-`helm` is needed on `PATH` only when a kustomization inflates `helmCharts`; the Nix devShell bundles
-it. `docker` is needed only for apps that build from source. kustomize is built in.
+  Without the cache, Nix builds ksync from source. Do not set
+  `inputs.ksync.inputs.nixpkgs.follows`: it changes ksync's build inputs, so the cached binary no
+  longer matches.
+
+- **Binary**: download the archive for your platform (Linux or macOS, amd64 or arm64) from the
+  [releases page](https://github.com/motoki317/ksync/releases). Put `ksync` on your `PATH`.
+
+kustomize is built in. Two tools are optional: `helm` 3.17 or later on your `PATH` for
+kustomizations that use `helmCharts`, and `docker` for apps that build images from source.
 
 ## Quickstart
 
-A minimal `ksync.yaml` lists a context and one app directory:
+Write a `ksync.yaml` in the directory where you run ksync:
 
 ```yaml
-allowedContexts: [docker-desktop]   # the only context ksync may touch; a sole entry is auto-targeted
+allowedContexts: [docker-desktop]   # the only kubectl context ksync can use
 apps:
   - path: apps/shop                 # a directory with a kustomization.yaml
 ```
 
-Then run the loop:
+Then preview, apply once, and keep watching:
 
 ```bash
-ksync watch   # keep watching; re-render + apply affected apps on save
-ksync sync    # one-shot: converge the cluster to the local files, then exit
+ksync diff    # preview what sync will change
+ksync sync    # apply, wait until Healthy, then exit
+ksync watch   # sync, then sync again when files change
 ```
 
-Apps grow fields as you need them — a default namespace, dependency ordering, image builds:
+On a terminal, `watch` asks before it acts on a change. Run `ksync watch --auto` to skip the
+question.
 
-```yaml
-apps:
-  - name: api-b
-    path: apps/api-b
-    namespace: team-a          # default ns for resources without one
-    needs: [db]                # sync db before api-b
-    build:                     # rebuild + redeploy when the source changes
-      - image: example.com/team-a/api-b
-        context: ../src/api-b
-  - name: db
-    path: apps/postgres
-    namespace: team-a
-```
+## Documentation
 
-The full guide lives in the CLI itself: run **`ksync help`** for the command list and the
-concept guides (`ksync help config`, `builds`, `strategy`, `hooks`, `troubleshooting`), and
-`ksync <command> -h` for a command's flags and examples.
+The CLI help is the full guide. Run `ksync help` for the commands and topics, and
+`ksync <command> -h` for one command's flags. Start with `ksync help config` to write your
+`ksync.yaml`, and `ksync help builds` to build images from source.
 
 ## Development
 
-The dev environment is a Nix flake (`nix develop`, or `direnv` via `.envrc.example`); commands live
-in the [justfile](justfile):
-
-```bash
-just build       # CGO_ENABLED=0 go build → ./ksync
-just test        # go test ./... (includes the leak guard, see AGENTS.md)
-just check       # gofmt gate + go vet + advisory golangci-lint
-```
-
-Commit-time git hooks are installed by the flake devShell: every commit must build and pass tests,
-and the Nix build is verified when a commit touches dependency/flake files.
-
-Agent and contributor conventions live in [AGENTS.md](AGENTS.md); design decisions in
-[docs/ADR/](docs/ADR/).
+Run `nix develop` (or direnv with `.envrc.example`) to get the toolchain and the commit hooks.
+[AGENTS.md](AGENTS.md) is the contributor guide: the repo map, the build and test commands, and
+the conventions. Design decisions are in [docs/ADR/](docs/ADR/).
 
 ## License
 

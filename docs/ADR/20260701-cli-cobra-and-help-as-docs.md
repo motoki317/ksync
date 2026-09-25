@@ -4,6 +4,9 @@ author: "motoki317"
 status: "accepted"
 ---
 
+> **Superseded in part (2026-09-25).** `docs/usage.md` was later deleted instead of kept as a
+> pointer, because the README already points to `ksync help`. The rest of this ADR still holds.
+
 # Context
 
 ksync's help was thin and its user guide lived apart from the binary. The CLI was a hand-rolled
