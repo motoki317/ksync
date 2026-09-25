@@ -1,123 +1,94 @@
 ---
 name: release
 description: >-
-  Use when cutting a ksync release — publishing a new version of the ksync CLI, or when the user
-  says "release X.Y.Z", "tag a release", "ship a new version", or "cut the first release". ksync has
-  ONE release track: pushing a `vX.Y.Z` git tag fires both GoReleaser (GitHub Release) and the cachix
-  pre-build. This skill is the runbook — the pre-flight gates, the exact order, and the traps that
-  leave a release half-published. Reach for it whenever a git tag is about to trigger a public artifact.
+  Use when cutting a ksync release: publishing a new version of the ksync CLI, or when the user
+  says "release X.Y.Z", "tag a release", "ship a new version", or "cut a release". Pushing a
+  `vX.Y.Z` git tag fires both GoReleaser (GitHub Release) and the cachix pre-build. This skill is
+  the runbook: the pre-flight gates, the exact order, and the traps that leave a release
+  half-published. Use it whenever a git tag is about to trigger a public artifact.
 ---
 
 # Cutting a ksync release
 
-ksync has **one release track**, driven by pushing a `vX.Y.Z` git tag. The authoritative summary is
-AGENTS.md "Releases" — read that for the *what*; this skill is the *runbook* for doing it without
-leaving a release half-done. (Contrast kd, which has two tracks; ksync has no chart and no
-`Chart.yaml` version-match gate. Do not copy a chart step from muscle memory.)
+Pushing a `vX.Y.Z` tag starts two workflows, and both must pass.
 
-| Trigger | Workflow | Publishes |
-| --- | --- | --- |
-| `vX.Y.Z` tag push | `.github/workflows/release.yaml` (GoReleaser, `.goreleaser.yaml`) | GitHub Release: linux/darwin × amd64/arm64 tarballs (each with the binary + LICENSE + README) + `checksums.txt` + grouped changelog |
-| the **same** tag push | `.github/workflows/cachix.yaml` | `nix build .#ksync` on x86_64-linux, aarch64-linux, aarch64-darwin → pushed to the `motoki317-ksync` cachix cache, so `nix run github:motoki317/ksync` substitutes the binary |
+| Workflow | Publishes |
+| --- | --- |
+| `.github/workflows/release.yaml` (GoReleaser, `.goreleaser.yaml`) | A GitHub Release: linux/darwin × amd64/arm64 tarballs (binary, LICENSE, README), `checksums.txt`, and the changelog |
+| `.github/workflows/cachix.yaml` | `nix build .#ksync` on x86_64-linux, aarch64-linux, and aarch64-darwin, pushed to the `motoki317-ksync` cachix cache, so that `nix run github:motoki317/ksync` downloads the binary |
 
-**One tag, two workflows. Both must go green** — verifying only the GitHub Release misses a broken
-cachix push (which silently degrades every downstream `nix run`/`nix develop` to a from-source compile).
+## Facts that shape the flow
 
-## Key facts that shape the flow
+- **The tag is the version.** There is no version file to bump. `main.version` in
+  `cmd/ksync/main.go` defaults to `dev`. GoReleaser sets it from the tag
+  (`-X main.version={{ .Version }}`), and the flake sets it from `self.shortRev`.
+- **The two builds print different versions.** The GoReleaser binary's `ksync version` prints
+  `X.Y.Z`. `nix run github:motoki317/ksync/vX.Y.Z -- version` prints the git short revision. This
+  is expected. Do not fix it during a release.
 
-- **The version comes from the tag, NOT a file.** `main.version` (cmd/ksync/main.go) defaults to
-  `"dev"`; GoReleaser stamps it from the tag (`-X main.version={{ .Version }}`) and the flake stamps
-  it from `self.shortRev`. There is **no source version constant to bump** — do not go hunting for
-  one. The tag *is* the version.
-- **Known quirk, not a bug:** the GoReleaser binary's `ksync version` prints `X.Y.Z`, but a
-  `nix run github:motoki317/ksync/vX.Y.Z -- version` build prints the git short-rev (the flake stamps
-  the rev, not the tag). Expected; don't "fix" it mid-release.
-- **The changelog is generated from commits.** `.goreleaser.yaml` `changelog`: scope-aware excludes
-  (`docs`/`test`/`chore`/`ci`, e.g. `^docs(\(.+\))?!?:` so a scoped `docs(readme):` is dropped too),
-  grouped Features/Bug fixes/Performance/Other. So conventional-commit subjects ARE the public release
-  notes — they must read well *before* you tag. `use: github` auto-falls-back to `git` on the first
-  tag (no previous tag to compare); that fallback is normal, not an error.
-- **Tags are lightweight, on the commit you want released.** Annotated vs lightweight is irrelevant
-  to GoReleaser (the changelog is from commits, not the tag message). Match the repo's first release
-  (`v0.1.0`, lightweight).
+## Runbook
 
-## The runbook
-
-1. **Land all the work on `main` first.** Everything that should be in the release must be committed
-   and pushed before any tag — the tag freezes the contents and the changelog range. Confirm
-   `git status` is clean and `git rev-parse HEAD` equals `git rev-parse origin/main`.
-2. **Confirm the latest `main` CI is green** (`gh run list --limit 5`): both `CI` and `cachix` should
-   be `success` on the commit you are about to tag. The tag re-runs cachix from the same commit, so a
-   red cachix on `main` will be red on the tag too.
-3. **Pre-flight gates** (run them — do not assume; this is a public repo and the pipeline is rarely
-   exercised):
-   - `nix develop --accept-flake-config -c just test` — the leak guard lives here. **Never publish a
-     tree leaking a real cluster/namespace/ARN name.** (`just check` is the gofmt+vet gate;
-     golangci-lint there is advisory `|| true` and does not block.)
-   - `nix run nixpkgs#goreleaser -- check` — validates `.goreleaser.yaml`.
-   - **Dry-run the real pipeline against a LOCAL tag.** A local tag is fully reversible; only the
-     *push* is not. The validation splits into build, archives, and changelog because of a quirk
-     below:
+1. **Put every change on `main`, and push it.** The tag freezes the contents and the changelog
+   range. `git status` must be clean, and `git rev-parse HEAD` must equal
+   `git rev-parse origin/main`.
+2. **Check that CI passed on that commit.** Run `gh run list --commit "$(git rev-parse HEAD)"`.
+   Both `CI` and `cachix` must show `success`. The tag runs cachix again on the same commit, so a
+   failed cachix on `main` also fails on the tag.
+3. **Preview the changelog and pick the version.** GoReleaser cannot dry-run the changelog. It
+   asks GitHub to compare the previous tag with the new one, and that fails until the new tag is
+   on GitHub. This command lists every subject that the notes will show:
+   ```bash
+   git log --pretty='%s' "$(git describe --tags --abbrev=0)"..HEAD \
+     | grep -Ev '^(docs|test|chore|ci)(\(.+\))?!?:'
+   ```
+   The notes group `feat`, `fix`, and `perf` subjects under their own headings. Everything else,
+   merge commits included, goes under Other. If the user gave no version, propose one from this
+   list and ask.
+4. **Run every pre-flight gate.** The repo is public and the pipeline runs rarely, so do not skip
+   one.
+   - `nix develop --accept-flake-config -c just test` runs the tests. CI passing is not enough:
+     the leak guard skips in CI, so only this local run catches a leaked cluster, namespace, or
+     ARN name. Never publish a tree that leaks one.
+   - `nix run nixpkgs#goreleaser -- check` catches errors in `.goreleaser.yaml`.
+   - Dry-run the build and the archives against a local tag:
      ```bash
-     git tag vX.Y.Z                         # local only — NOT pushed
-     rm -rf dist
-     # (a) build + version stamp, all 4 targets — stamps X.Y.Z from the local tag:
-     nix run nixpkgs#goreleaser -- build --clean
-     dist/ksync_darwin_arm64_v8.0/ksync version   # host-arch binary → X.Y.Z
-     # (b) archives + checksums — snapshot avoids the changelog compare (synthetic version):
-     nix run nixpkgs#goreleaser -- release --snapshot --skip=publish --clean
-     git tag -d vX.Y.Z                      # remove the local tag before the real push
+     git tag vX.Y.Z                                  # local only, NOT pushed
+     nix run nixpkgs#goreleaser -- build --clean     # all 4 targets, version from the tag
+     dist/ksync_<os>_<arch>*/ksync version           # your host's binary prints X.Y.Z
+     nix run nixpkgs#goreleaser -- release --snapshot --clean   # archives and checksums
+     git tag -d vX.Y.Z                               # delete the local tag
      ```
-     **Why not `goreleaser release --skip=publish` for the dry-run?** That worked for the *first* tag
-     only. With a previous tag present, the `use: github` changelog calls
-     `compare/vPREV...vX.Y.Z`, which **404s** because vX.Y.Z is not on GitHub yet — the dry-run dies
-     before archiving. And `--skip=changelog` is **not** a valid skip option in current GoReleaser
-     (valid: announce, archive, before, nfpm, nix, publish, sbom, sign, validate, …). So the changelog
-     cannot be exercised against a local tag; it generates correctly on the real push (both tags
-     remote). Preview it from git instead — GoReleaser groups Features/Bug fixes/Performance and drops
-     `docs`/`test`/`chore`/`ci` (scope-aware):
-     ```bash
-     for k in feat fix perf; do echo "## $k"; git log --pretty='%s' vPREV..HEAD | grep -E "^$k(\(.+\))?!?:"; done
-     ```
-     If the tree is dirty with a yet-to-commit release change (e.g. a `.goreleaser.yaml` edit), add
-     `--skip=validate` to bypass the clean-tree check for the snapshot run only.
-4. **Push `main`** so the tagged commit exists on the remote: `git push origin main`.
-5. **Create the lightweight tag on HEAD and push it** — *this is the public, hard-to-undo step.*
-   Treat it like any outward-facing publish: do it only when the user has asked for the release (they
-   did if they're invoking this skill); otherwise confirm first.
+     `--snapshot` skips the changelog and publishing. If a step fails, still delete the local
+     tag, or the `git tag` in the next step fails.
+5. **Create the tag on HEAD and push it.** This step is public and hard to undo. If the user did
+   not ask for the release, ask before you push.
    ```bash
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
-6. **Verify BOTH workflows ran green:**
+6. **Check that both workflows passed.**
    ```bash
-   gh run list --limit 5          # both "Release" and "cachix" should appear, triggered by the tag
-   gh run watch <run-id>          # watch each to success
-   gh release view vX.Y.Z         # the GitHub Release exists with the 4 archives + checksums
+   gh run list --commit "$(git rev-parse HEAD)"   # "Release" and "cachix" run for the tag
+   gh run watch <run-id>                          # watch each one until it succeeds
+   gh release view vX.Y.Z                         # the 4 archives and checksums.txt exist
    ```
-   Then prove **both install paths** resolve at the tag:
+   Download an archive from the release and run `ksync version`. It must print `X.Y.Z`.
+7. **Check that the cache holds the binary.** A green cachix run does not prove this. Without
+   the `CACHIX_AUTH_TOKEN` secret, the workflow builds but cannot push, and `nix run` then still
+   works by compiling from source. Query the cache for each system:
    ```bash
-   # binary path: download an archive from the release and run `ksync version` → X.Y.Z
-   nix run github:motoki317/ksync/vX.Y.Z -- version   # nix path → prints the short-rev (see quirk)
+   for sys in x86_64-linux aarch64-linux aarch64-darwin; do
+     p=$(nix eval --raw "github:motoki317/ksync/vX.Y.Z#packages.$sys.ksync.outPath")
+     nix path-info --store https://motoki317-ksync.cachix.org "$p"   # "is not valid" = missing
+   done
    ```
 
 ## Traps that leave a release half-published
 
-- **Verifying only the GitHub Release.** The cachix job is a second workflow on the same tag; a green
-  release with a red cachix means every downstream `nix run` compiles from source. Check both.
-- **Tagging before pushing the commit.** The tag references a commit; if `main` wasn't pushed, the
-  workflow runs against a commit the remote first saw via the tag push. Push `main` first.
-- **Re-tagging a published version.** Don't move a `vX.Y.Z` tag after the release/cache artifacts
-  exist — cut `vX.Y.(Z+1)` instead. Deleting or force-moving a remote tag is an outward-facing action
-  with downstream pull impact; never do it without explicit user direction.
-- **A `docs`/`chore`-only release shows an empty changelog.** Expected — those prefixes are filtered
-  (scope-aware). If the release has user-facing changes, they must have landed as `feat`/`fix`/`perf`,
-  not buried under an excluded prefix.
-- **Assuming the first-release changelog will fail.** It won't: GoReleaser detects "no previous tag"
-  and uses `git` instead of `github`. That log line is normal.
+- **Checking only the GitHub Release.** A failed cachix push does not show there. Then every
+  `nix run` and downstream `nix develop` compiles ksync from source. Do steps 6 and 7.
+- **Moving a published tag.** After the release or cache artifacts exist, cut `vX.Y.(Z+1)`
+  instead. Deleting or moving a remote tag needs the user's explicit direction.
 
-## Updating this skill
-
-If the pipeline changes (a new workflow, a version moves into a file, the changelog config changes),
-update this runbook AND the AGENTS.md "Releases" section together — they are the two operational
-copies and must not drift.
+If the pipeline changes (a new workflow, a version file, a new changelog config), update this
+skill. AGENTS.md only points here.
