@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -126,6 +127,8 @@ type App struct {
 	Namespace string `json:"namespace,omitempty"`
 	// Needs lists apps that must be synced before this one.
 	Needs []string `json:"needs,omitempty"`
+	// Profiles make optional apps selectable without a separate config file.
+	Profiles []string `json:"profiles,omitempty"`
 	// Build lists images built from local sources for this app. When a
 	// build's watched sources change, ksync rebuilds the image and injects
 	// the new tag into the rendered manifests before syncing.
@@ -308,6 +311,8 @@ func (m multiErr) Error() string {
 
 func (m multiErr) Unwrap() []error { return m }
 
+var profileName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+
 // Parse parses and validates a config document. Relative app paths are
 // resolved against baseDir (the config file's directory); defaults (app name
 // from the path basename) are applied. All validation errors are reported
@@ -360,6 +365,16 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 				errs = append(errs, fmt.Errorf("apps[%d] (%s): namespace %q is not a valid namespace name: %s",
 					i, app.Name, app.Namespace, strings.Join(msgs, "; ")))
 			}
+		}
+		profiles := make(map[string]bool, len(app.Profiles))
+		for _, p := range app.Profiles {
+			if !profileName.MatchString(p) {
+				errs = append(errs, fmt.Errorf("apps[%d] (%s): invalid profile %q (must match %s)", i, app.Name, p, profileName))
+			}
+			if profiles[p] {
+				errs = append(errs, fmt.Errorf("apps[%d] (%s): duplicate profile %q; remove the duplicate", i, app.Name, p))
+			}
+			profiles[p] = true
 		}
 		for j, p := range app.Patches {
 			if err := p.Validate(); err != nil {
@@ -556,23 +571,76 @@ func (c *Config) MatchedViaGlob(name string) bool {
 	return false
 }
 
-// Select returns the apps with the given names in request order, or all apps
-// in declaration order when names is empty.
-func (c *Config) Select(names []string) ([]App, error) {
-	if len(names) == 0 {
-		return c.Apps, nil
-	}
+// Select keeps explicit names independent of profiles so targeted operations can
+// act on any app, including a subset of the always-on apps. Profile selection
+// requires every dependency in the set, before a command can touch the cluster.
+func (c *Config) Select(names, profiles []string) ([]App, error) {
 	byName := make(map[string]App, len(c.Apps))
 	for _, app := range c.Apps {
 		byName[app.Name] = app
 	}
-	apps := make([]App, 0, len(names))
-	for _, name := range names {
-		app, ok := byName[name]
-		if !ok {
-			return nil, fmt.Errorf("unknown app %q (not declared in the config)", name)
+	if len(names) > 0 {
+		apps := make([]App, 0, len(names))
+		for _, name := range names {
+			app, ok := byName[name]
+			if !ok {
+				return nil, fmt.Errorf("unknown app %q (not declared in the config)", name)
+			}
+			apps = append(apps, app)
 		}
-		apps = append(apps, app)
+		return apps, nil
+	}
+
+	declared := make(map[string]bool)
+	var available []string
+	for _, app := range c.Apps {
+		for _, p := range app.Profiles {
+			if !declared[p] {
+				declared[p] = true
+				available = append(available, p)
+			}
+		}
+	}
+	slices.Sort(available)
+	active := make(map[string]bool, len(profiles))
+	var errs []error
+	for _, p := range profiles {
+		if active[p] {
+			continue
+		}
+		active[p] = true
+		if p != "*" && !declared[p] {
+			if len(available) == 0 {
+				errs = append(errs, fmt.Errorf("unknown profile %q (no app declares profiles); clear --profile or KSYNC_PROFILES", p))
+			} else {
+				errs = append(errs, fmt.Errorf("unknown profile %q (declared profiles: %s); choose a declared profile with --profile", p, strings.Join(available, ", ")))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return nil, multiErr(errs)
+	}
+
+	var apps []App
+	selected := make(map[string]bool)
+	for _, app := range c.Apps {
+		if len(app.Profiles) == 0 || active["*"] || slices.ContainsFunc(app.Profiles, func(p string) bool { return active[p] }) {
+			apps = append(apps, app)
+			selected[app.Name] = true
+		}
+	}
+	if len(apps) == 0 {
+		return nil, fmt.Errorf("no apps selected: every app is in a profile; activate one with --profile (declared profiles: %s)", strings.Join(available, ", "))
+	}
+	for _, app := range apps {
+		for _, dep := range app.Needs {
+			if !selected[dep] {
+				errs = append(errs, fmt.Errorf("app %q needs %q, which is not selected (its profiles: %s); activate one with --profile", app.Name, dep, strings.Join(byName[dep].Profiles, ", ")))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return nil, multiErr(errs)
 	}
 	return apps, nil
 }

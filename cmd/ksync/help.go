@@ -44,8 +44,8 @@ New to ksync? Read 'ksync help config' to write your ksync.yaml.`
 // the help topics below, linked by name.
 
 const watchLong = `Run the main loop: build and sync every selected app once to converge the cluster, then
-re-render, diff, and apply each app whose files change. With no app names, every app is
-watched.
+re-render, diff, and apply each app whose files change. With no app names, it watches
+apps without profiles plus apps in an active profile (see 'ksync help config').
 
 On an interactive terminal a prompt gates each rebuild after the first convergence:
 Rebuild-all is the default (Enter), Space narrows to a subset, and an empty selection
@@ -58,13 +58,14 @@ first edit rebuilds it and takes over from the supplied ref — the inner loop r
 
 See 'ksync help builds' and 'ksync help strategy'.`
 
-const watchExample = `  ksync watch                # watch and sync every app
+const watchExample = `  ksync watch                # watch and sync selected apps
   ksync watch web api        # only these two apps
   ksync watch --auto         # no prompt; rebuild on every change`
 
-const syncLong = `Build, render, and apply each selected app once, then exit. With no app names, every app
-is synced in needs order. Apps run concurrently, in the order set by needs; an app
-finishes only when its resources are Healthy (up to --timeout).
+const syncLong = `Build, render, and apply each selected app once, then exit. With no app names, it selects
+apps without profiles plus apps in an active profile (see 'ksync help config').
+Apps run concurrently, in the order set by needs; an app finishes only when its resources
+are Healthy (up to --timeout).
 
 On timeout — or if you Ctrl-C a stuck sync — ksync names the still-unhealthy resources
 and dumps their events and pod logs, so a stuck rollout is diagnosable without a separate
@@ -75,7 +76,8 @@ kubectl session.
 See 'ksync help strategy' for the render/diff/apply behavior and 'ksync help hooks' for
 hook and sync-wave ordering.`
 
-const syncExample = `  ksync sync                                  # sync every app once
+const syncExample = `  ksync sync                                  # sync selected apps once
+  ksync sync -p debug                         # also include apps in the debug profile
   ksync sync web                              # just one app
   ksync sync --force                          # re-run hooks even with no manifest change
   ksync sync --image ghcr.io/app/api=pr-42    # deploy tag pr-42 of api instead of building`
@@ -90,7 +92,7 @@ prunes is not shown as drift; --client-diff uses the faster in-process diff inst
 
 See 'ksync help strategy'.`
 
-const diffExample = `  ksync diff             # preview changes for every app
+const diffExample = `  ksync diff             # preview changes for selected apps
   ksync diff web api     # just these apps`
 
 const renderLong = `Print each selected app's rendered manifests (kustomize + helm) to stdout. Read-only and
@@ -114,18 +116,19 @@ are excluded: they are local-only dev tags that are never pulled.
 operator-derived images that the manifests never name (an ECK Elasticsearch data image
 from spec.version).`
 
-const imagesExample = `  ksync images          # images every app deploys
+const imagesExample = `  ksync images          # images selected apps deploy
   ksync images --live   # also include operator-derived running-pod images`
 
 const destroyLong = `Delete every resource ksync tracks (labeled ksync.dev/app) for the selected apps, in
 reverse needs order. It prints its scope and the target context first and requires --yes
 to proceed. Namespaces are never deleted.
 
-With no app names, destroy targets every app — so a bare 'ksync destroy --yes' tears down
-the whole stack.`
+With no app names, it targets apps without profiles plus apps in an active profile
+(see 'ksync help config'). 'ksync destroy -p "*" --yes' tears down every app.`
 
 const destroyExample = `  ksync destroy web --yes    # delete one app's resources
-  ksync destroy --yes        # tear down every app`
+  ksync destroy --yes        # tear down selected apps
+  ksync destroy -p '*' --yes # tear down every app`
 
 // Concept topics. Each is a help-only command: 'ksync <topic>' prints its Long and
 // 'ksync help <topic>' shows the same text. They do no cluster work but carry a Run
@@ -163,6 +166,7 @@ const configTopic = `ksync reads one ksync.yaml from the working directory (use 
   name         app name (default: the directory name).
   namespace    default namespace for resources that set none.
   needs        apps that must be Healthy before this one syncs.
+  profiles     optional groups, for example [debug] (see Profiles below).
   build        images built from local source (ksync help builds).
 
 ## Requirements
@@ -170,6 +174,24 @@ const configTopic = `ksync reads one ksync.yaml from the working directory (use 
   inflates helmCharts (kustomize is built in). docker only when an app builds.
 
 ─── Advanced ──────────────────────────────────────────────
+
+## Profiles
+  Profile names must match [a-zA-Z0-9][a-zA-Z0-9_.-]+ and cannot repeat within an app.
+
+  With no app names, every command selects apps without profiles plus apps that share
+  at least one active profile. --profile/-p activates profiles, repeated or comma-separated:
+  'ksync sync -p debug,metrics'. '-p "*"' selects every app.
+
+  KSYNC_PROFILES supplies a comma-separated default. Both sources trim whitespace and
+  drop empty entries. Any --profile flag replaces that default, even '-p ""' (no active profiles).
+
+  Positional app names select exactly those apps and ignore profiles, even unknown ones.
+  Dependencies outside that set are skipped, with a note on sync. Without app names,
+  an unknown profile, an empty selection, or an unselected needs dependency causes an
+  error. The message names the profiles to activate with --profile.
+
+  A different profile selection never deletes apps it leaves out. Use destroy to
+  delete their resources explicitly.
 
 ## Context selection (the safety gate)
   ksync targets only a listed context and never reads your kubeconfig current-context.

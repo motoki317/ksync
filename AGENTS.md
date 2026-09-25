@@ -50,14 +50,15 @@ re-litigate only with new evidence):
   <topic>` concept pages (config / builds / strategy / hooks / troubleshooting) that make the CLI its
   own user guide — lives in `help.go`. Flags are GNU `--long` (pflag) with `-f`/`-v` shorthands;
   `runX` bodies read pointer-bound flags so the framework swap changed parsing and help, not command
-  logic (ADR 20260701-cli-cobra-and-help-as-docs). `signalContext` is the shared interrupt handler
-  all entry points use: the
-  first Ctrl-C cancels the context (graceful), the second `os.Exit(130)`s — so a non-context-aware
-  step (engine.New's warm-cache LIST, render) can always be force-quit instead of swallowing every
-  signal until it returns (ADR 20260627-double-signal-force-quit). `diff.go` is the **`ksync diff`**
-  command: the read-only preview of `sync` —
-  per-resource unified YAML diff against live, build-tag carry-forward, secret masking (ADR
-  20260625-diff-command). `diff` and `sync`/`watch` default to a **server-side dry-run diff** (the
+  logic (ADR 20260701-cli-cobra-and-help-as-docs). All six app commands accept `--profile`/`-p`
+  with `KSYNC_PROFILES` as the default (ADR 20260925-app-profiles). `signalContext` is the
+  shared interrupt handler all entry points use: the first Ctrl-C cancels the context
+  (graceful), the second `os.Exit(130)`s — so a non-context-aware step (engine.New's warm-cache
+  LIST, render) can always be force-quit instead of swallowing every signal until it returns
+  (ADR 20260627-double-signal-force-quit). `diff.go` is the **`ksync diff`** command: the
+  read-only preview of `sync` — per-resource unified YAML diff against live, build-tag
+  carry-forward, secret masking (ADR 20260625-diff-command).
+  `diff` and `sync`/`watch` default to a **server-side dry-run diff** (the
   apiserver's predicted post-apply object, so a field the cluster defaults or prunes is not seen as
   drift); `--client-diff` opts back into the in-process client-side diff (ADR
   20260625-server-side-diff-default). `images.go` is the **`ksync images`** command: renders the
@@ -74,8 +75,11 @@ re-litigate only with new evidence):
   On `watch` an override has **takeover** semantics: the entry is seeded from the supplied ref on
   first convergence (like `sync`) but its source stays watched, and the first source edit drops the
   override and rebuilds (ADR 20260702-watch-image-override-takeover).
-- `internal/config` — ksync.yaml model: app list, `allowedContexts` allowlist (the safety model —
-  ksync never reads the host current-context (a shared, host-global setting); `SelectContext`
+- `internal/config` — ksync.yaml model: app list with optional `profiles`
+  (`Select(names, profiles)` keeps exact positional selection, otherwise selects unprofiled apps
+  plus active-profile apps and rejects unknown profiles or omitted `needs`), `allowedContexts`
+  allowlist (the safety model — ksync never reads the host current-context (a shared,
+  host-global setting); `SelectContext`
   auto-targets the **sole** concrete entry, else (≥2 entries, or a single glob) requires `--context`
   and fails closed without it; an `--context` must still match an entry; entries are shell-style
   globs (`path.Match`, e.g. `k3s-*` for per-worktree microVMs — always needing `--context`), a plain

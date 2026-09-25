@@ -132,12 +132,12 @@ func renderContext(cfg *config.Config, override string, offline bool) (string, e
 	return resolveContext(cfg, override)
 }
 
-func runRender(path, kctx *string, offline *bool, maxParallel *int, names []string) error {
+func runRender(path, kctx *string, offline *bool, maxParallel *int, names, profiles []string) error {
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
-	apps, err := cfg.Select(names)
+	apps, err := cfg.Select(names, profiles)
 	if err != nil {
 		return err
 	}
@@ -248,12 +248,12 @@ func setupLogging(verbose bool) (app, engineLog logr.Logger) {
 	return app, engineLog
 }
 
-func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *bool, timeout *time.Duration, maxParallel *int, images stringSlice, names []string) error {
+func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *bool, timeout *time.Duration, maxParallel *int, images stringSlice, names, profiles []string) error {
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
-	apps, err := cfg.Select(names)
+	apps, err := cfg.Select(names, profiles)
 	if err != nil {
 		return err
 	}
@@ -434,12 +434,12 @@ func withTimeout(ctx context.Context, d time.Duration) (context.Context, context
 	return context.WithTimeout(ctx, d)
 }
 
-func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *bool, debounce, timeout *time.Duration, maxParallel *int, images stringSlice, names []string) error {
+func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *bool, debounce, timeout *time.Duration, maxParallel *int, images stringSlice, names, profiles []string) error {
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
-	apps, err := cfg.Select(names)
+	apps, err := cfg.Select(names, profiles)
 	if err != nil {
 		return err
 	}

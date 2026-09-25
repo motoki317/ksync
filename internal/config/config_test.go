@@ -3,9 +3,69 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestParse_Profiles(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		profiles string
+		want     []string
+		wantErr  string
+	}{
+		{name: "omitted"},
+		{name: "empty", profiles: "[]"},
+		{name: "valid", profiles: `[debug, metrics, Team_a.v2-0, "12"]`, want: []string{"debug", "metrics", "Team_a.v2-0", "12"}},
+		{name: "leading hyphen", profiles: `[-x]`, wantErr: `invalid profile "-x"`},
+		{name: "space", profiles: `[a b]`, wantErr: `invalid profile "a b"`},
+		{name: "wildcard reserved", profiles: `['*']`, wantErr: `invalid profile "*"`},
+		{name: "single character", profiles: `[a]`, wantErr: `invalid profile "a"`},
+		{name: "empty name", profiles: `['']`, wantErr: `invalid profile ""`},
+		{name: "duplicate", profiles: `[debug, debug]`, wantErr: `duplicate profile "debug"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			yml := "allowedContexts: [dev-cluster]\napps:\n  - path: web\n"
+			if tt.profiles != "" {
+				yml += "    profiles: " + tt.profiles + "\n"
+			}
+			cfg, err := Parse([]byte(yml), "/cfg")
+			if tt.wantErr != "" {
+				want := "apps[0] (web): " + tt.wantErr
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("Parse error = %v, want %q", err, want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(cfg.Apps[0].Profiles, tt.want) {
+				t.Errorf("Profiles = %v, want %v", cfg.Apps[0].Profiles, tt.want)
+			}
+		})
+	}
+}
+
+func TestParse_ProfilesReportsAllErrors(t *testing.T) {
+	_, err := Parse([]byte(`apps:
+  - path: web
+    profiles: ['*', debug, debug]
+  - path: api
+    profiles: [debug, '-x']
+`), "/cfg")
+	for _, want := range []string{
+		"4 problems:", "allowedContexts must list",
+		`apps[0] (web): invalid profile "*"`,
+		`apps[0] (web): duplicate profile "debug"`,
+		`apps[1] (api): invalid profile "-x"`,
+	} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Parse error = %v, want %q", err, want)
+		}
+	}
+}
 
 func TestParse_MinimalConfig(t *testing.T) {
 	yml := `
@@ -917,7 +977,7 @@ func writeApp(t *testing.T, dir, rel string) {
 
 func TestSelect_EmptyNamesMeansAllApps(t *testing.T) {
 	cfg := &Config{Apps: []App{{Name: "db"}, {Name: "api-b"}}}
-	apps, err := cfg.Select(nil)
+	apps, err := cfg.Select(nil, nil)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -928,7 +988,7 @@ func TestSelect_EmptyNamesMeansAllApps(t *testing.T) {
 
 func TestSelect_ReturnsNamedAppsInRequestOrder(t *testing.T) {
 	cfg := &Config{Apps: []App{{Name: "db"}, {Name: "api-b"}, {Name: "shop"}}}
-	apps, err := cfg.Select([]string{"shop", "db"})
+	apps, err := cfg.Select([]string{"shop", "db"}, nil)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -939,9 +999,69 @@ func TestSelect_ReturnsNamedAppsInRequestOrder(t *testing.T) {
 
 func TestSelect_RejectsUnknownName(t *testing.T) {
 	cfg := &Config{Apps: []App{{Name: "db"}}}
-	_, err := cfg.Select([]string{"ghost"})
+	_, err := cfg.Select([]string{"ghost"}, nil)
 	if err == nil || !strings.Contains(err.Error(), `unknown app "ghost"`) {
 		t.Errorf("Select error = %v, want unknown app error", err)
+	}
+}
+
+func TestSelect_Profiles(t *testing.T) {
+	apps := []App{
+		{Name: "web"},
+		{Name: "debug-ui", Profiles: []string{"debug", "tools"}},
+		{Name: "api"},
+		{Name: "metrics", Profiles: []string{"metrics"}, Needs: []string{"debug-ui"}},
+	}
+	for _, tt := range []struct {
+		name                  string
+		apps                  []App
+		names, profiles, want []string
+		wantErr               string
+	}{
+		{name: "legacy config", apps: []App{{Name: "web"}, {Name: "api"}}, want: []string{"web", "api"}},
+		{name: "default", apps: apps, want: []string{"web", "api"}},
+		{name: "one profile", apps: apps, profiles: []string{"debug"}, want: []string{"web", "debug-ui", "api"}},
+		{name: "any matching profile", apps: apps, profiles: []string{"tools"}, want: []string{"web", "debug-ui", "api"}},
+		{name: "multiple union in declaration order", apps: apps, profiles: []string{"metrics", "debug"}, want: []string{"web", "debug-ui", "api", "metrics"}},
+		{name: "overlap and repeated profile", apps: apps, profiles: []string{"tools", "debug", "debug"}, want: []string{"web", "debug-ui", "api"}},
+		{name: "wildcard", apps: apps, profiles: []string{"*"}, want: []string{"web", "debug-ui", "api", "metrics"}},
+		{name: "wildcard without profiles", apps: []App{{Name: "web"}}, profiles: []string{"*"}, want: []string{"web"}},
+		{name: "explicit profiled app skips needs", apps: apps, names: []string{"metrics"}, want: []string{"metrics"}},
+		{name: "explicit order ignores unknown profiles", apps: apps, names: []string{"metrics", "web"}, profiles: []string{"nope", "*"}, want: []string{"metrics", "web"}},
+		{name: "explicit subset of always on", apps: apps, names: []string{"api"}, profiles: []string{"debug"}, want: []string{"api"}},
+		{name: "explicit unknown app", apps: apps, names: []string{"nope"}, profiles: []string{"nope"}, wantErr: `unknown app "nope" (not declared in the config)`},
+		{name: "unknown profile", apps: apps, profiles: []string{"nope"}, wantErr: `unknown profile "nope" (declared profiles: debug, metrics, tools); choose a declared profile with --profile`},
+		{name: "unknown profile without declarations", apps: []App{{Name: "web"}}, profiles: []string{"nope"}, wantErr: `unknown profile "nope" (no app declares profiles); clear --profile or KSYNC_PROFILES`},
+		{name: "wildcard does not hide unknown profile", apps: apps, profiles: []string{"*", "nope"}, wantErr: `unknown profile "nope" (declared profiles: debug, metrics, tools); choose a declared profile with --profile`},
+		{name: "all unknown profiles", apps: apps, profiles: []string{"nope", "missing"}, wantErr: "2 problems:\n  - unknown profile \"nope\" (declared profiles: debug, metrics, tools); choose a declared profile with --profile\n  - unknown profile \"missing\" (declared profiles: debug, metrics, tools); choose a declared profile with --profile"},
+		{name: "empty selection", apps: []App{{Name: "debug-ui", Profiles: []string{"debug"}}}, wantErr: `no apps selected: every app is in a profile; activate one with --profile (declared profiles: debug)`},
+		{name: "missing dependency", apps: apps, profiles: []string{"metrics"}, wantErr: `app "metrics" needs "debug-ui", which is not selected (its profiles: debug, tools); activate one with --profile`},
+		{name: "multiple needs violations in declaration order", apps: []App{
+			{Name: "web", Needs: []string{"db", "api"}},
+			{Name: "metrics", Needs: []string{"api"}},
+			{Name: "db", Profiles: []string{"data"}},
+			{Name: "api", Profiles: []string{"debug", "tools"}},
+		}, wantErr: "3 problems:\n  - app \"web\" needs \"db\", which is not selected (its profiles: data); activate one with --profile\n  - app \"web\" needs \"api\", which is not selected (its profiles: debug, tools); activate one with --profile\n  - app \"metrics\" needs \"api\", which is not selected (its profiles: debug, tools); activate one with --profile"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{Apps: tt.apps}
+			got, err := cfg.Select(tt.names, tt.profiles)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("Select error = %v, want %s", err, tt.wantErr)
+				}
+				if len(got) != 0 {
+					t.Errorf("Select returned apps on error: %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameOrder(got, tt.want...) {
+				t.Errorf("Select = %v, want %v", names(got), tt.want)
+			}
+		})
 	}
 }
 
