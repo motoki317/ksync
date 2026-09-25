@@ -1,63 +1,57 @@
 # Sync-failure diagnostic fixtures
 
-Manifests that each induce one distinct "stuck / unhealthy" failure mode, for
-eyeballing the diagnostic block `ksync sync` prints when an app does not become
-healthy before its `--timeout` (`engine.Diagnose`, ADR
-20260627-actionable-diagnostics). They need a live local cluster, so they are
-**not** run by `go test` — the pure formatter and dedup/filter logic are
-unit-tested in [`internal/engine/diagnose_test.go`](../../internal/engine/diagnose_test.go).
-These fixtures are the manual counterpart: regenerate them after touching the
-diagnostics to confirm the real output stays actionable.
+Each app here fails in one distinct way and never becomes Healthy. They show the diagnostic block
+that `ksync sync` prints for a stuck app (ADR 20260627-actionable-diagnostics).
+`go test` does not run them, because they need a live local cluster. The unit tests in
+[`internal/engine/diagnose_test.go`](../../internal/engine/diagnose_test.go) cover the formatter,
+the filters, and the dedup. After you change `engine.Diagnose` (`internal/engine/diagnose.go`) or
+`cmd/ksync/diagnostics.go`, run these fixtures to check that the real output still says what to
+fix.
 
 ## Run
 
-`ksync.yaml` targets the `docker-desktop` context; edit `allowedContexts` for a
-different local cluster. A short timeout makes each app give up quickly:
+`ksync.yaml` targets the `docker-desktop` context. For another local cluster, put its context in
+`allowedContexts`, but do not commit that edit. The leak check scans the working tree and fails
+every commit while the edit is there, so revert it after the run
+(`git checkout -- testdata/diagnostics/ksync.yaml`). A short `--timeout`
+makes each app give up quickly. Run from the repo root:
 
 ```bash
-ksync build   # or use a prebuilt ./ksync
-./ksync sync crashloop -f testdata/diagnostics/ksync.yaml -timeout 30s
+just build
+./ksync sync crashloop -f testdata/diagnostics/ksync.yaml --timeout 30s
 ```
 
-Run a single scenario by name, or several at once. Clean up afterwards:
+Name one scenario, several, or none to run all ten. Each scenario runs in the namespace
+`diag-<scenario>`. `destroy` deletes the resources but leaves the namespace, so delete it too:
 
 ```bash
-./ksync destroy crashloop -f testdata/diagnostics/ksync.yaml -yes
-# or: kubectl delete ns -l '' $(kubectl get ns -o name | grep diag-)
+./ksync destroy crashloop -f testdata/diagnostics/ksync.yaml --yes
+kubectl --context <context> delete namespace diag-crashloop   # the context in allowedContexts
 ```
 
 ## Scenarios
 
-Each exercises a different path through the formatter; the right-hand column is
-the actionable signal the dump must surface.
+The right column is the signal that the dump must show.
 
 | Scenario | Failure mode | Diagnostic signal |
 |----------|--------------|-------------------|
-| `crashloop` | container exits 1 immediately, 3 replicas | `Waiting (CrashLoopBackOff); last: Terminated (Error, exit 1)`, the FATAL log, **3 replicas collapsed to one** `(+2 more identical)` |
-| `badimage` | unresolvable image | `Waiting (ImagePullBackOff)` + the single most-informative pull error (`no such host`), the three redundant `Failed` events deduped to one |
-| `unschedulable` | impossible memory request | pod has no container state — the `FailedScheduling` event is the sole signal |
-| `badconfig` | `envFrom` a missing secret | `Waiting (CreateContainerConfigError)` + `secret "missing-secret" not found` |
-| `readiness` | readiness probe to a closed port | `Running (not ready)` + `Unhealthy: Readiness probe failed` |
-| `oom` | allocate past a 32Mi limit | exit 137 surfaced via last-termination (a real containerd/k3s reports `OOMKilled`; docker-desktop reports `Error, exit 137`) |
-| `jobfail` | a `Job` that exits 2 | `Job ... reached the specified backoff limit` + the pod's `Terminated (Error, exit 2)` and migration error log |
-| `initfail` | a failing init container | `init migrate: Waiting (CrashLoopBackOff); last: ...` + the **init container's** log, not the blocked app's empty one |
-| `multicontainer` | one of two containers fails | both container states shown, the failing `sidecar`'s log tailed (not the healthy `web`) |
-| `quota` | a `ResourceQuota` blocks pod creation | no pod exists, so the signal is the **ReplicaSet's** `FailedCreate: exceeded quota` — the "no child pod" class, gathered from the intermediate controller |
+| `crashloop` | container exits 1 at once, 3 replicas | `Waiting (CrashLoopBackOff); last: Terminated (Error, exit 1)`, the FATAL log line, and one pod for all 3 replicas: `(+2 more identical)` |
+| `badimage` | image cannot resolve | `Waiting (ImagePullBackOff)` and one pull error (`no such host`), not three `Failed` events |
+| `unschedulable` | impossible memory request | only the `FailedScheduling` event, because the pod has no container state |
+| `badconfig` | `envFrom` a missing secret | `Waiting (CreateContainerConfigError)` and `secret "missing-secret" not found` |
+| `readiness` | readiness probe to a closed port | `Running (not ready, restarts 0)` and `Unhealthy: Readiness probe failed` |
+| `oom` | allocates past a 32Mi limit | exit 137 in the last termination: `OOMKilled` on a containerd cluster such as k3s, `Error, exit 137` on Docker Desktop |
+| `jobfail` | a `Job` that exits 2 | `Job ... reached the specified backoff limit`, the pod's `Terminated (Error, exit 2)`, and the migration error log |
+| `initfail` | an init container fails | `init migrate: Waiting (CrashLoopBackOff); last: ...` and the **init container's** log, not the blocked app container's empty log |
+| `multicontainer` | one of two containers fails | both container states, and the log of the failing `sidecar`, not the working `web` |
+| `quota` | a `ResourceQuota` blocks pod creation | no pod exists, so the signal is the **ReplicaSet's** `FailedCreate: exceeded quota` |
 
-## What "actionable, not bloated" means here
+## What the dump keeps and drops
 
-- Normal events (`Scheduled`, `Pulled`, `Started`) and the redundant `BackOff`
-  event are dropped — the container state and logs already carry the story.
-- Identical replica failures collapse to one representative with a count.
-- One log stream per pod (the previous run for a crashed container, else the
-  current), with the kubelet "unable to retrieve container logs" placeholder
-  filtered out.
-- Child resources are walked: pods carry the usual signal, but an intermediate
-  controller (a ReplicaSet) is shown when it holds a warning the pods cannot — a
-  `FailedCreate` when no pod could be created at all (see `quota`). A controller
-  whose pods came up fine emits only Normal events and stays out of the dump.
-- A Ctrl-C of a one-shot `sync` is reported as `interrupted` (exit 130) but still
-  prints the same dump for each app that was stuck — aborting a wedged sync is the
-  usual way the failure is seen — gathered on a fresh context, never the cancelled
-  one (which would read back only `context canceled`). A real timeout dumps the same
-  way. `watch` does not dump on Ctrl-C: there it is a routine quit.
+- It drops Normal events (`Scheduled`, `Pulled`, `Started`) and the redundant `BackOff` warning.
+- Each pod gets one log stream: the previous run for a crashed container, otherwise the current
+  one. The kubelet placeholder "unable to retrieve container logs" is filtered out.
+- Ctrl-C on a one-shot `sync` exits with `interrupted` (exit 130). It still prints the dump for
+  each stuck app, the same as a timeout does. The dump reads the cluster on a fresh context, so a
+  dump that shows only `context canceled` is a bug. `watch` prints no dump on Ctrl-C, because
+  there Ctrl-C is a normal quit.
