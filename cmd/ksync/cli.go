@@ -29,18 +29,18 @@ const (
 
 func fileFlag(f *pflag.FlagSet) *string {
 	p := new(string)
-	f.StringVarP(p, "file", "f", "ksync.yaml", "path to the ksync config file")
+	f.StringVarP(p, "file", "f", "ksync.yaml", "path to the config file")
 	return p
 }
 
 func contextFlag(f *pflag.FlagSet) *string {
 	p := new(string)
-	f.StringVar(p, "context", "", "kubectl context to target; must be listed in allowedContexts (default: the sole allowedContexts entry, when exactly one)")
+	f.StringVar(p, "context", "", "kubectl context to use, must match allowedContexts\n(optional if allowedContexts has one non-glob entry)")
 	return p
 }
 
 func profileFlag(f *pflag.FlagSet) func() []string {
-	profiles := f.StringSliceP("profile", "p", nil, "activate optional apps (repeatable, comma-separated; '*' = every profile; defaults to "+profileEnv+")")
+	profiles := f.StringSliceP("profile", "p", nil, "also select apps in these profiles, '*' for all\n(repeatable or comma-separated, default "+profileEnv+")")
 	return func() []string {
 		if f.Changed("profile") {
 			return normalizeProfiles(*profiles)
@@ -51,31 +51,31 @@ func profileFlag(f *pflag.FlagSet) func() []string {
 
 func maxParallelFlag(f *pflag.FlagSet) *int {
 	p := new(int)
-	f.IntVar(p, "max-parallel", runtime.NumCPU(), "how many apps to process concurrently (0 = no limit)")
+	f.IntVar(p, "max-parallel", runtime.NumCPU(), "apps to process at once (0 = no limit)")
 	return p
 }
 
 func offlineRenderFlag(f *pflag.FlagSet) *bool {
 	p := new(bool)
-	f.BoolVar(p, "offline-render", false, "render helm charts without live-cluster lookup (charts using helm lookup will not resolve)")
+	f.BoolVar(p, "offline-render", false, "render helm charts without the cluster (no lookup)")
 	return p
 }
 
 func clientDiffFlag(f *pflag.FlagSet) *bool {
 	p := new(bool)
-	f.BoolVar(p, "client-diff", false, "decide the apply set with the in-process (client-side) diff instead of a server-side dry-run apply; faster, but fields the cluster defaults or prunes are re-applied every sync")
+	f.BoolVar(p, "client-diff", false, "diff in-process, not by a dry-run apply on the server\n(faster, but re-applies fields the apiserver changes)")
 	return p
 }
 
 func verboseFlag(f *pflag.FlagSet) *bool {
 	p := new(bool)
-	f.BoolVarP(p, "verbose", "v", false, "also log per-change tracing")
+	f.BoolVarP(p, "verbose", "v", false, "print debug logs")
 	return p
 }
 
 func pruneFlag(f *pflag.FlagSet) *bool {
 	p := new(bool)
-	f.BoolVar(p, "prune", true, "delete tracked resources missing from the rendered output")
+	f.BoolVar(p, "prune", true, "delete tracked resources no longer rendered")
 	return p
 }
 
@@ -90,7 +90,7 @@ func newWatchCmd() *cobra.Command {
 	images := new(stringSlice)
 	cmd := &cobra.Command{
 		Use:     "watch [app...]",
-		Short:   "watch app directories and sync affected apps on change (the main loop)",
+		Short:   "sync, then sync again on every change (the main loop)",
 		Long:    watchLong,
 		Example: watchExample,
 		GroupID: groupCommands,
@@ -104,11 +104,11 @@ func newWatchCmd() *cobra.Command {
 	kctx = contextFlag(f)
 	profiles = profileFlag(f)
 	prune = pruneFlag(f)
-	debounce = f.Duration("debounce", 200*time.Millisecond, "quiet period after the last change before re-rendering")
-	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app to converge before retrying (0 = no limit)")
+	debounce = f.Duration("debounce", 200*time.Millisecond, "how long files must be quiet before a sync")
+	timeout = f.Duration("timeout", defaultSyncTimeout, "time limit for each app's sync (0 = no limit)")
 	maxParallel = maxParallelFlag(f)
-	f.Var(images, "image", "seed a pre-built image instead of building it, until its source changes: IMAGE=REF (repeatable; also via "+overrideEnv+")")
-	auto = f.Bool("auto", false, "rebuild and redeploy automatically on every change, skipping the confirmation prompt")
+	f.Var(images, "image", "deploy REF instead of building IMAGE until its source\nchanges (repeatable, or set "+overrideEnv+")")
+	auto = f.Bool("auto", false, "act on every change without asking")
 	offline = offlineRenderFlag(f)
 	clientD = clientDiffFlag(f)
 	verbose = verboseFlag(f)
@@ -126,7 +126,7 @@ func newSyncCmd() *cobra.Command {
 	images := new(stringSlice)
 	cmd := &cobra.Command{
 		Use:     "sync [app...]",
-		Short:   "render and sync the given apps once, then exit",
+		Short:   "sync the selected apps once, then exit",
 		Long:    syncLong,
 		Example: syncExample,
 		GroupID: groupCommands,
@@ -140,10 +140,10 @@ func newSyncCmd() *cobra.Command {
 	kctx = contextFlag(f)
 	profiles = profileFlag(f)
 	prune = pruneFlag(f)
-	force = f.Bool("force", false, "re-run hooks even when manifests are unchanged (re-applies PostSync Jobs; a failed hook is retried regardless)")
-	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to converge (retrying failures) before giving up (0 = retry until converged or interrupted)")
+	force = f.Bool("force", false, "run all hooks again, even with no manifest change")
+	timeout = f.Duration("timeout", defaultSyncTimeout, "time limit for each app's sync (0 = no limit)")
 	maxParallel = maxParallelFlag(f)
-	f.Var(images, "image", "deploy a pre-built image instead of building it: IMAGE=REF (repeatable; also via "+overrideEnv+")")
+	f.Var(images, "image", "deploy REF instead of building IMAGE\n(repeatable, or set "+overrideEnv+")")
 	offline = offlineRenderFlag(f)
 	clientD = clientDiffFlag(f)
 	verbose = verboseFlag(f)
@@ -160,7 +160,7 @@ func newDiffCmd() *cobra.Command {
 	images := new(stringSlice)
 	cmd := &cobra.Command{
 		Use:     "diff [app...]",
-		Short:   "show what a sync would change against live cluster state",
+		Short:   "preview what a sync changes in the cluster",
 		Long:    diffLong,
 		Example: diffExample,
 		GroupID: groupCommands,
@@ -173,11 +173,11 @@ func newDiffCmd() *cobra.Command {
 	path = fileFlag(f)
 	kctx = contextFlag(f)
 	profiles = profileFlag(f)
-	prune = f.Bool("prune", true, "show tracked resources a sync would prune (delete)")
+	prune = f.Bool("prune", true, "show the tracked resources that a sync deletes")
 	maxParallel = maxParallelFlag(f)
-	f.Var(images, "image", "diff as if this pre-built image were deployed: IMAGE=REF (repeatable; also via "+overrideEnv+")")
+	f.Var(images, "image", "use REF instead of a build of IMAGE\n(repeatable, or set "+overrideEnv+")")
 	offline = offlineRenderFlag(f)
-	cliD = f.Bool("client-diff", false, "diff in-process (client-side) instead of via a server-side dry-run apply; faster, but fields the cluster defaults or prunes can show as drift")
+	cliD = f.Bool("client-diff", false, "diff in-process, not by a dry-run apply on the server\n(faster, but fields the apiserver changes show as drift)")
 	return cmd
 }
 
@@ -190,7 +190,7 @@ func newRenderCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:     "render [app...]",
-		Short:   "render the given apps' manifests to stdout",
+		Short:   "print the rendered manifests of the selected apps",
 		Long:    renderLong,
 		Example: renderExample,
 		GroupID: groupCommands,
@@ -217,7 +217,7 @@ func newImagesCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:     "images [app...]",
-		Short:   "list the container images the given apps deploy",
+		Short:   "list the images that the selected apps deploy",
 		Long:    imagesLong,
 		Example: imagesExample,
 		GroupID: groupCommands,
@@ -230,7 +230,7 @@ func newImagesCmd() *cobra.Command {
 	path = fileFlag(f)
 	kctx = contextFlag(f)
 	profiles = profileFlag(f)
-	live = f.Bool("live", false, "also include images of pods in the apps' namespaces (captures operator-derived images, e.g. ECK Elasticsearch, that rendered manifests never name)")
+	live = f.Bool("live", false, "also list the images of pods in the app namespaces")
 	maxParallel = maxParallelFlag(f)
 	offline = offlineRenderFlag(f)
 	return cmd
@@ -245,7 +245,7 @@ func newDestroyCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:     "destroy [app...]",
-		Short:   "delete all tracked resources of the given apps",
+		Short:   "delete every tracked resource of the selected apps",
 		Long:    destroyLong,
 		Example: destroyExample,
 		GroupID: groupCommands,
@@ -258,8 +258,8 @@ func newDestroyCmd() *cobra.Command {
 	path = fileFlag(f)
 	kctx = contextFlag(f)
 	profiles = profileFlag(f)
-	yes = f.Bool("yes", false, "confirm deleting every tracked resource of the selected apps")
-	timeout = f.Duration("timeout", defaultSyncTimeout, "max time to wait for one app's resources to delete (0 = no limit)")
+	yes = f.Bool("yes", false, "confirm the delete (without it, destroy only prints)")
+	timeout = f.Duration("timeout", defaultSyncTimeout, "time limit to delete each app (0 = no limit)")
 	return cmd
 }
 
@@ -303,7 +303,7 @@ func newRootCmd() *cobra.Command {
 	root.Flags().BoolP("version", "V", false, "print the ksync version")
 	root.AddGroup(
 		&cobra.Group{ID: groupCommands, Title: "Commands:"},
-		&cobra.Group{ID: groupTopics, Title: "Concept guides (run 'ksync <topic>' or 'ksync help <topic>'):"},
+		&cobra.Group{ID: groupTopics, Title: "Concept guides (run 'ksync help <topic>'):"},
 	)
 	root.AddCommand(
 		newWatchCmd(),
