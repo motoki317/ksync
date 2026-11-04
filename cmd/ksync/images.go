@@ -27,10 +27,9 @@ import (
 // normalization containerd applies — so the output matches the cluster image
 // store exactly and a consumer can do plain set membership without re-parsing.
 //
-// Images ksync builds locally (any `build:` entry's image) are excluded: those
-// are content-addressed dev tags that live only in the local store and are never
-// pulled, so caching them is pointless. With --live, images of pods in the apps'
-// namespaces are added too, which is how operator-derived images (an ECK
+// Images the app or its direct needs build are excluded: dev tags and manifest
+// placeholders cannot be pulled from a registry. With --live, images of pods in
+// the apps' namespaces are added too, which is how operator-derived images (an ECK
 // Elasticsearch data image named only by spec.version) get covered.
 func runImages(path, kctx *string, live, offline *bool, maxParallel *int, names, profiles []string) error {
 	cfg, err := config.Load(*path)
@@ -48,10 +47,7 @@ func runImages(path, kctx *string, live, offline *bool, maxParallel *int, names,
 		return err
 	}
 
-	// Exclude every image any app builds (not just the selected ones): a built
-	// image is a local-only dev tag, never something to cache, wherever it appears.
-	built := builtRepos(cfg)
-	images := newImageSet(built)
+	images := newImageSet(nil)
 
 	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
@@ -83,7 +79,7 @@ func runImages(path, kctx *string, live, offline *bool, maxParallel *int, names,
 		for n := range ns {
 			nsList = append(nsList, n)
 		}
-		return appResult{refs: res.Images(), namespaces: nsList}, nil
+		return appResult{refs: appImageRefs(cfg, app, res.Images()), namespaces: nsList}, nil
 	})
 	if err != nil {
 		return err
@@ -101,7 +97,7 @@ func runImages(path, kctx *string, live, offline *bool, maxParallel *int, names,
 	if *live {
 		ctx, stop := signalContext()
 		defer stop()
-		if err := addLiveImages(ctx, kubeContext, namespaces, images); err != nil {
+		if err := addLiveImages(ctx, kubeContext, namespaces, cfg, images); err != nil {
 			return err
 		}
 	}
@@ -114,16 +110,38 @@ func runImages(path, kctx *string, live, offline *bool, maxParallel *int, names,
 	return nil
 }
 
+func appImageRefs(cfg *config.Config, app config.App, refs []string) []string {
+	images := newImageSet(appBuiltRepos(app, cfg.NeededBuilds(app)))
+	for _, ref := range refs {
+		images.add(ref)
+	}
+	return images.sorted()
+}
+
 // builtRepos is the set of canonical repositories ksync builds locally, used to
-// drop them from the image list.
+// drop them from live pod images.
 func builtRepos(cfg *config.Config) map[string]bool {
 	built := make(map[string]bool)
 	for _, a := range cfg.Apps {
-		for _, b := range a.Build {
-			if repo, _, ok := normalizeRef(b.Image); ok {
-				built[repo] = true
-			}
+		for repo := range appBuiltRepos(a, nil) {
+			built[repo] = true
 		}
+	}
+	return built
+}
+
+func appBuiltRepos(app config.App, needed []config.BuildRef) map[string]bool {
+	built := make(map[string]bool)
+	add := func(image string) {
+		if repo, _, ok := normalizeRef(image); ok {
+			built[repo] = true
+		}
+	}
+	for _, b := range app.Build {
+		add(b.Image)
+	}
+	for _, ref := range needed {
+		add(ref.Image)
 	}
 	return built
 }
@@ -148,12 +166,12 @@ func collectNamespaces(into map[string]struct{}, objs []*unstructured.Unstructur
 // namespaces. This catches images no manifest names because a controller
 // creates the pod (an ECK operator materializing an Elasticsearch's data image
 // from spec.version) — exactly the ones a render-only list misses.
-func addLiveImages(ctx context.Context, kubeContext string, namespaces map[string]struct{}, images *imageSet) error {
-	cfg, err := engine.RESTConfig(kubeContext)
+func addLiveImages(ctx context.Context, kubeContext string, namespaces map[string]struct{}, cfg *config.Config, images *imageSet) error {
+	restCfg, err := engine.RESTConfig(kubeContext)
 	if err != nil {
 		return err
 	}
-	client, err := kubernetes.NewForConfig(cfg)
+	client, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		return fmt.Errorf("building kubernetes client: %w", err)
 	}
@@ -162,30 +180,35 @@ func addLiveImages(ctx context.Context, kubeContext string, namespaces map[strin
 		if err != nil {
 			return fmt.Errorf("listing pods in %s: %w", ns, err)
 		}
-		for i := range pods.Items {
-			addPodImages(images, &pods.Items[i])
-		}
+		addPodImages(images, cfg, pods.Items)
 	}
 	return nil
 }
 
-// addPodImages adds every container image declared on a pod (the spec refs are
+// addPodImages adds every pullable container image declared on pods (the spec refs are
 // stable and canonicalizable, unlike the status refs which a runtime may pin to
 // a digest).
-func addPodImages(images *imageSet, pod *corev1.Pod) {
-	for _, c := range pod.Spec.InitContainers {
-		images.add(c.Image)
+func addPodImages(images *imageSet, cfg *config.Config, pods []corev1.Pod) {
+	// Pod queries cover namespaces rather than apps, so their build filter stays global.
+	live := newImageSet(builtRepos(cfg))
+	for _, pod := range pods {
+		for _, c := range pod.Spec.InitContainers {
+			live.add(c.Image)
+		}
+		for _, c := range pod.Spec.Containers {
+			live.add(c.Image)
+		}
+		for _, c := range pod.Spec.EphemeralContainers {
+			live.add(c.Image)
+		}
 	}
-	for _, c := range pod.Spec.Containers {
-		images.add(c.Image)
-	}
-	for _, c := range pod.Spec.EphemeralContainers {
-		images.add(c.Image)
+	for _, ref := range live.sorted() {
+		images.add(ref)
 	}
 }
 
 // imageSet accumulates canonical image references, dropping unparseable refs and
-// any whose repository ksync builds locally.
+// repositories in its build filter.
 type imageSet struct {
 	built map[string]bool
 	refs  map[string]struct{}
