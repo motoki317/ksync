@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
 	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/engine"
 	"github.com/motoki317/ksync/internal/render"
@@ -98,12 +100,70 @@ func TestDiffImages(t *testing.T) {
 				selected[app.Name] = true
 			}
 			app := apps[0]
-			supplied, repos := diffImages(app, cfg.NeededBuilds(app), selected, tt.deployed, tt.overrides)
+			supplied, repos, carried := diffImages(app, cfg.NeededBuilds(app), selected, tt.deployed, tt.overrides, nil)
 			if !slices.Equal(supplied, tt.wantSupplied) {
 				t.Errorf("supplied = %+v, want %+v", supplied, tt.wantSupplied)
 			}
 			if !slices.Equal(repos, tt.wantRepos) {
 				t.Errorf("build repos = %v, want %v", repos, tt.wantRepos)
+			}
+			if len(carried) != 0 {
+				t.Errorf("carried repos without owner tags = %v, want none", carried)
+			}
+		})
+	}
+}
+
+func TestDiffImages_SelectedOwnerDrift(t *testing.T) {
+	const image = "ghcr.io/app/seed"
+	const oldTag = "ksync-000000000001"
+	const newTag = "ksync-000000000002"
+	app := config.App{Name: "api-b"}
+	needed := []config.BuildRef{{App: "team-a", Image: image}}
+	for _, tt := range []struct {
+		name     string
+		live     string
+		override string
+		want     string
+	}{
+		{name: "owner live tag wins over consumer", live: newTag, want: newTag},
+		{name: "missing owner tag falls back to consumer", want: oldTag},
+		{name: "non-dev owner tag falls back to consumer", live: "stable", want: oldTag},
+		{name: "explicit override wins over owner", live: newTag, override: "supplied", want: "supplied"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			live := func(tag string) []*unstructured.Unstructured {
+				return []*unstructured.Unstructured{{Object: map[string]any{
+					"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"name": "api-b"},
+					"spec": map[string]any{"containers": []any{map[string]any{"name": "seed", "image": image + ":" + tag}}},
+				}}}
+			}
+			res := renderNeededImage(t, image+":manifest")
+			var ownerLive []*unstructured.Unstructured
+			if tt.live != "" {
+				ownerLive = live(tt.live)
+			}
+			ownerTags := map[string]map[string]string{"team-a": render.LiveDevTags(ownerLive, []string{image})}
+			var overrides map[string]render.Image
+			if tt.override != "" {
+				overrides = map[string]render.Image{image: {Name: image, NewTag: tt.override}}
+			}
+			supplied, repos, carried := diffImages(app, needed, map[string]bool{"team-a": true}, res.ReferencedRepos(), overrides, ownerTags)
+			var wantCarried []string
+			if tt.live == newTag && tt.override == "" {
+				wantCarried = []string{image}
+			}
+			if !slices.Equal(carried, wantCarried) {
+				t.Errorf("owner-carried repos = %v, want %v", carried, wantCarried)
+			}
+			if err := res.SetImages(supplied); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := res.CarryForwardBuildTags(live(oldTag), repos); err != nil {
+				t.Fatal(err)
+			}
+			if got := res.Images(); !slices.Equal(got, []string{image + ":" + tt.want}) {
+				t.Errorf("predicted image = %v, want %s:%s", got, image, tt.want)
 			}
 		})
 	}

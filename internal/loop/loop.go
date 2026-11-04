@@ -122,6 +122,8 @@ type Options struct {
 	// Those owners supply only Overrides, because the loop does not build or watch them.
 	NeededBuilds map[string][]config.BuildRef
 	Log          logr.Logger
+	// OnRender sees patched repos of consumers before image injection, so notes match the manifest refs.
+	OnRender func(app string, referenced map[string]bool)
 	// Report renders one app's completed sync. The loop calls it on success so
 	// the watch output matches `ksync sync`'s ship-emoji apply line rather than
 	// a plain log record; when nil, the loop logs a structured "synced" line.
@@ -390,6 +392,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		syncFn:   syncFn,
 		report:   opts.Report,
 		onError:  opts.OnError,
+		onRender: opts.OnRender,
 		log:      log,
 	}
 
@@ -801,6 +804,7 @@ type runner struct {
 	syncFn   SyncFunc
 	report   func(app string, stats SyncStats, took time.Duration)
 	onError  func(app string, err error)
+	onRender func(app string, referenced map[string]bool)
 	log      logr.Logger
 }
 
@@ -830,7 +834,11 @@ func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render
 		return result
 	}
 	if trackImages {
-		result.referenced = res.ReferencedRepos()
+		referenced := res.ReferencedRepos()
+		result.referenced = referenced
+		if rn.onRender != nil {
+			rn.onRender(app.Name, referenced)
+		}
 	}
 	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {

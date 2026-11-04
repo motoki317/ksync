@@ -280,6 +280,11 @@ func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *boo
 	}
 	defer eng.Close()
 
+	if err := addNeededLiveTags(cfg, apps, overrides, eng.LiveObjects); err != nil {
+		return err
+	}
+	onRender := neededImageNotes(cfg, apps, overrides, os.Stderr)
+
 	out := ui.NewColors(os.Stderr)
 	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
@@ -347,7 +352,11 @@ func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *boo
 			}
 		}
 		appImages := syncImages(app, bo.tags, needed, neededTags, overrides)
-		results, degraded, err := deployApp(ctx, r, eng, prog, app, appImages, lookup, *prune, *force, !*clientDiff, *timeout, userInterrupted)
+		var appOnRender func(string, map[string]bool)
+		if len(needed) > 0 {
+			appOnRender = onRender
+		}
+		results, degraded, err := deployApp(ctx, r, eng, prog, app, appImages, lookup, appOnRender, *prune, *force, !*clientDiff, *timeout, userInterrupted)
 		if err != nil {
 			prog.finish(app.Name, nil) // remove the live group; the error is returned and printed at the top level
 			return err
@@ -407,7 +416,7 @@ func syncImages(app config.App, tags map[int]string, needed []config.BuildRef, n
 
 // The deploy row lands in the app's pipeline. The caller commits it after tallying,
 // so the live footer's count tracks the committed lines.
-func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, images []render.Image, lookup func(string) (string, bool), prune, force, serverSide bool, timeout time.Duration, userInterrupted func() bool) ([]common.ResourceSyncResult, []string, error) {
+func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, images []render.Image, lookup func(string) (string, bool), onRender func(string, map[string]bool), prune, force, serverSide bool, timeout time.Duration, userInterrupted func() bool) ([]common.ResourceSyncResult, []string, error) {
 	res, err := r.Render(app.Path, app.ClientRender)
 	if err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
@@ -416,6 +425,9 @@ func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog
 	// and SetImages must win on the dev tag and the Always→IfNotPresent fix.
 	if err := res.ApplyPatches(app.Patches, lookup); err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
+	}
+	if onRender != nil {
+		onRender(app.Name, res.ReferencedRepos())
 	}
 	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {
@@ -488,6 +500,10 @@ func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *boo
 	}
 	defer eng.Close()
 
+	if err := addNeededLiveTags(cfg, apps, overrides, eng.LiveObjects); err != nil {
+		return err
+	}
+
 	out := ui.NewColors(os.Stderr)
 	nsByApp := make(map[string]string, len(apps))
 	for _, a := range apps {
@@ -554,6 +570,7 @@ func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *boo
 		Build:        makeBuildFunc(ctx, cfg, prog, kubeContext),
 		Overrides:    overrides,
 		NeededBuilds: neededBuilds,
+		OnRender:     neededImageNotes(cfg, apps, overrides, os.Stderr),
 		Log:          log,
 		Report:       reporter.report,
 		// A build/render failure (or a failed sync) ends the run without a Report;

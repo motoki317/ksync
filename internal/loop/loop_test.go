@@ -1082,6 +1082,50 @@ func TestRun_NeedOutsideLoopUsesOnlyOverrides(t *testing.T) {
 	}
 }
 
+func TestRun_NeedNotesSeePatchedRepos(t *testing.T) {
+	consumer := consumerApp(t, t.TempDir(), "api-b", "team-a")
+	consumer.Patches = []config.Patch{{
+		Target: config.PatchTarget{Kind: "Deployment", Name: "api-b"},
+		Patch:  `[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"worker:manifest"}]`,
+	}}
+	refs := make(chan map[string]bool, 1)
+	sink := &objectSink{}
+	startTestLoop(t, []config.App{consumer}, sink.sync, Options{
+		NeededBuilds: map[string][]config.BuildRef{"api-b": {{App: "team-a", Image: "worker"}}},
+		Overrides:    map[string]render.Image{"worker": {Name: "worker", NewName: "ghcr.io/app/worker", NewTag: "supplied"}},
+		OnRender: func(app string, repos map[string]bool) {
+			if app != "api-b" {
+				t.Errorf("rendered app = %s, want api-b", app)
+			}
+			refs <- repos
+		},
+	})
+	waitFor(t, func() bool { return len(sink.synced()) == 1 })
+	select {
+	case got := <-refs:
+		if len(got) != 1 || !got["worker"] {
+			t.Errorf("referenced repos = %v, want patched worker before override", got)
+		}
+	default:
+		t.Error("OnRender did not run before sync")
+	}
+	if got := sink.synced(); !slices.Equal(got, []string{"ghcr.io/app/worker:supplied"}) {
+		t.Errorf("synced images = %v, want override", got)
+	}
+}
+
+func TestRun_NeedNotesSkipAppWithoutNeededBuilds(t *testing.T) {
+	app := consumerApp(t, t.TempDir(), "plain")
+	rec := &recorder{calls: map[string]int{}}
+	startTestLoop(t, []config.App{app}, rec.sync, Options{
+		Debounce: 10 * time.Millisecond,
+		OnRender: func(app string, _ map[string]bool) {
+			t.Errorf("OnRender called for %s without needed builds", app)
+		},
+	})
+	waitFor(t, func() bool { return rec.count("plain") == 1 })
+}
+
 func TestRun_ConsumerDirectOnlyNeeds(t *testing.T) {
 	tmp := t.TempDir()
 	owner := buildAppNamed(t, tmp, "team-a", "seed")

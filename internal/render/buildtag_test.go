@@ -18,7 +18,7 @@ func deployImage(ns, name, image string) *unstructured.Unstructured {
 	}}
 }
 
-// liveDevTags carries a build repo's current dev tag forward only when the live
+// LiveDevTags carries a build repo's current dev tag forward only when the live
 // cluster runs it at a recognized ksync-<12hex> tag, found wherever the image
 // sits — including a CRD's non-standard path — and only when every occurrence
 // agrees. Anything else (a plain tag, a missing image, a disagreeing pair) is
@@ -108,9 +108,9 @@ func TestLiveDevTags(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := liveDevTags(c.objs, c.repos)
+			got := LiveDevTags(c.objs, c.repos)
 			if !reflect.DeepEqual(got, c.want) {
-				t.Errorf("liveDevTags = %v, want %v", got, c.want)
+				t.Errorf("LiveDevTags = %v, want %v", got, c.want)
 			}
 		})
 	}
