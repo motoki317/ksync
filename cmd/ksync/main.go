@@ -337,7 +337,17 @@ func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *boo
 			prog.finish(app.Name, nil)
 			return fmt.Errorf("app %s: build failed: %w", app.Name, bo.err)
 		}
-		results, degraded, err := deployApp(ctx, r, eng, prog, app, bo.tags, overrides, lookup, *prune, *force, !*clientDiff, *timeout, userInterrupted)
+		needed := cfg.NeededBuilds(app)
+		// runByNeeds already waited for selected owners to deploy successfully.
+		// An unselected owner has no build outcome, so only overrides can supply its refs.
+		neededTags := make(map[string]map[int]string)
+		for _, ref := range needed {
+			if _, ok := neededTags[ref.App]; !ok {
+				neededTags[ref.App] = awaitBuild(ref.App).tags
+			}
+		}
+		appImages := syncImages(app, bo.tags, needed, neededTags, overrides)
+		results, degraded, err := deployApp(ctx, r, eng, prog, app, appImages, lookup, *prune, *force, !*clientDiff, *timeout, userInterrupted)
 		if err != nil {
 			prog.finish(app.Name, nil) // remove the live group; the error is returned and printed at the top level
 			return err
@@ -377,22 +387,27 @@ func runSync(path, kctx *string, prune, force, verbose, offline, clientDiff *boo
 	return err
 }
 
-// deployApp renders one app, injects its image refs (built dev tags and/or
-// supplied overrides), and applies it — returning the per-resource sync results
-// and the names of any degraded resources. The build ran ahead of this
-// (startEagerBuilds) and the caller awaited it, so the applied manifests always
-// reference images that exist. The deploy row lands in the app's pipeline; the
-// caller commits it after tallying so the live footer's count tracks the
-// committed lines.
-func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, tags map[int]string, overrides map[string]render.Image, lookup func(string) (string, bool), prune, force, serverSide bool, timeout time.Duration, userInterrupted func() bool) ([]common.ResourceSyncResult, []string, error) {
-	images := make([]render.Image, 0, len(app.Build))
-	for j := range app.Build {
-		if ov, ok := overrides[app.Build[j].Image]; ok {
+func syncImages(app config.App, tags map[int]string, needed []config.BuildRef, neededTags map[string]map[int]string, overrides map[string]render.Image) []render.Image {
+	images := make([]render.Image, 0, len(app.Build)+len(needed))
+	appendImage := func(image string, tags map[int]string, index int) {
+		if ov, ok := overrides[image]; ok {
 			images = append(images, ov)
-		} else if tag, ok := tags[j]; ok {
-			images = append(images, render.Image{Name: app.Build[j].Image, NewTag: tag})
+		} else if tag, ok := tags[index]; ok {
+			images = append(images, render.Image{Name: image, NewTag: tag})
 		}
 	}
+	for j, b := range app.Build {
+		appendImage(b.Image, tags, j)
+	}
+	for _, ref := range needed {
+		appendImage(ref.Image, neededTags[ref.App], ref.Index)
+	}
+	return images
+}
+
+// The deploy row lands in the app's pipeline. The caller commits it after tallying,
+// so the live footer's count tracks the committed lines.
+func deployApp(ctx context.Context, r *render.Renderer, eng *engine.Engine, prog *progress, app config.App, images []render.Image, lookup func(string) (string, bool), prune, force, serverSide bool, timeout time.Duration, userInterrupted func() bool) ([]common.ResourceSyncResult, []string, error) {
 	res, err := r.Render(app.Path, app.ClientRender)
 	if err != nil {
 		return nil, nil, fmt.Errorf("app %s: %w", app.Name, err)
