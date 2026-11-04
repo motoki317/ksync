@@ -97,10 +97,14 @@ const imagesLong = `Print the images that the selected apps deploy, one per line
 is a full reference as containerd stores it (docker.io/library/redis:7, not redis:7),
 so a cache or pre-pull tool can match the lines as plain strings.
 
-Images that ksync builds are left out, because no registry has their dev tags.
+A ref to an image that ksync builds is left out when the ref is in the app that builds
+the image, or in an app that lists that app in needs. ksync deploys a dev tag in its
+place, which no registry has, unless the app that builds the image is not selected and
+does not run one ('ksync help builds').
 
---live adds the images of the pods in the namespaces of the apps. This catches images
-that an operator picks and the manifests never name.`
+--live adds the images of the pods in the namespaces of the apps, except the images
+that ksync builds. This catches images that an operator picks and the manifests never
+name.`
 
 const imagesExample = `  ksync images          # the images that the apps deploy
   ksync images --live   # also the images of running pods`
@@ -152,7 +156,8 @@ errors.
   path              a directory with a kustomization file. Required.
   name              the app name. Default: the directory name.
   namespace         the namespace for resources that set none.
-  needs             apps that must be healthy before this app syncs.
+  needs             apps that must be healthy before this app syncs. This app also
+                    deploys the dev tags of their builds ('ksync help builds').
   profiles          optional groups, for example [debug]. See Profiles below.
   build             images built from local source ('ksync help builds').
   patches           edits to rendered objects. See Patches below.
@@ -231,7 +236,7 @@ rebuilds the image, gives it a dev tag, and syncs the app with that tag.
   - Files that .dockerignore excludes never trigger a rebuild.
   - ksync changes imagePullPolicy: Always to IfNotPresent on built images, because no
     registry has the dev tag.
-  - Only one app can build an image, and only that app gets the dev tag.
+  - Only one app can build an image.
 
 ## Load built images into the cluster (imageLoad)
   ksync builds into your local docker image store. Docker Desktop runs pods from that
@@ -251,6 +256,27 @@ rebuilds the image, gives it a dev tag, and syncs the app with that tag.
 
   ksync runs every command in ksync.yaml with sh -c. $KSYNC_CONTEXT holds the kubectl
   context.
+
+## Use an image that another app builds
+  To run an image that another app builds, list that app in needs. Here testdata runs
+  ghcr.io/app/api, which api builds, in a Job that loads test data. needs also makes
+  testdata sync after api is healthy:
+
+    - name: testdata
+      path: apps/testdata
+      needs: [api]
+
+  For each image that api builds, testdata deploys:
+    1. an override for the image (--image or KSYNC_IMAGE_OVERRIDES), if one exists.
+    2. otherwise, if api is selected, the dev tag that api builds.
+    3. otherwise, the dev tag that the resources of api in the cluster use, if they
+       all use the same one. api is not selected when you name apps without it.
+    4. otherwise, the ref in the manifests of testdata.
+  Only direct needs count: an app that needs testdata gets no dev tag from api.
+
+  When an image of api gets a new dev tag, watch syncs testdata again after api is
+  healthy, if the manifests of testdata use that image. If api is not selected,
+  watch reads the dev tag of api once, at start.
 
 ─── Advanced ──────────────────────────────────────────────
 
@@ -295,7 +321,8 @@ rebuilds the image, gives it a dev tag, and syncs the app with that tag.
   image that no app builds.
 
   sync and diff use the override for the whole run. watch uses it until the first edit
-  to the source of the image, then builds the image as usual.`
+  to the source of the image, then builds the image as usual. If the app that builds
+  the image is not selected, watch uses the override for the whole session.`
 
 const strategyTopic = `## Sync phases
   Phase    Default                                   Opt-out

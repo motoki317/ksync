@@ -4,6 +4,11 @@ author: "motoki317"
 status: "accepted"
 ---
 
+> **Superseded in part (2026-11-04).** "Exclude built images" now drops a built image only from
+> the app that builds it and the apps that need that app
+> ([20261104-needs-dev-tags](20261104-needs-dev-tags.md)). `--live` still drops every built image
+> from the live pod images.
+
 # Context
 
 A long-lived dev cluster (a cold microVM, a CI scenario-test runner) pays a large up-front cost
