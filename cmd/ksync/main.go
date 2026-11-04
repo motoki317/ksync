@@ -540,15 +540,22 @@ func runWatch(path, kctx *string, prune, auto, verbose, offline, clientDiff *boo
 	// Ctrl-C mid-convergence never leaves it pinned.
 	reporter := startWatchReporter(os.Stderr, out, log, prog, apps, kubeContext)
 	defer reporter.stop()
+	neededBuilds := make(map[string][]config.BuildRef)
+	for _, app := range apps {
+		if refs := cfg.NeededBuilds(app); len(refs) > 0 {
+			neededBuilds[app.Name] = refs
+		}
+	}
 	return loop.Run(ctx, apps, syncFn, loop.Options{
-		Debounce:    *debounce,
-		MaxParallel: *maxParallel,
-		Render:      renderOpts,
-		WorkDir:     cfg.Dir(),
-		Build:       makeBuildFunc(ctx, cfg, prog, kubeContext),
-		Overrides:   overrides,
-		Log:         log,
-		Report:      reporter.report,
+		Debounce:     *debounce,
+		MaxParallel:  *maxParallel,
+		Render:       renderOpts,
+		WorkDir:      cfg.Dir(),
+		Build:        makeBuildFunc(ctx, cfg, prog, kubeContext),
+		Overrides:    overrides,
+		NeededBuilds: neededBuilds,
+		Log:          log,
+		Report:       reporter.report,
 		// A build/render failure (or a failed sync) ends the run without a Report;
 		// remove the live group so a retry starts fresh rather than stacking rows.
 		OnError: func(app string, _ error) { prog.finish(app, nil) },

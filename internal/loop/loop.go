@@ -118,7 +118,10 @@ type Options struct {
 	// pull resolved by a wrapper) stand in until its source is touched.
 	// See ADR 20260702-watch-image-override-takeover and 20260616-image-override.
 	Overrides map[string]render.Image
-	Log       logr.Logger
+	// NeededBuilds comes from Config.NeededBuilds, including owners outside the loop.
+	// Those owners supply only Overrides, because the loop does not build or watch them.
+	NeededBuilds map[string][]config.BuildRef
+	Log          logr.Logger
 	// Report renders one app's completed sync. The loop calls it on success so
 	// the watch output matches `ksync sync`'s ship-emoji apply line rather than
 	// a plain log record; when nil, the loop logs a structured "synced" line.
@@ -216,6 +219,14 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 				return fmt.Errorf("app %s declares builds but no build function is configured", a.Name)
 			}
 			buildApps = append(buildApps, schedule.App{Name: a.Name})
+		}
+	}
+	consumers := make(map[string][]string)
+	for _, app := range apps {
+		for _, ref := range opts.NeededBuilds[app.Name] {
+			if _, selected := byName[ref.App]; selected {
+				consumers[ref.Image] = append(consumers[ref.Image], app.Name)
+			}
 		}
 	}
 
@@ -384,6 +395,7 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 
 	buildResults := make(chan buildResult)
 	deployResults := make(chan deployResult)
+	referenced := make(map[string]map[string]bool)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
@@ -516,22 +528,33 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 		for _, name := range deploySched.StartDue(now) {
 			app := byName[name]
 			states := builds[name]
+			needed := opts.NeededBuilds[name]
 			// Build the deploy's image set under the loop goroutine (the deploy
 			// goroutine must not touch shared state): an overridden entry injects
 			// its supplied ref, a built one its remembered tag.
-			images := make([]render.Image, 0, len(states))
-			for j := range states {
+			images := make([]render.Image, 0, len(states)+len(needed))
+			appendImage := func(image string, state buildState) {
 				switch {
-				case states[j].override != nil:
-					images = append(images, *states[j].override)
-				case states[j].tag != "":
-					images = append(images, render.Image{Name: app.Build[j].Image, NewTag: states[j].tag})
+				case state.override != nil:
+					images = append(images, *state.override)
+				case state.tag != "":
+					images = append(images, render.Image{Name: image, NewTag: state.tag})
+				}
+			}
+			for j := range states {
+				appendImage(app.Build[j].Image, states[j])
+			}
+			for _, ref := range needed {
+				if ownerStates, selected := builds[ref.App]; selected {
+					appendImage(ref.Image, ownerStates[ref.Index])
+				} else if ov, ok := opts.Overrides[ref.Image]; ok {
+					images = append(images, ov)
 				}
 			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				r := rn.runDeploy(ctx, app, images)
+				r := rn.runDeploy(ctx, app, images, len(needed) > 0)
 				select {
 				case deployResults <- r:
 				case <-ctx.Done():
@@ -672,23 +695,38 @@ func Run(ctx context.Context, apps []config.App, syncFn SyncFunc, opts Options) 
 			log.Error(err, "watch error; some changes may have been missed — resyncing all apps")
 			resyncAll(time.Now())
 		case r := <-buildResults:
+			now := time.Now()
 			building[r.app] = false
 			states := builds[r.app]
 			// Tags from successful batches stick; failed entries re-dirty so the
 			// build scheduler retries them (the deploy stays gated meanwhile).
 			for j, tag := range r.built {
+				if states[j].tag == tag {
+					continue
+				}
 				states[j].tag = tag
+				image := byName[r.app].Build[j].Image
+				for _, consumer := range consumers[image] {
+					// A render in flight can add this image, so its previous set cannot rule it out.
+					if deploySched.Running(consumer) || referenced[consumer] == nil || referenced[consumer][image] {
+						delete(pendingDeploy, consumer)
+						deploySched.MarkDirty(consumer, now)
+					}
+				}
 			}
 			for _, j := range r.failed {
 				states[j].dirty = true
 			}
-			buildSched.Finish(r.app, r.ok, time.Now())
+			buildSched.Finish(r.app, r.ok, now)
 			// A build's .dockerignore may have changed what affects the image.
 			if a, ok := byName[r.app]; ok {
 				deriveScopes(a)
 			}
 			refreshWatch()
 		case r := <-deployResults:
+			if r.referenced != nil {
+				referenced[r.app] = r.referenced
+			}
 			attempts, retryIn := deploySched.Finish(r.app, r.ok, time.Now())
 			if !r.ok {
 				// The whole app failed and the scheduler queued a retry: announce it
@@ -737,9 +775,10 @@ type buildResult struct {
 // failure err carries the cause, which the loop surfaces once at the scheduler's
 // Finish as the retry line — runDeploy does not log it, so it is not doubled.
 type deployResult struct {
-	app string
-	ok  bool
-	err error
+	app        string
+	ok         bool
+	err        error
+	referenced map[string]bool
 }
 
 // unbuilt returns the todo entries that built does not record — what a build
@@ -774,32 +813,41 @@ type runner struct {
 // A failure returns its cause in deployResult.err rather than logging it: the
 // loop reports it once, at the scheduler's Finish, as the retry line (attempt
 // count + backoff), so a single line names both what broke and when it retries.
-func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render.Image) deployResult {
+func (rn *runner) runDeploy(ctx context.Context, app config.App, images []render.Image, trackImages bool) deployResult {
 	started := time.Now()
+	result := deployResult{app: app.Name}
 	res, err := rn.renderer.Render(app.Path, app.ClientRender)
 	if err != nil {
 		rn.onError(app.Name, err)
-		return deployResult{app: app.Name, err: err}
+		result.err = err
+		return result
 	}
 	// Patches before image injection (deploy-environment fields the kustomization
 	// can't carry); SetImages must win on the built dev tag.
 	if err := res.ApplyPatches(app.Patches, rn.lookup); err != nil {
 		rn.onError(app.Name, err)
-		return deployResult{app: app.Name, err: err}
+		result.err = err
+		return result
+	}
+	if trackImages {
+		result.referenced = res.ReferencedRepos()
 	}
 	if len(images) > 0 {
 		if err := res.SetImages(images); err != nil {
 			rn.onError(app.Name, err)
-			return deployResult{app: app.Name, err: err}
+			result.err = err
+			return result
 		}
 	}
 	stats, err := rn.syncFn(ctx, app.Name, res.Objects)
 	if err != nil {
 		rn.onError(app.Name, err)
-		return deployResult{app: app.Name, err: err}
+		result.err = err
+		return result
 	}
 	rn.reportSync(app.Name, stats, time.Since(started))
-	return deployResult{app: app.Name, ok: true}
+	result.ok = true
+	return result
 }
 
 // reportSync emits one app's completed-sync line: the injected ship-emoji

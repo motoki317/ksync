@@ -195,6 +195,11 @@ func (s *Scheduler) NextDeadline() (time.Time, bool) {
 	return earliest, found
 }
 
+func (s *Scheduler) Running(name string) bool {
+	st, ok := s.apps[name]
+	return ok && st.running
+}
+
 // Idle reports whether no app is dirty or running.
 func (s *Scheduler) Idle() bool {
 	if s.running > 0 {
