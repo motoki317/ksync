@@ -60,9 +60,13 @@ func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *
 	defer cleanup()
 	r := render.New(renderOpts)
 	lookup := render.NewVarLookup(cfg.Dir())
+	selected := make(map[string]bool, len(apps))
+	for _, app := range apps {
+		selected[app.Name] = true
+	}
 
 	results, err := renderConcurrently(apps, *maxParallel, func(app config.App) (appDiff, error) {
-		return diffApp(r, eng, lookup, app, overrides, *prune, !*clientDiff)
+		return diffApp(r, eng, lookup, app, cfg.NeededBuilds(app), selected, overrides, *prune, !*clientDiff)
 	})
 	if err != nil {
 		return err
@@ -78,7 +82,7 @@ func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *
 // diffApp renders one app and previews its sync: patches and any --image override
 // are applied as on sync; for an un-overridden build image the current live dev
 // tag is carried forward so its per-build churn does not dominate the diff.
-func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string, bool), app config.App, overrides map[string]render.Image, prune, serverSide bool) (appDiff, error) {
+func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string, bool), app config.App, needed []config.BuildRef, selected map[string]bool, overrides map[string]render.Image, prune, serverSide bool) (appDiff, error) {
 	res, err := r.Render(app.Path, app.ClientRender)
 	if err != nil {
 		return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
@@ -86,22 +90,9 @@ func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string
 	if err := res.ApplyPatches(app.Patches, lookup); err != nil {
 		return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 	}
-	// An overridden build image deploys the supplied ref (shown in the diff); the
-	// rest are un-built, so carry their live dev tag forward. A build entry whose
-	// image the manifests do not actually reference is skipped — carrying or noting
-	// it would be phantom churn (deployed is read before the override rewrite, but
-	// overridden entries are handled separately so that does not matter).
-	deployed := res.ReferencedRepos()
-	var supplied []render.Image
-	var buildRepos []string
-	for j := range app.Build {
-		img := app.Build[j].Image
-		if ov, ok := overrides[img]; ok {
-			supplied = append(supplied, ov)
-		} else if deployed[img] {
-			buildRepos = append(buildRepos, img)
-		}
-	}
+	// Unreferenced builds must not produce carry-forward notes. Read the
+	// manifest repos before overrides can rename them.
+	supplied, buildRepos := diffImages(app, needed, selected, res.ReferencedRepos(), overrides)
 	if len(supplied) > 0 {
 		if err := res.SetImages(supplied); err != nil {
 			return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
@@ -122,6 +113,24 @@ func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string
 		return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	return appDiff{app: app, diffs: diffs, carried: carried, atSrcRef: subtract(buildRepos, carried)}, nil
+}
+
+func diffImages(app config.App, needed []config.BuildRef, selected, deployed map[string]bool, overrides map[string]render.Image) (supplied []render.Image, buildRepos []string) {
+	classify := func(image string, syncBuildsImage bool) {
+		if ov, ok := overrides[image]; ok {
+			supplied = append(supplied, ov)
+		} else if syncBuildsImage && deployed[image] {
+			buildRepos = append(buildRepos, image)
+		}
+	}
+	for _, b := range app.Build {
+		classify(b.Image, true)
+	}
+	for _, ref := range needed {
+		// Sync never builds an unselected owner's images, so only overrides can change their refs.
+		classify(ref.Image, selected[ref.App])
+	}
+	return supplied, buildRepos
 }
 
 // subtract returns the elements of all not present in remove, preserving order —
