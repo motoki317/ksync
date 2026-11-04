@@ -2,13 +2,172 @@ package main
 
 import (
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
 	"github.com/motoki317/ksync/internal/config"
 	"github.com/motoki317/ksync/internal/engine"
+	"github.com/motoki317/ksync/internal/render"
 	"github.com/motoki317/ksync/internal/ui"
 )
+
+func TestDiffImages(t *testing.T) {
+	cfg := &config.Config{Apps: []config.App{
+		{Name: "team-a", Build: []config.Build{{Image: "ghcr.io/app/seed"}, {Image: "ghcr.io/app/worker"}, {Image: "ghcr.io/app/unused"}}},
+		{Name: "api-b", Needs: []string{"team-a"}, Build: []config.Build{{Image: "ghcr.io/app/api-b"}}},
+		{Name: "shop", Needs: []string{"api-b"}},
+		{Name: "plain"},
+	}}
+	for _, tt := range []struct {
+		name         string
+		app          string
+		alsoSelect   []string
+		deployed     map[string]bool
+		overrides    map[string]render.Image
+		wantSupplied []render.Image
+		wantRepos    []string
+	}{
+		{
+			name: "unselected owner leaves needed image at manifest ref", app: "api-b",
+			deployed:  map[string]bool{"ghcr.io/app/api-b": true, "ghcr.io/app/seed": true},
+			wantRepos: []string{"ghcr.io/app/api-b"},
+		},
+		{
+			name: "unselected owner supplies only overridden images", app: "api-b",
+			deployed: map[string]bool{"ghcr.io/app/api-b": true, "ghcr.io/app/seed": true, "ghcr.io/app/worker": true},
+			overrides: map[string]render.Image{
+				"ghcr.io/app/seed": {Name: "ghcr.io/app/seed", NewName: "ghcr.io/app/seed-copy", NewTag: "supplied"},
+			},
+			wantSupplied: []render.Image{{Name: "ghcr.io/app/seed", NewName: "ghcr.io/app/seed-copy", NewTag: "supplied"}},
+			wantRepos:    []string{"ghcr.io/app/api-b"},
+		},
+		{
+			name: "own and needed referenced images", app: "api-b",
+			alsoSelect: []string{"team-a"},
+			deployed:   map[string]bool{"ghcr.io/app/api-b": true, "ghcr.io/app/seed": true, "ghcr.io/app/worker": true},
+			wantRepos:  []string{"ghcr.io/app/api-b", "ghcr.io/app/seed", "ghcr.io/app/worker"},
+		},
+		{
+			name: "own and needed overrides take precedence", app: "api-b",
+			alsoSelect: []string{"team-a"},
+			deployed:   map[string]bool{"ghcr.io/app/api-b": true, "ghcr.io/app/seed": true, "ghcr.io/app/worker": true},
+			overrides: map[string]render.Image{
+				"ghcr.io/app/api-b": {Name: "ghcr.io/app/api-b", NewTag: "supplied"},
+				"ghcr.io/app/seed":  {Name: "ghcr.io/app/seed", NewName: "ghcr.io/app/seed-copy", Digest: "sha256:0123456789012345678901234567890123456789012345678901234567890123"},
+			},
+			wantSupplied: []render.Image{
+				{Name: "ghcr.io/app/api-b", NewTag: "supplied"},
+				{Name: "ghcr.io/app/seed", NewName: "ghcr.io/app/seed-copy", Digest: "sha256:0123456789012345678901234567890123456789012345678901234567890123"},
+			},
+			wantRepos: []string{"ghcr.io/app/worker"},
+		},
+		{
+			name: "unreferenced needed override still supplies its ref", app: "api-b",
+			overrides:    map[string]render.Image{"ghcr.io/app/unused": {Name: "ghcr.io/app/unused", NewTag: "supplied"}},
+			wantSupplied: []render.Image{{Name: "ghcr.io/app/unused", NewTag: "supplied"}},
+		},
+		{
+			name: "own builds retain their behavior", app: "team-a",
+			deployed:     map[string]bool{"ghcr.io/app/seed": true, "ghcr.io/app/worker": true},
+			overrides:    map[string]render.Image{"ghcr.io/app/worker": {Name: "ghcr.io/app/worker", NewTag: "supplied"}},
+			wantSupplied: []render.Image{{Name: "ghcr.io/app/worker", NewTag: "supplied"}},
+			wantRepos:    []string{"ghcr.io/app/seed"},
+		},
+		{
+			name: "transitive owner supplies neither overrides nor carry-forward", app: "shop",
+			alsoSelect: []string{"api-b", "team-a"},
+			deployed:   map[string]bool{"ghcr.io/app/api-b": true, "ghcr.io/app/seed": true},
+			overrides:  map[string]render.Image{"ghcr.io/app/seed": {Name: "ghcr.io/app/seed", NewTag: "supplied"}},
+			wantRepos:  []string{"ghcr.io/app/api-b"},
+		},
+		{
+			name: "unrelated build is ignored", app: "plain",
+			deployed:  map[string]bool{"ghcr.io/app/seed": true},
+			overrides: map[string]render.Image{"ghcr.io/app/seed": {Name: "ghcr.io/app/seed", NewTag: "supplied"}},
+		},
+		{name: "no referenced images", app: "api-b"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			apps, err := cfg.Select(append([]string{tt.app}, tt.alsoSelect...), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := make(map[string]bool, len(apps))
+			for _, app := range apps {
+				selected[app.Name] = true
+			}
+			app := apps[0]
+			supplied, repos, carried := diffImages(app, cfg.NeededBuilds(app), selected, tt.deployed, tt.overrides, nil)
+			if !slices.Equal(supplied, tt.wantSupplied) {
+				t.Errorf("supplied = %+v, want %+v", supplied, tt.wantSupplied)
+			}
+			if !slices.Equal(repos, tt.wantRepos) {
+				t.Errorf("build repos = %v, want %v", repos, tt.wantRepos)
+			}
+			if len(carried) != 0 {
+				t.Errorf("carried repos without owner tags = %v, want none", carried)
+			}
+		})
+	}
+}
+
+func TestDiffImages_SelectedOwnerDrift(t *testing.T) {
+	const image = "ghcr.io/app/seed"
+	const oldTag = "ksync-000000000001"
+	const newTag = "ksync-000000000002"
+	app := config.App{Name: "api-b"}
+	needed := []config.BuildRef{{App: "team-a", Image: image}}
+	for _, tt := range []struct {
+		name     string
+		live     string
+		override string
+		want     string
+	}{
+		{name: "owner live tag wins over consumer", live: newTag, want: newTag},
+		{name: "missing owner tag falls back to consumer", want: oldTag},
+		{name: "non-dev owner tag falls back to consumer", live: "stable", want: oldTag},
+		{name: "explicit override wins over owner", live: newTag, override: "supplied", want: "supplied"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			live := func(tag string) []*unstructured.Unstructured {
+				return []*unstructured.Unstructured{{Object: map[string]any{
+					"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"name": "api-b"},
+					"spec": map[string]any{"containers": []any{map[string]any{"name": "seed", "image": image + ":" + tag}}},
+				}}}
+			}
+			res := renderNeededImage(t, image+":manifest")
+			var ownerLive []*unstructured.Unstructured
+			if tt.live != "" {
+				ownerLive = live(tt.live)
+			}
+			ownerTags := map[string]map[string]string{"team-a": render.LiveDevTags(ownerLive, []string{image})}
+			var overrides map[string]render.Image
+			if tt.override != "" {
+				overrides = map[string]render.Image{image: {Name: image, NewTag: tt.override}}
+			}
+			supplied, repos, carried := diffImages(app, needed, map[string]bool{"team-a": true}, res.ReferencedRepos(), overrides, ownerTags)
+			var wantCarried []string
+			if tt.live == newTag && tt.override == "" {
+				wantCarried = []string{image}
+			}
+			if !slices.Equal(carried, wantCarried) {
+				t.Errorf("owner-carried repos = %v, want %v", carried, wantCarried)
+			}
+			if err := res.SetImages(supplied); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := res.CarryForwardBuildTags(live(oldTag), repos); err != nil {
+				t.Fatal(err)
+			}
+			if got := res.Images(); !slices.Equal(got, []string{image + ":" + tt.want}) {
+				t.Errorf("predicted image = %v, want %s:%s", got, image, tt.want)
+			}
+		})
+	}
+}
 
 func plainColors() ui.Colors { return ui.NewColors(io.Discard) } // io.Discard is not a TTY → no escapes
 

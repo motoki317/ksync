@@ -818,6 +818,412 @@ func buildAppNamed(t *testing.T, base, name, img string) config.App {
 	}
 }
 
+func consumerApp(t *testing.T, base, name string, needs ...string) config.App {
+	t.Helper()
+	appDir := filepath.Join(base, name)
+	writeFile(t, filepath.Join(appDir, "kustomization.yaml"), "resources: [deployment.yaml]\n")
+	writeFile(t, filepath.Join(appDir, "deployment.yaml"), consumerDeploymentYAML)
+	return config.App{Name: name, Path: appDir, Needs: needs}
+}
+
+var consumerDeploymentYAML = strings.Replace(deploymentYAML, "image: api-b:main", "image: seed:manifest\n          imagePullPolicy: Always", 1)
+
+func neededBuildsForApps(apps []config.App) map[string][]config.BuildRef {
+	cfg := &config.Config{Apps: apps}
+	refs := make(map[string][]config.BuildRef)
+	for _, app := range apps {
+		refs[app.Name] = cfg.NeededBuilds(app)
+	}
+	return refs
+}
+
+type appObjectSinks map[string]*objectSink
+
+func (s appObjectSinks) sync(ctx context.Context, app string, objs []*unstructured.Unstructured) (SyncStats, error) {
+	return s[app].sync(ctx, app, objs)
+}
+
+func startTestLoop(t *testing.T, apps []config.App, syncFn SyncFunc, opts Options) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, apps, syncFn, opts) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Run: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not stop after cancellation")
+		}
+	})
+}
+
+func TestRun_ConsumerDeploysNeededTag(t *testing.T) {
+	tmp := t.TempDir()
+	owner := buildAppNamed(t, tmp, "team-a", "seed")
+	consumer := consumerApp(t, tmp, "api-b", "team-a")
+	apps := []config.App{consumer, owner}
+	builder := &fakeBuilder{}
+	sinks := appObjectSinks{"team-a": {}, "api-b": {}}
+	idle := &idleRecorder{}
+	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) (SyncStats, error) {
+		if app == "api-b" {
+			containers, _, _ := unstructured.NestedSlice(objs[0].Object, "spec", "template", "spec", "containers")
+			if got := containers[0].(map[string]any)["imagePullPolicy"]; got != "IfNotPresent" {
+				t.Errorf("consumer imagePullPolicy = %v, want IfNotPresent", got)
+			}
+		}
+		return sinks.sync(ctx, app, objs)
+	}
+	startTestLoop(t, apps, syncFn, Options{
+		Debounce: 10 * time.Millisecond, Build: builder.build,
+		NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+	})
+	waitFor(t, func() bool { return idle.count() == 1 })
+	for _, name := range []string{"team-a", "api-b"} {
+		if got := sinks[name].synced(); !slices.Equal(got, []string{"seed:ksync-000000000001"}) {
+			t.Errorf("%s images = %v, want owner's dev tag", name, got)
+		}
+	}
+}
+
+func TestRun_ConsumerRebuildWaitsForOwner(t *testing.T) {
+	tmp := t.TempDir()
+	owner := buildAppNamed(t, tmp, "team-a", "seed")
+	consumer := consumerApp(t, tmp, "api-b", "team-a")
+	apps := []config.App{consumer, owner}
+	builder := &fakeBuilder{}
+	sinks := appObjectSinks{"team-a": {}, "api-b": {}}
+	idle := &idleRecorder{}
+	releaseOwner := make(chan struct{})
+	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) (SyncStats, error) {
+		stats, err := sinks.sync(ctx, app, objs)
+		if app == "team-a" && len(sinks[app].synced()) == 2 {
+			select {
+			case <-releaseOwner:
+			case <-ctx.Done():
+			}
+		}
+		return stats, err
+	}
+	startTestLoop(t, apps, syncFn, Options{
+		Debounce: 10 * time.Millisecond, Build: builder.build,
+		NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+	})
+	waitFor(t, func() bool { return idle.count() == 1 })
+	writeFile(t, filepath.Join(owner.Build[0].Context, "main.go"), "package main // changed\n")
+	waitFor(t, func() bool { return len(sinks["team-a"].synced()) == 2 })
+	if got := sinks["api-b"].synced(); len(got) != 1 {
+		t.Fatalf("consumer deployed before owner finished: %v", got)
+	}
+	close(releaseOwner)
+	waitFor(t, func() bool { return idle.count() == 2 })
+	if got := sinks["api-b"].synced(); !slices.Equal(got, []string{"seed:ksync-000000000001", "seed:ksync-000000000002"}) {
+		t.Errorf("consumer images = %v, want rebuilt tag after owner", got)
+	}
+}
+
+func TestRun_ConsumerSkipsUnchangedOrUnusedNeededImage(t *testing.T) {
+	for _, scenario := range []string{"same tag", "unreferenced image", "another entry", "patched image", "no images"} {
+		t.Run(scenario, func(t *testing.T) {
+			tmp := t.TempDir()
+			owner := buildAppNamed(t, tmp, "team-a", "seed")
+			consumer := consumerApp(t, tmp, "api-b", "team-a")
+			changedSource := owner.Build[0].Context
+			switch scenario {
+			case "unreferenced image":
+				writeFile(t, filepath.Join(consumer.Path, "deployment.yaml"), strings.ReplaceAll(consumerDeploymentYAML, "seed:manifest", "proxy:manifest"))
+			case "another entry":
+				other := buildAppNamed(t, tmp, "shop", "worker")
+				owner.Build = append(owner.Build, other.Build[0])
+				changedSource = other.Build[0].Context
+			case "patched image":
+				consumer.Patches = []config.Patch{{
+					Target: config.PatchTarget{Kind: "Deployment", Name: "api-b"},
+					Patch:  `[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"proxy:manifest"}]`,
+				}}
+			case "no images":
+				writeFile(t, filepath.Join(consumer.Path, "deployment.yaml"), configmapYAML("hello"))
+			}
+			apps := []config.App{owner, consumer}
+			builder := &fakeBuilder{}
+			buildFn := func(ctx context.Context, app string, entries []config.Build) ([]string, error) {
+				refs, err := builder.build(ctx, app, entries)
+				if scenario == "same tag" {
+					for i, entry := range entries {
+						refs[i] = entry.Image + ":ksync-000000000001"
+					}
+				}
+				return refs, err
+			}
+			rec := &recorder{calls: map[string]int{}}
+			idle := &idleRecorder{}
+			startTestLoop(t, apps, rec.sync, Options{
+				Debounce: 10 * time.Millisecond, Build: buildFn,
+				NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+			})
+			waitFor(t, func() bool { return idle.count() == 1 })
+			writeFile(t, filepath.Join(changedSource, "main.go"), "package main // changed\n")
+			waitFor(t, func() bool { return idle.count() == 2 })
+			if got := rec.count("api-b"); got != 1 {
+				t.Errorf("consumer deploys = %d, want 1", got)
+			}
+			if got := rec.count("team-a"); got != 2 {
+				t.Errorf("owner deploys = %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestRun_ConsumerInFlightReceivesNewNeededTag(t *testing.T) {
+	tmp := t.TempDir()
+	owner := buildAppNamed(t, tmp, "team-a", "seed")
+	consumer := consumerApp(t, tmp, "api-b", "team-a")
+	writeFile(t, filepath.Join(consumer.Path, "deployment.yaml"), strings.ReplaceAll(consumerDeploymentYAML, "seed:manifest", "proxy:manifest"))
+	apps := []config.App{owner, consumer}
+	builder := &fakeBuilder{}
+	sinks := appObjectSinks{"team-a": {}, "api-b": {}}
+	idle := &idleRecorder{}
+	releaseConsumer := make(chan struct{})
+	syncFn := func(ctx context.Context, app string, objs []*unstructured.Unstructured) (SyncStats, error) {
+		stats, err := sinks.sync(ctx, app, objs)
+		if app == "api-b" && len(sinks[app].synced()) == 2 {
+			select {
+			case <-releaseConsumer:
+			case <-ctx.Done():
+			}
+		}
+		return stats, err
+	}
+	startTestLoop(t, apps, syncFn, Options{
+		Debounce: 10 * time.Millisecond, Build: builder.build,
+		NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+	})
+	waitFor(t, func() bool { return idle.count() == 1 })
+	writeFile(t, filepath.Join(consumer.Path, "deployment.yaml"), consumerDeploymentYAML)
+	waitFor(t, func() bool { return len(sinks["api-b"].synced()) == 2 })
+	writeFile(t, filepath.Join(owner.Build[0].Context, "main.go"), "package main // changed\n")
+	waitFor(t, func() bool { return len(sinks["team-a"].synced()) == 2 })
+	close(releaseConsumer)
+	waitFor(t, func() bool { return idle.count() == 2 })
+	want := []string{"proxy:manifest", "seed:ksync-000000000001", "seed:ksync-000000000002"}
+	if got := sinks["api-b"].synced(); !slices.Equal(got, want) {
+		t.Errorf("consumer images = %v, want %v", got, want)
+	}
+}
+
+func TestRun_ConsumerOverrideTakeover(t *testing.T) {
+	for _, override := range []render.Image{
+		{Name: "seed", NewName: "ghcr.io/app/seed", NewTag: "supplied"},
+		{Name: "seed", NewTag: "ksync-000000000001"},
+	} {
+		t.Run(override.NewTag, func(t *testing.T) {
+			tmp := t.TempDir()
+			owner := buildAppNamed(t, tmp, "team-a", "seed")
+			consumer := consumerApp(t, tmp, "api-b", "team-a")
+			apps := []config.App{owner, consumer}
+			builder := &fakeBuilder{}
+			sinks := appObjectSinks{"team-a": {}, "api-b": {}}
+			idle := &idleRecorder{}
+			startTestLoop(t, apps, sinks.sync, Options{
+				Debounce: 10 * time.Millisecond, Build: builder.build,
+				NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+				Overrides: map[string]render.Image{"seed": override},
+			})
+			waitFor(t, func() bool { return idle.count() == 1 })
+			name := "seed"
+			if override.NewName != "" {
+				name = override.NewName
+			}
+			want := []string{name + ":" + override.NewTag}
+			if got := sinks["api-b"].synced(); !slices.Equal(got, want) {
+				t.Fatalf("consumer images = %v, want override %v", got, want)
+			}
+			if got := builder.builds(); got != 0 {
+				t.Fatalf("startup builds = %d, want 0", got)
+			}
+			writeFile(t, filepath.Join(owner.Build[0].Context, "main.go"), "package main // changed\n")
+			waitFor(t, func() bool { return idle.count() == 2 })
+			want = append(want, "seed:ksync-000000000001")
+			if got := sinks["api-b"].synced(); !slices.Equal(got, want) {
+				t.Errorf("consumer images after takeover = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestRun_NeedOutsideLoopUsesOnlyOverrides(t *testing.T) {
+	for _, supplied := range []bool{false, true} {
+		t.Run(fmt.Sprint(supplied), func(t *testing.T) {
+			tmp := t.TempDir()
+			owner := buildAppNamed(t, tmp, "team-a", "seed")
+			consumer := consumerApp(t, tmp, "api-b", "team-a")
+			allApps := []config.App{owner, consumer}
+			var overrides map[string]render.Image
+			want := "seed:manifest"
+			if supplied {
+				overrides = map[string]render.Image{"seed": {Name: "seed", NewTag: "supplied"}}
+				want = "seed:supplied"
+			}
+			sink := &objectSink{}
+			idle := &idleRecorder{}
+			startTestLoop(t, []config.App{consumer}, sink.sync, Options{
+				Debounce: 10 * time.Millisecond, Overrides: overrides,
+				NeededBuilds: neededBuildsForApps(allApps), OnIdle: idle.onIdle,
+			})
+			waitFor(t, func() bool { return idle.count() == 1 })
+			if got := sink.synced(); !slices.Equal(got, []string{want}) {
+				t.Errorf("consumer images = %v, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestRun_NeedNotesSeePatchedRepos(t *testing.T) {
+	consumer := consumerApp(t, t.TempDir(), "api-b", "team-a")
+	consumer.Patches = []config.Patch{{
+		Target: config.PatchTarget{Kind: "Deployment", Name: "api-b"},
+		Patch:  `[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"worker:manifest"}]`,
+	}}
+	refs := make(chan map[string]bool, 1)
+	sink := &objectSink{}
+	startTestLoop(t, []config.App{consumer}, sink.sync, Options{
+		NeededBuilds: map[string][]config.BuildRef{"api-b": {{App: "team-a", Image: "worker"}}},
+		Overrides:    map[string]render.Image{"worker": {Name: "worker", NewName: "ghcr.io/app/worker", NewTag: "supplied"}},
+		OnRender: func(app string, repos map[string]bool) {
+			if app != "api-b" {
+				t.Errorf("rendered app = %s, want api-b", app)
+			}
+			refs <- repos
+		},
+	})
+	waitFor(t, func() bool { return len(sink.synced()) == 1 })
+	select {
+	case got := <-refs:
+		if len(got) != 1 || !got["worker"] {
+			t.Errorf("referenced repos = %v, want patched worker before override", got)
+		}
+	default:
+		t.Error("OnRender did not run before sync")
+	}
+	if got := sink.synced(); !slices.Equal(got, []string{"ghcr.io/app/worker:supplied"}) {
+		t.Errorf("synced images = %v, want override", got)
+	}
+}
+
+func TestRun_NeedNotesSkipAppWithoutNeededBuilds(t *testing.T) {
+	app := consumerApp(t, t.TempDir(), "plain")
+	rec := &recorder{calls: map[string]int{}}
+	startTestLoop(t, []config.App{app}, rec.sync, Options{
+		Debounce: 10 * time.Millisecond,
+		OnRender: func(app string, _ map[string]bool) {
+			t.Errorf("OnRender called for %s without needed builds", app)
+		},
+	})
+	waitFor(t, func() bool { return rec.count("plain") == 1 })
+}
+
+func TestRun_ConsumerDirectOnlyNeeds(t *testing.T) {
+	tmp := t.TempDir()
+	owner := buildAppNamed(t, tmp, "team-a", "seed")
+	consumer := consumerApp(t, tmp, "api-b", "team-a")
+	transitive := consumerApp(t, tmp, "shop", "api-b")
+	unrelated := consumerApp(t, tmp, "plain")
+	apps := []config.App{owner, consumer, transitive, unrelated}
+	builder := &fakeBuilder{}
+	sinks := appObjectSinks{"team-a": {}, "api-b": {}, "shop": {}, "plain": {}}
+	idle := &idleRecorder{}
+	startTestLoop(t, apps, sinks.sync, Options{
+		Debounce: 10 * time.Millisecond, Build: builder.build,
+		NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+	})
+	waitFor(t, func() bool { return idle.count() == 1 })
+	writeFile(t, filepath.Join(owner.Build[0].Context, "main.go"), "package main // changed\n")
+	waitFor(t, func() bool { return idle.count() == 2 })
+	for _, name := range []string{"shop", "plain"} {
+		if got := sinks[name].synced(); !slices.Equal(got, []string{"seed:manifest"}) {
+			t.Errorf("%s images = %v, want only its initial manifest ref", name, got)
+		}
+	}
+	if got := sinks["api-b"].synced(); len(got) != 2 {
+		t.Errorf("direct consumer images = %v, want two deploys", got)
+	}
+}
+
+func TestRun_ConsumerGateReleaseReSyncs(t *testing.T) {
+	tmp := t.TempDir()
+	owner := buildAppNamed(t, tmp, "team-a", "seed")
+	owner.Build[0].Name = "seed"
+	consumer := consumerApp(t, tmp, "api-b", "team-a")
+	apps := []config.App{owner, consumer}
+	builder := &fakeBuilder{}
+	sinks := appObjectSinks{"team-a": {}, "api-b": {}}
+	idle := &idleRecorder{}
+	g := newFakeGate()
+	t.Cleanup(g.close)
+	startTestLoop(t, apps, sinks.sync, Options{
+		Debounce: 10 * time.Millisecond, Build: builder.build, Gate: g.gate(),
+		NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+	})
+	waitFor(t, func() bool { return idle.count() == 1 })
+	writeFile(t, filepath.Join(owner.Build[0].Context, "main.go"), "package main // changed\n")
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	items := g.lastAsk()
+	wantItems := []PendingItem{{App: "team-a", Build: 0, Label: "seed"}}
+	if !slices.Equal(items, wantItems) {
+		t.Fatalf("prompt items = %+v, want %+v", items, wantItems)
+	}
+	if builder.builds() != 1 || len(sinks["api-b"].synced()) != 1 {
+		t.Fatal("consumer rebuilt or redeployed before confirmation")
+	}
+	g.decided <- Decision{Selected: items}
+	waitFor(t, func() bool { return idle.count() == 2 })
+	if got := sinks["api-b"].synced(); !slices.Equal(got, []string{"seed:ksync-000000000001", "seed:ksync-000000000002"}) {
+		t.Errorf("consumer images = %v, want new tag after confirmation", got)
+	}
+}
+
+func TestRun_ConsumerGateClearsHeldManifestChange(t *testing.T) {
+	tmp := t.TempDir()
+	owner := buildAppNamed(t, tmp, "team-a", "seed")
+	owner.Build[0].Name = "seed"
+	consumer := consumerApp(t, tmp, "api-b", "team-a")
+	plain := consumerApp(t, tmp, "plain")
+	apps := []config.App{owner, consumer, plain}
+	builder := &fakeBuilder{}
+	sinks := appObjectSinks{"team-a": {}, "api-b": {}, "plain": {}}
+	idle := &idleRecorder{}
+	g := newFakeGate()
+	t.Cleanup(g.close)
+	startTestLoop(t, apps, sinks.sync, Options{
+		Debounce: 10 * time.Millisecond, Build: builder.build, Gate: g.gate(),
+		NeededBuilds: neededBuildsForApps(apps), OnIdle: idle.onIdle,
+	})
+	waitFor(t, func() bool { return idle.count() == 1 })
+	writeFile(t, filepath.Join(consumer.Path, "deployment.yaml"), strings.Replace(consumerDeploymentYAML, "seed:manifest", "seed:held", 1))
+	waitFor(t, func() bool { return g.askCount() == 1 })
+	writeFile(t, filepath.Join(owner.Build[0].Context, "main.go"), "package main // changed\n")
+	build := PendingItem{App: "team-a", Build: 0, Label: "seed"}
+	waitFor(t, func() bool { return slices.Contains(g.lastAsk(), build) })
+	if got := g.lastAsk(); !slices.Equal(got, []PendingItem{build, {App: "api-b", Build: DeployOnly, Label: "api-b"}}) {
+		t.Fatalf("prompt = %+v, want owner build and held consumer deploy", got)
+	}
+	g.decided <- Decision{Selected: []PendingItem{build}}
+	waitFor(t, func() bool { return idle.count() == 2 })
+	if got := sinks["api-b"].synced(); !slices.Equal(got, []string{"seed:ksync-000000000001", "seed:ksync-000000000002"}) {
+		t.Fatalf("consumer images = %v, want new tag", got)
+	}
+	writeFile(t, filepath.Join(plain.Path, "deployment.yaml"), strings.Replace(consumerDeploymentYAML, "seed:manifest", "seed:next", 1))
+	deploy := PendingItem{App: "plain", Build: DeployOnly, Label: "plain"}
+	waitFor(t, func() bool { return slices.Contains(g.lastAsk(), deploy) })
+	if got := g.lastAsk(); !slices.Equal(got, []PendingItem{deploy}) {
+		t.Errorf("prompt after consumer re-sync = %+v, want only %+v", got, deploy)
+	}
+}
+
 // TestRun_DependentBuildsWhileDependencyDeploys is the core of the build/deploy
 // split: a dependent's build must run while its dependency is still deploying,
 // not behind it. App b needs a; a's deploy is held in flight until b's build is

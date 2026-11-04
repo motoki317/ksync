@@ -13,10 +13,9 @@ import (
 	"github.com/motoki317/ksync/internal/ui"
 )
 
-// appDiff is one app's preview: the per-resource diffs, the build repos whose
-// live dev tag was carried forward (suppressed from the diff), and the build
-// repos shown at their source ref because no live dev tag was found (so the note
-// can warn that the displayed tag is not what a sync would deploy).
+// appDiff is one app's preview. carried lists build repos shown at the app's or
+// a selected needed owner's live dev tag, which a sync can rebuild. atSrcRef
+// lists build repos shown at their source ref because no live dev tag was found.
 type appDiff struct {
 	app      config.App
 	diffs    []engine.ResourceDiff
@@ -53,6 +52,11 @@ func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *
 	}
 	defer eng.Close()
 
+	if err := addNeededLiveTags(cfg, apps, overrides, eng.LiveObjects); err != nil {
+		return err
+	}
+	onRender := neededImageNotes(cfg, apps, overrides, os.Stderr)
+
 	renderOpts, cleanup, err := renderOptions(kubeContext, *offline)
 	if err != nil {
 		return err
@@ -60,9 +64,29 @@ func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *
 	defer cleanup()
 	r := render.New(renderOpts)
 	lookup := render.NewVarLookup(cfg.Dir())
+	selected := make(map[string]bool, len(apps))
+	neededOwners := make(map[string]bool)
+	for _, app := range apps {
+		selected[app.Name] = true
+		for _, ref := range cfg.NeededBuilds(app) {
+			if _, supplied := overrides[ref.Image]; !supplied {
+				neededOwners[ref.App] = true
+			}
+		}
+	}
+	ownerTags := make(map[string]map[string]string)
+	for _, app := range apps {
+		if neededOwners[app.Name] {
+			tags, err := liveBuildTags(app, eng.LiveObjects)
+			if err != nil {
+				return fmt.Errorf("live tags for app %s: %w", app.Name, err)
+			}
+			ownerTags[app.Name] = tags
+		}
+	}
 
 	results, err := renderConcurrently(apps, *maxParallel, func(app config.App) (appDiff, error) {
-		return diffApp(r, eng, lookup, app, overrides, *prune, !*clientDiff)
+		return diffApp(r, eng, lookup, app, cfg.NeededBuilds(app), selected, overrides, ownerTags, onRender, *prune, !*clientDiff)
 	})
 	if err != nil {
 		return err
@@ -78,7 +102,7 @@ func runDiff(path, kctx *string, prune, offline, clientDiff *bool, maxParallel *
 // diffApp renders one app and previews its sync: patches and any --image override
 // are applied as on sync; for an un-overridden build image the current live dev
 // tag is carried forward so its per-build churn does not dominate the diff.
-func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string, bool), app config.App, overrides map[string]render.Image, prune, serverSide bool) (appDiff, error) {
+func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string, bool), app config.App, needed []config.BuildRef, selected map[string]bool, overrides map[string]render.Image, ownerTags map[string]map[string]string, onRender func(string, map[string]bool), prune, serverSide bool) (appDiff, error) {
 	res, err := r.Render(app.Path, app.ClientRender)
 	if err != nil {
 		return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
@@ -86,42 +110,57 @@ func diffApp(r *render.Renderer, eng *engine.Engine, lookup func(string) (string
 	if err := res.ApplyPatches(app.Patches, lookup); err != nil {
 		return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 	}
-	// An overridden build image deploys the supplied ref (shown in the diff); the
-	// rest are un-built, so carry their live dev tag forward. A build entry whose
-	// image the manifests do not actually reference is skipped — carrying or noting
-	// it would be phantom churn (deployed is read before the override rewrite, but
-	// overridden entries are handled separately so that does not matter).
-	deployed := res.ReferencedRepos()
-	var supplied []render.Image
-	var buildRepos []string
-	for j := range app.Build {
-		img := app.Build[j].Image
-		if ov, ok := overrides[img]; ok {
-			supplied = append(supplied, ov)
-		} else if deployed[img] {
-			buildRepos = append(buildRepos, img)
-		}
+	// Unreferenced builds must not produce carry-forward notes. Read the
+	// manifest repos before overrides can rename them.
+	referenced := res.ReferencedRepos()
+	if onRender != nil {
+		onRender(app.Name, referenced)
 	}
+	supplied, buildRepos, carried := diffImages(app, needed, selected, referenced, overrides, ownerTags)
 	if len(supplied) > 0 {
 		if err := res.SetImages(supplied); err != nil {
 			return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 		}
 	}
-	var carried []string
 	if len(buildRepos) > 0 {
 		live, err := eng.LiveObjects(app.Name, app.Namespace, res.Objects)
 		if err != nil {
 			return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 		}
-		if carried, err = res.CarryForwardBuildTags(live, buildRepos); err != nil {
+		consumerCarried, err := res.CarryForwardBuildTags(live, buildRepos)
+		if err != nil {
 			return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 		}
+		carried = append(carried, consumerCarried...)
 	}
 	diffs, err := eng.Diff(app.Name, res.Objects, engine.DiffOptions{Prune: prune, Namespace: app.Namespace, ServerSide: serverSide})
 	if err != nil {
 		return appDiff{}, fmt.Errorf("app %s: %w", app.Name, err)
 	}
 	return appDiff{app: app, diffs: diffs, carried: carried, atSrcRef: subtract(buildRepos, carried)}, nil
+}
+
+func diffImages(app config.App, needed []config.BuildRef, selected, deployed map[string]bool, overrides map[string]render.Image, ownerTags map[string]map[string]string) (supplied []render.Image, buildRepos, carried []string) {
+	classify := func(image string, syncBuildsImage bool, ownerTag string) {
+		if ov, ok := overrides[image]; ok {
+			supplied = append(supplied, ov)
+		} else if syncBuildsImage && deployed[image] {
+			if ownerTag != "" {
+				supplied = append(supplied, render.Image{Name: image, NewTag: ownerTag})
+				carried = append(carried, image)
+			} else {
+				buildRepos = append(buildRepos, image)
+			}
+		}
+	}
+	for _, b := range app.Build {
+		classify(b.Image, true, "")
+	}
+	for _, ref := range needed {
+		// Sync never builds an unselected owner's images, so only overrides can change their refs.
+		classify(ref.Image, selected[ref.App], ownerTags[ref.App][ref.Image])
+	}
+	return supplied, buildRepos, carried
 }
 
 // subtract returns the elements of all not present in remove, preserving order —

@@ -177,6 +177,13 @@ type Patch struct {
 	Patch  string      `json:"patch"`
 }
 
+// BuildRef identifies a build entry.
+type BuildRef struct {
+	App   string
+	Index int
+	Image string
+}
+
 // Build declares one locally built image. Design rationale:
 // docs/ADR/20260612-build-integration.md.
 type Build struct {
@@ -569,6 +576,24 @@ func (c *Config) MatchedViaGlob(name string) bool {
 		}
 	}
 	return false
+}
+
+// NeededBuilds uses the full config because an app can need an unselected owner.
+// Only direct needs supply images.
+func (c *Config) NeededBuilds(app App) []BuildRef {
+	var refs []BuildRef
+	for _, name := range app.Needs {
+		for _, owner := range c.Apps {
+			if owner.Name != name {
+				continue
+			}
+			for i, b := range owner.Build {
+				refs = append(refs, BuildRef{App: owner.Name, Index: i, Image: b.Image})
+			}
+			break
+		}
+	}
+	return refs
 }
 
 // Select keeps explicit names independent of profiles so targeted operations can

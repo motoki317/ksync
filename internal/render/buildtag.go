@@ -25,7 +25,7 @@ var devTagPattern = regexp.MustCompile(`^ksync-[0-9a-f]{12}$`)
 // edited-but-unsynced source change does not appear as an image diff (diff
 // cannot know the new content hash without building).
 func (res *Result) CarryForwardBuildTags(live []*unstructured.Unstructured, repos []string) ([]string, error) {
-	tags := liveDevTags(live, repos)
+	tags := LiveDevTags(live, repos)
 	if len(tags) == 0 {
 		return nil, nil
 	}
@@ -48,7 +48,7 @@ func (res *Result) CarryForwardBuildTags(live []*unstructured.Unstructured, repo
 // uses it to drop a `build:` entry whose image the manifests no longer deploy:
 // such an orphaned entry would otherwise produce a phantom "shown at source ref"
 // note and wrongly keep the app out of "in sync", though a sync would change no
-// image. Pure; the repo extraction matches SetImages/liveDevTags.
+// image. The repo extraction matches SetImages/LiveDevTags.
 func (res *Result) ReferencedRepos() map[string]bool {
 	repos := map[string]bool{}
 	for _, o := range res.Objects {
@@ -59,14 +59,14 @@ func (res *Result) ReferencedRepos() map[string]bool {
 	return repos
 }
 
-// liveDevTags returns, for each requested repo, the ksync dev tag the live
+// LiveDevTags returns, for each requested repo, the ksync dev tag the live
 // objects run it at — but only when every occurrence agrees and the tag matches
 // ksync-<12hex>. A repo absent, inconsistent, or seen at any non-ksync ref is
-// omitted, so the caller falls open to showing the real diff. It deep-walks the
+// omitted, so callers can keep the manifest ref. It deep-walks the
 // objects for image references (any `image` string and the `image.reference` OCI
 // volume path), so a CRD's non-standard image path is covered without the field
 // specs. Pure, so the rule is unit-tested without a cluster.
-func liveDevTags(objs []*unstructured.Unstructured, repos []string) map[string]string {
+func LiveDevTags(objs []*unstructured.Unstructured, repos []string) map[string]string {
 	want := make(map[string]bool, len(repos))
 	for _, r := range repos {
 		want[r] = true

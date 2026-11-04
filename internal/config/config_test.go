@@ -975,6 +975,42 @@ func writeApp(t *testing.T, dir, rel string) {
 	mustWriteFile(t, filepath.Join(appDir, "kustomization.yaml"), "resources: []\n")
 }
 
+func TestNeededBuilds(t *testing.T) {
+	cfg := &Config{Apps: []App{
+		{Name: "team-a", Build: []Build{{Image: "ghcr.io/app/seed"}, {Image: "ghcr.io/app/worker"}}},
+		{Name: "shop", Needs: []string{"team-a"}, Build: []Build{{Image: "ghcr.io/app/shop"}}},
+		{Name: "api-b", Needs: []string{"shop", "team-a"}, Build: []Build{{Image: "ghcr.io/app/api-b"}}},
+		{Name: "report", Needs: []string{"shop"}},
+		{Name: "plain"},
+	}}
+	for _, tt := range []struct {
+		app  string
+		want []BuildRef
+	}{
+		{
+			app: "api-b",
+			want: []BuildRef{
+				{App: "shop", Index: 0, Image: "ghcr.io/app/shop"},
+				{App: "team-a", Index: 0, Image: "ghcr.io/app/seed"},
+				{App: "team-a", Index: 1, Image: "ghcr.io/app/worker"},
+			},
+		},
+		{app: "report", want: []BuildRef{{App: "shop", Index: 0, Image: "ghcr.io/app/shop"}}},
+		{app: "team-a"},
+		{app: "plain"},
+	} {
+		t.Run(tt.app, func(t *testing.T) {
+			selected, err := cfg.Select([]string{tt.app}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.NeededBuilds(selected[0]); !slices.Equal(got, tt.want) {
+				t.Errorf("NeededBuilds = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSelect_EmptyNamesMeansAllApps(t *testing.T) {
 	cfg := &Config{Apps: []App{{Name: "db"}, {Name: "api-b"}}}
 	apps, err := cfg.Select(nil, nil)

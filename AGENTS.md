@@ -54,10 +54,11 @@ Each one was checked against the source code. Reopen one only with new evidence.
   `images --live` use `signalContext`: the first Ctrl-C cancels, and the second exits at once.
   ADRs: 20260701-cli-cobra-and-help-as-docs, 20260627-double-signal-force-quit,
   20260625-diff-command, 20260617-images-command, 20260616-image-override,
-  20260702-watch-image-override-takeover, 20260925-app-profiles.
+  20260702-watch-image-override-takeover, 20260925-app-profiles, 20261104-needs-dev-tags.
 - `internal/config` — the `ksync.yaml` model and its validation. `Select` picks apps by name or
   profile. `SelectContext` enforces `allowedContexts`. ADRs: 20260612-app-model-and-config,
-  20260615-allowed-contexts, 20260619-context-auto-select, 20260925-app-profiles.
+  20260615-allowed-contexts, 20260619-context-auto-select, 20260925-app-profiles,
+  20261104-needs-dev-tags.
 - `internal/build` — source to image: docker build or a custom `command`, then the dev tag
   `ksync-<12 hex>` from the image fingerprint. It also runs build groups and the `imageLoad`
   command. Loads always run one at a time. A group's command runs one at a time unless the group
@@ -85,7 +86,8 @@ Each one was checked against the source code. Reopen one only with new evidence.
   first convergence runs at once. In an interactive terminal without `--auto`, the loop asks
   before it acts on each later change. The cluster and docker are injected (`SyncFunc`,
   `BuildFunc`), so the tests need neither. ADRs: 20260616-eager-build-ahead,
-  20260616-manual-build-gate, 20260619-refresh-open-build-prompt.
+  20260616-manual-build-gate, 20260619-refresh-open-build-prompt,
+  20261104-needs-dev-tags.
 - `internal/schedule` — the pure scheduler: debounce, one run per app at a time, a parallelism
   limit, `needs` gating, and retry backoff. An external block lets the loop hold a deploy while
   its image builds.

@@ -3,6 +3,10 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/motoki317/ksync/internal/config"
 )
 
 func TestNormalizeRef(t *testing.T) {
@@ -48,6 +52,79 @@ func TestImageSet(t *testing.T) {
 	want := []string{"docker.io/library/alpine:latest", "docker.io/library/redis:7"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sorted() = %v, want %v", got, want)
+	}
+}
+
+func TestAppImageRefs(t *testing.T) {
+	cfg := &config.Config{Apps: []config.App{
+		{Name: "team-a", Build: []config.Build{{Image: "seed"}, {Image: "ghcr.io/app/worker"}}},
+		{Name: "api-b", Needs: []string{"team-a"}, Build: []config.Build{{Image: "ghcr.io/app/api-b"}}},
+		{Name: "shop", Needs: []string{"api-b"}},
+		{Name: "plain"},
+	}}
+	refs := []string{
+		"seed:set-by-stack",
+		"docker.io/library/seed@sha256:" + zeroDigest,
+		"ghcr.io/app/worker:set-by-stack",
+		"ghcr.io/app/api-b:set-by-stack",
+		"redis:7",
+	}
+	for _, tt := range []struct {
+		name string
+		app  string
+		want []string
+	}{
+		{
+			name: "owner excludes own builds", app: "team-a",
+			want: []string{"docker.io/library/redis:7", "ghcr.io/app/api-b:set-by-stack"},
+		},
+		{
+			name: "consumer excludes own and needed builds with owner unselected", app: "api-b",
+			want: []string{"docker.io/library/redis:7"},
+		},
+		{
+			name: "transitive owner is not excluded", app: "shop",
+			want: []string{"docker.io/library/redis:7", "docker.io/library/seed:set-by-stack", "docker.io/library/seed@sha256:" + zeroDigest, "ghcr.io/app/worker:set-by-stack"},
+		},
+		{
+			name: "unrelated app retains built repositories", app: "plain",
+			want: []string{"docker.io/library/redis:7", "docker.io/library/seed:set-by-stack", "docker.io/library/seed@sha256:" + zeroDigest, "ghcr.io/app/api-b:set-by-stack", "ghcr.io/app/worker:set-by-stack"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			apps, err := cfg.Select([]string{tt.app}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := apps[0]
+			if got := appImageRefs(cfg, app, refs); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("images = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAddPodImages_BuiltRepos(t *testing.T) {
+	cfg := &config.Config{Apps: []config.App{
+		{Name: "team-a", Build: []config.Build{{Image: "seed"}}},
+		{Name: "api-b", Build: []config.Build{{Image: "ghcr.io/app/api-b"}}},
+	}}
+	images := newImageSet(nil)
+	images.add("seed:registry-tag")
+	addPodImages(images, cfg, []corev1.Pod{{Spec: corev1.PodSpec{
+		InitContainers: []corev1.Container{{Image: "docker.io/library/seed:ksync-012345678901"}},
+		Containers: []corev1.Container{
+			{Image: "ghcr.io/app/api-b:ksync-012345678901"},
+			{Image: "redis:7"},
+		},
+		EphemeralContainers: []corev1.EphemeralContainer{
+			{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Image: "seed@sha256:" + zeroDigest}},
+			{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Image: "alpine"}},
+		},
+	}}})
+	want := []string{"docker.io/library/alpine:latest", "docker.io/library/redis:7", "docker.io/library/seed:registry-tag"}
+	if got := images.sorted(); !reflect.DeepEqual(got, want) {
+		t.Errorf("live images = %v, want %v", got, want)
 	}
 }
 

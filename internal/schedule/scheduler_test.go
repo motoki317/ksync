@@ -11,6 +11,29 @@ var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func at(d time.Duration) time.Time { return t0.Add(d) }
 
+func TestScheduler_Running(t *testing.T) {
+	s := New(Options{}, []App{{Name: "api-b"}})
+	if s.Running("missing") || s.Running("api-b") {
+		t.Fatal("an idle or unknown app is running")
+	}
+	s.MarkDirty("api-b", at(0))
+	if s.Running("api-b") {
+		t.Fatal("a dirty app is running before StartDue")
+	}
+	s.StartDue(at(0))
+	if !s.Running("api-b") {
+		t.Fatal("a started app is not running")
+	}
+	s.MarkDirty("api-b", at(0))
+	if !s.Running("api-b") {
+		t.Fatal("a dirty in-flight app is not running")
+	}
+	s.Finish("api-b", false, at(0))
+	if s.Running("api-b") {
+		t.Fatal("a finished app is still running")
+	}
+}
+
 func TestScheduler_DebouncesBurstsIntoOneRun(t *testing.T) {
 	s := New(Options{Debounce: 100 * time.Millisecond}, []App{{Name: "api-b"}})
 	// A burst of file events; each one slides the deadline.
